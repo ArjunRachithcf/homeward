@@ -23,8 +23,8 @@ func TestTheTableIsReplacedInOneTransactionAndChangesNoOtherTable(t *testing.T) 
 		t.Errorf("the script doesn't replace the table atomically:\n%s", r)
 	}
 	for _, l := range lines {
-		// A statement of the script's own, not a rule inside the table (which may add to the table's own set).
-		if f := strings.Fields(l); !strings.HasPrefix(l, "\t") && len(f) >= 2 && (f[0] == "table" || f[0] == "delete" || f[0] == "flush" || f[0] == "add") && !strings.Contains(l, "inet homerslab") {
+		// A rule's update of the table's own set names no table.
+		if f := strings.Fields(l); len(f) >= 2 && !strings.HasPrefix(f[1], "@") && (f[0] == "table" || f[0] == "delete" || f[0] == "flush" || f[0] == "add") && !strings.Contains(l, "inet homerslab") {
 			t.Errorf("the script touches another table: %q", l)
 		}
 	}
@@ -380,7 +380,7 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 		"\tchain output {\n\t\ttype filter hook output priority filter - 5; policy accept;\n\t\toifname \"hla*\" jump to_apps\n",
 		`oifname { "br-app", "br-signin" } jump to_apps`,
 		"ip daddr . meta l4proto . th dport { 172.31.240.2 . tcp . 8080, 172.31.250.10 . tcp . 9000 } jump to_apps",
-		"\tchain to_apps {\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n" +
+		"\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n" +
 			"\t\tip daddr . tcp dport . meta skuid { 172.31.240.2 . 8080 . 0, 172.31.240.2 . 8080 . 981, " +
 			"172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981 } goto admit\n\t\tdrop\n\t}\n",
 	} {
@@ -391,7 +391,7 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 	// No upstream: nothing of this machine opens a connection into an app's network at all; and an app's bridge the
 	// engines haven't listed yet is kept to the edge by its name.
 	none := firewall.Render(firewall.State{Mesh: []string{"wt0"}, LAN: []string{"enp5s0"}, Bridges: []string{"br-app"}, Virtual: []string{"br-app"}})
-	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n\t\tdrop\n\t}\n") {
+	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n\t\tdrop\n\t}\n") {
 		t.Errorf("without an upstream:\n%s", none)
 	}
 	// An upstream that isn't IPv4 with a port: never rendered. One with no user is closed to every process of this
@@ -489,20 +489,21 @@ func TestNoFlowRunsOnByItsStateAlone(t *testing.T) {
 	r := firewall.Render(s)
 	for _, l := range strings.Split(r, "\n") {
 		if strings.Contains(l, "established") && l != "\t\tct state established ct direction reply accept" &&
-			l != "\t\tct state established ct id @admitted accept" {
+			l != "\t\tct state established ct id @admitted update @admitted { ct id } accept" {
 			t.Errorf("a flow runs on by its state: %q", l)
 		}
 	}
 	for _, name := range []string{"input", "forward", "to_apps"} {
 		_, after, _ := strings.Cut(r, "\tchain "+name+" {\n")
 		body, _, _ := strings.Cut(after, "\t}\n")
-		if !strings.Contains(body, "\t\tct state related accept\n\t\tct state established ct direction reply accept\n") ||
-			!strings.Contains(body, "\t\tct state established ct id @admitted accept\n") {
+		if !strings.HasPrefix(strings.TrimPrefix(body, "\t\ttype filter hook "+name+" priority filter - 5; policy drop;\n"),
+			"\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n") ||
+			!strings.Contains(body, "\t\tct state established ct id @admitted update @admitted { ct id } accept\n") {
 			t.Errorf("%s doesn't ask again the flows an earlier table admitted:\n%s", name, body)
 		}
 	}
-	if !strings.Contains(r, "\tset admitted {\n\t\ttypeof ct id\n\t\tsize 65535\n\t\tflags dynamic,timeout\n\t\ttimeout 1m\n\t}\n") ||
-		!strings.Contains(r, "\tchain admit {\n\t\tadd @admitted { ct id }\n\t\taccept\n\t}\n") {
+	if !strings.Contains(r, "\tset admitted {\n\t\ttypeof ct id\n\t\tsize 65535\n\t\tflags dynamic,timeout\n\t\ttimeout 30s\n\t}\n") ||
+		!strings.Contains(r, "\tchain admit {\n\t\tupdate @admitted { ct id }\n\t\taccept\n\t}\n") {
 		t.Errorf("the set of admitted flows, or admit:\n%s", r)
 	}
 }
@@ -518,7 +519,7 @@ func TestTheFlowsATableAdmittedAreNoDrift(t *testing.T) {
 		}
 		count++
 		return []byte("table inet homerslab {\n\tset admitted {\n\t\ttypeof ct id\n\t\tsize 65535\t# count " +
-			strconv.Itoa(count) + "\n\t\tflags dynamic,timeout\n\t\ttimeout 1m\n\t}\n}\n"), nil
+			strconv.Itoa(count) + "\n\t\tflags dynamic,timeout\n\t\ttimeout 30s\n\t}\n}\n"), nil
 	}}
 	if err := fw.Apply(context.Background(), firewall.State{Mesh: []string{"wt0"}}); err != nil {
 		t.Fatal(err)

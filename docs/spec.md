@@ -381,7 +381,8 @@ Stories 120–121 are decided in #87.
     Homeward.
   - **Host apps**: the vendor's repository and package, per distro.
   - **The firewall table**: no published ports, mesh-only listeners, the LAN kept out, drift corrected. A new table
-    takes effect on running flows too: a flow an earlier table admitted runs on only if the new one admits it (#285). Also
+    takes effect on running flows too: a flow an earlier table admitted is asked again at its next packet in the
+    direction that opened it, and cut there if the new table refuses it (#285). Also
     ([ADR 0020](adr/0020-only-the-edge-reaches-an-app.md); decided in #82):
     - **only the edge reaches an app**. The agent, not the compose file, wires each app's one upstream: a bridge
       address on Docker and rootful Podman, a loopback port on rootless Podman. New connections to it are accepted

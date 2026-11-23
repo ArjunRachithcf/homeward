@@ -116,17 +116,23 @@ type State struct {
 	LDAP []LDAPApp `json:"ldap,omitempty"`
 }
 
-// The set of the flows a table admitted (#285): as many as nft's default for a dynamic set, each forgotten a minute after
-// it was added (then asked again at its next packet, and added again).
+// The set of the flows a table admitted (#285): as many as nft's default for a dynamic set, each forgotten once it has
+// been idle that long (then asked again at its next packet, and added again).
 const (
 	admittedSize = 65535
-	admittedFor  = "1m"
+	admittedFor  = "30s"
 )
 
 // admitted opens each base chain's rules, and to_apps': a packet of a flow's other direction (a reply), and one related
-// to a flow (an ICMP error), pass as they always did. A reply can't be asked again: the rules read the direction that
-// opened a flow, and a reply to this machine's own connections (to the internet, say) matches none of them.
-const admitted = "\t\tct state related accept\n\t\tct state established ct direction reply accept\n"
+// to a flow (an ICMP error), pass as they always did; a connection a conntrack helper expected (FTP's data, say) is
+// admitted with its first packet, so the rest of it runs on. A reply can't be asked again: the rules read the direction
+// that opened a flow, and a reply to this machine's own connections (to the internet, say) matches none of them.
+const admitted = "\t\tct state related ct status expected goto admit\n" +
+	"\t\tct state related accept\n" +
+	"\t\tct state established ct direction reply accept\n"
+
+// lookup lets a flow this table admitted run on, and keeps it remembered while it runs.
+const lookup = "\t\tct state established ct id @admitted update @admitted { ct id } accept\n"
 
 // LDAPSPort is the sign-in listener's LDAPS port.
 const LDAPSPort = 636
@@ -215,8 +221,8 @@ func Render(s State) string {
 	w("\t\ttimeout %s", admittedFor)
 	w("\t}")
 	w("\tchain admit {")
-	// When the set is full the add fails, and the packet goes on to the accept below it: never dropped for that.
-	w("\t\tadd @admitted { ct id }")
+	// When the set is full the update fails, and the packet goes on to the accept below it: never dropped for that.
+	w("\t\tupdate @admitted { ct id }")
 	w("\t\taccept")
 	w("\t}")
 
@@ -228,7 +234,7 @@ func Render(s State) string {
 	if len(mesh) > 0 {
 		w("\t\tiifname %s accept", set(quoted(mesh)))
 	}
-	w("\t\tct state established ct id @admitted accept")
+	b.WriteString(lookup)
 	if len(apps) > 0 {
 		// An engine's bridge is a bridge to the kernel too (#148): a tunnel an engine names is no app network. And one
 		// of guests' ports only (#169).
@@ -261,7 +267,7 @@ func Render(s State) string {
 	w("\tchain forward {")
 	w("\t\ttype filter hook forward priority filter - 5; policy drop;")
 	b.WriteString(admitted)
-	w("\t\tct state established ct id @admitted accept")
+	b.WriteString(lookup)
 	if len(mesh) > 0 {
 		w("\t\tiifname %s drop", set(quoted(mesh)))
 	}
@@ -367,7 +373,7 @@ func Render(s State) string {
 	// and by the upstreams' addresses on whatever interface leads to them. Replies, and ping, pass.
 	w("\tchain to_apps {")
 	b.WriteString(admitted)
-	w("\t\tct state established ct id @admitted accept")
+	b.WriteString(lookup)
 	w("\t\tmeta l4proto { icmp, ipv6-icmp } goto admit")
 	if allowed := upstreamUsers(s.Upstreams); len(allowed) > 0 {
 		w("\t\tip daddr . tcp dport . meta skuid %s goto admit", set(allowed))
