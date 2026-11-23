@@ -103,7 +103,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		os.Exit(0)
-	case "echo": // a TCP echo, line by line, on every connection
+	case "echo", "echoend": // a TCP echo, line by line, on every connection; echoend says "ended" when one ends
 		ln, err := net.Listen("tcp", os.Args[len(os.Args)-1])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -115,7 +115,13 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				os.Exit(1)
 			}
-			go func() { _, _ = io.Copy(c, c); c.Close() }()
+			go func() {
+				_, _ = io.Copy(c, c)
+				c.Close()
+				if os.Getenv(helper) == "echoend" {
+					fmt.Println("ended")
+				}
+			}()
 		}
 	case "tsession", "usession": // one flow, kept open: a line on stdin asks it a question, "ok" or "no" says if it was answered
 		proto := map[string]string{"tsession": "tcp", "usession": "udp"}[os.Getenv(helper)]
@@ -127,6 +133,10 @@ func TestMain(m *testing.M) {
 		fmt.Println("connected")
 		in, from := bufio.NewScanner(os.Stdin), bufio.NewReader(c)
 		for i := 0; in.Scan(); i++ {
+			if in.Text() == "close" {
+				c.Close()
+				os.Exit(0)
+			}
 			q := fmt.Sprintf("q%d\n", i)
 			_ = c.SetDeadline(time.Now().Add(700 * time.Millisecond))
 			_, err := c.Write([]byte(q))
@@ -716,12 +726,14 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	n.serve(t, "lan", "echo", "203.0.113.50:9011")
 	n.serve(t, "lan", "ulisten", "203.0.113.50:9012")
 	n.serve(t, "ctr", "echo", "172.30.0.2:8447")
+	ends := n.serveEnds(t, "ctr", "172.30.0.2:8448")
 
 	open := firewall.State{Mesh: []string{"wt0"}, WireGuard: []int{51820, 51821}, SetupPort: 7030, LAN: []string{"br-iot"},
 		LANPrefixes: []netip.Prefix{netip.MustParsePrefix("192.168.77.0/24")}, Uplinks4: []string{"br-iot"},
 		Bridges: []string{"br-test", "br-other", "docker0"}, Virtual: guests(t),
 		Resolvers: []netip.Addr{netip.MustParseAddr("192.168.77.50")},
-		Upstreams: []firewall.Upstream{{Addr: netip.MustParseAddrPort("172.30.0.2:8447"), UIDs: []uint32{0}}}}
+		Upstreams: []firewall.Upstream{{Addr: netip.MustParseAddrPort("172.30.0.2:8447"), UIDs: []uint32{0}},
+			{Addr: netip.MustParseAddrPort("172.30.0.2:8448"), UIDs: []uint32{0}}}}
 	// Stricter: the setup listener closed, one WireGuard port gone, no way to the IPv4 internet, no upstream.
 	strict := open
 	strict.SetupPort, strict.WireGuard, strict.Uplinks4, strict.Upstreams = 0, []int{51820}, nil, nil
@@ -748,6 +760,10 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	sessions := make([]*session, len(flows))
 	for i, f := range flows {
 		sessions[i] = n.session(t, f.from, f.mode, f.addr)
+	}
+	ending := n.session(t, "", "tsession", "172.30.0.2:8448")
+	if !ending.ask(t) {
+		t.Fatal("the box's flow into the app's network that ends: no answer under the table that admits it")
 	}
 	ask := func(when string, want func(kept bool) bool) {
 		t.Helper()
@@ -777,6 +793,14 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	ask("after the same table applied again", kept)
 	if d, err := fw.Check(ctx); d != nil || err != nil {
 		t.Errorf("the flows the table admitted read as drift: %+v, %v", d, err)
+	}
+	// A flow the table refuses still ends: the box's process closes it, and the app sees the end (its FIN), rather than
+	// waiting on a flow that is gone (#286's review).
+	ending.close(t)
+	select {
+	case <-ends:
+	case <-time.After(3 * time.Second):
+		t.Error("the box closed a flow into an app's network the table refuses, and the app never saw it end")
 	}
 
 	// The set of admitted flows full: a flow is admitted all the same (and only asked again at its next packet).
@@ -827,6 +851,39 @@ func (n *netns) session(t *testing.T, from, mode, addr string) *session {
 		t.Fatalf("%s: no flow", s.what)
 	}
 	return s
+}
+
+// close closes the flow.
+func (s *session) close(t *testing.T) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := io.WriteString(s.in, "close\n"); err != nil {
+		t.Errorf("%s: the flow's process is gone", s.what)
+	}
+}
+
+// serveEnds starts a TCP echo (echoend) in a namespace, and says on the channel each time one of its connections ends.
+func (n *netns) serveEnds(t *testing.T, name, addr string) <-chan struct{} {
+	t.Helper()
+	cmd := n.helper(name, "echoend", addr)
+	out, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	lines := bufio.NewScanner(out)
+	if !lines.Scan() || lines.Text() != "listening" {
+		t.Fatalf("no echoend on %s in %s", addr, orBox(name))
+	}
+	ends := make(chan struct{}, 8)
+	go func() {
+		for lines.Scan() {
+			if lines.Text() == "ended" {
+				ends <- struct{}{}
+			}
+		}
+	}()
+	return ends
 }
 
 // ask asks the flow a question, and says whether it was answered.
@@ -998,8 +1055,12 @@ func reexec(t *testing.T, run string) {
 	t.Logf("in namespaces:\n%s", out)
 }
 
+// firstPingID is the ICMP id below a namespace's first ping's (pingFrom).
+const firstPingID = 20000
+
 type netns struct {
-	pids map[string]int // child namespaces, each held by a sleep
+	pids  map[string]int // child namespaces, each held by a sleep
+	pings int            // the pings sent, each with an ICMP id of its own (pingFrom)
 	// probes, while together runs: want and wantUDP then run at once, each in its own process, and together waits
 	// for them all.
 	probes *sync.WaitGroup
@@ -1279,7 +1340,9 @@ func (n *netns) ping(t *testing.T, what, addr string, reach bool) {
 
 func (n *netns) pingFrom(t *testing.T, what, from, addr string, reach bool) {
 	t.Helper()
-	got := exec.Command("nsenter", "-t", strconv.Itoa(n.pids[from]), "-n", "ping", "-c1", "-W1", addr).Run() == nil
+	// Its own ICMP id, so the table is asked about a new flow, never an earlier ping's (#285).
+	n.pings++
+	got := exec.Command("nsenter", "-t", strconv.Itoa(n.pids[from]), "-n", "ping", "-c1", "-W1", "-e", strconv.Itoa(firstPingID+n.pings), addr).Run() == nil
 	if got != reach {
 		t.Errorf("%s: ping %s %v, want %v", what, addr, got, reach)
 	}

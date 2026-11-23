@@ -374,6 +374,10 @@ func Render(s State) string {
 	w("\tchain to_apps {")
 	b.WriteString(admitted)
 	b.WriteString(lookup)
+	// A flow's end passes, whoever asks: a kernel's RST, and the FIN an orphaned socket sends after close(), carry no
+	// user skuid could match, and dropping them would leave the app waiting on a flow that is gone (#286's review). They
+	// only end a flow.
+	w("\t\tct state established tcp flags & (fin | rst) != 0 accept")
 	w("\t\tmeta l4proto { icmp, ipv6-icmp } goto admit")
 	if allowed := upstreamUsers(s.Upstreams); len(allowed) > 0 {
 		w("\t\tip daddr . tcp dport . meta skuid %s goto admit", set(allowed))
@@ -661,10 +665,10 @@ func (f *Firewall) Note(what string) {
 
 var errMissing = errors.New("the table is missing")
 
-// list is the table as nft lists it, without counters or other state: nor the flows it admitted (the set's elements,
-// and its count of them), which change with every flow and are no drift.
+// list is the table as nft lists it, without counters or other state: nor the flows it admitted (the set admitted's
+// elements, and its count of them), which change with every flow and are no drift. Any other set is listed whole.
 func (f *Firewall) list(ctx context.Context) (string, error) {
-	out, err := f.Run(ctx, host.Cmd{Name: "nft", Args: []string{"-s", "-t", "list", "table", "inet", "homerslab"}})
+	out, err := f.Run(ctx, host.Cmd{Name: "nft", Args: []string{"-s", "list", "table", "inet", "homerslab"}})
 	if err != nil {
 		var he *host.Error
 		if errors.As(err, &he) && strings.Contains(he.Stderr, "No such file or directory") {
@@ -672,7 +676,26 @@ func (f *Firewall) list(ctx context.Context) (string, error) {
 		}
 		return "", err
 	}
-	return count.ReplaceAllString(string(out), ""), nil
+	return withoutAdmitted(string(out)), nil
+}
+
+// withoutAdmitted is a listing with the set admitted's elements, and nft's count of them, left out: its block alone.
+func withoutAdmitted(listing string) string {
+	start := strings.Index(listing, "\n\tset admitted {\n")
+	if start < 0 {
+		return listing
+	}
+	start++
+	length := strings.Index(listing[start:], "\n\t}\n")
+	if length < 0 {
+		return listing
+	}
+	block := listing[start : start+length]
+	if i := strings.Index(block, "\n\t\telements = "); i >= 0 {
+		block = block[:i] // the elements are the block's last lines
+	}
+	block = count.ReplaceAllString(block, "")
+	return listing[:start] + block + listing[start+length:]
 }
 
 // count is the count of elements nft lists after a set's size.
