@@ -68,7 +68,9 @@ func TestDefaultsAreReadyOnceTheBlueprintsHaveApplied(t *testing.T) {
 		{"only orphaned ones", []map[string]any{bp("default/flow-gone.yaml", "orphaned", true)}, notYet, ""},
 		{"one in warning", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("system/w.yaml", "warning", true)}, failed, "system/w.yaml"},
 		{"one in warning, another not applied yet", []map[string]any{bp("default/flow-b.yaml", "unknown", true), bp("default/flow-w.yaml", "warning", true)}, failed, "default/flow-w.yaml"},
+		{"one failed listed before one in warning", []map[string]any{bp("default/flow-e.yaml", "error", true), bp("default/flow-w.yaml", "warning", true)}, failed, "default/flow-w.yaml"},
 		{"one in a state Authentik doesn't have", []map[string]any{bp("default/flow-a.yaml", "half-done", true)}, failed, "default/flow-a.yaml"},
+		{"one without a state", []map[string]any{bp("default/flow-a.yaml", "", true)}, failed, "default/flow-a.yaml"},
 		{"an example in warning, disabled", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("example/x.yaml", "warning", false)}, ready, ""},
 	} {
 		blueprints, applied = c.bps, nil
@@ -83,10 +85,10 @@ func TestDefaultsAreReadyOnceTheBlueprintsHaveApplied(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: %s (%v), want %s", c.name, got, err, c.want)
 		}
-		if c.want == failed && err != nil && !strings.Contains(err.Error(), c.names) {
+		if c.want == failed && (err == nil || !strings.Contains(err.Error(), c.names)) {
 			t.Errorf("%s: %v doesn't name %s", c.name, err, c.names)
 		}
-		// Only one in error is applied again; Homeward leaves one in a state it doesn't know as it found it.
+		// When one is in a state Homeward doesn't know, nothing is applied again, whatever else is listed.
 		if c.want == failed && len(applied) > 0 {
 			t.Errorf("%s: applied %q again", c.name, applied)
 		}

@@ -227,7 +227,8 @@ const retryEvery = 20 * time.Second
 // A blueprint not applied yet ("unknown") or failed ("error") is not ready yet. One in any other state fails at once,
 // naming it (#269): Authentik at Version has a "warning" status but never sets it (its apply is one transaction, all
 // or nothing, and the status is read-only over the API), so a blueprint in warning, or in a state Authentik doesn't
-// have, holds Homeward doesn't know what, and won't turn into one Prepare can build on by waiting.
+// have (none at all included), holds Homeward doesn't know what, and won't turn into one Prepare can build on by
+// waiting. Such a one is looked for before anything is applied again.
 func defaultsReady(ctx context.Context, a *api) error {
 	for _, slug := range DefaultFlows {
 		f, err := find[flow](ctx, a, "/flows/instances/?slug="+q(slug), "slug", slug)
@@ -249,21 +250,25 @@ func defaultsReady(ctx context.Context, a *api) error {
 	if err != nil {
 		return err
 	}
-	n := 0
-	var notYet error
+	var ours []instance
 	for _, b := range bs {
 		// An orphaned one's file is gone, an upgrade removed it: nothing is left to apply.
 		if !b.Enabled || b.Status == "orphaned" || !(strings.HasPrefix(b.Path, "default/") || strings.HasPrefix(b.Path, "system/")) {
 			continue
 		}
-		n++
 		switch b.Status {
-		case "successful":
-			continue
-		case "unknown", "error":
+		case "successful", "unknown", "error":
 		default:
-			return fmt.Errorf("authentik: its blueprint %s is in %q, which Authentik %s never sets, so what of it applied "+
-				"is unknown: see it in Authentik's admin interface, and apply it again there", b.Path, b.Status, Version)
+			// Before anything is applied again, so the answer doesn't hang on the order Authentik lists them in.
+			return fmt.Errorf("authentik: its blueprint %s is in %q, a state the Authentik Homeward pins (%s) never leaves "+
+				"a blueprint in, so what of it applied is unknown: Homeward won't build its sign-in on it", b.Path, b.Status, Version)
+		}
+		ours = append(ours, b)
+	}
+	var notYet error
+	for _, b := range ours {
+		if b.Status == "successful" {
+			continue
 		}
 		// One that failed is applied again, as Authentik's worker would only within the hour: at its first start the
 		// worker may apply a blueprint before the ones it builds on (#195's CI: default/flow-oobe.yaml). Not more often
@@ -278,7 +283,7 @@ func defaultsReady(ctx context.Context, a *api) error {
 	if notYet != nil {
 		return notYet
 	}
-	if n == 0 {
+	if len(ours) == 0 {
 		return fmt.Errorf("%w: it hasn't found its blueprints yet", idp.ErrNotReady)
 	}
 	cert, err := find[struct {
