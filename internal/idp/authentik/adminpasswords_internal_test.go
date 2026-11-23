@@ -96,16 +96,19 @@ func TestSomeoneHoldingAnAppPasswordIsntMadeAnAdmin(t *testing.T) {
 	if len(f.changes) != 0 || !slices.Contains(f.tokens(), "lenas") {
 		t.Errorf("refused, yet changed: %v, tokens %v", f.changes, f.tokens())
 	}
-	// An admin already, whose name changes: no promotion, nothing refused (the schedule's check ends hers).
+	// An admin already, whose name changes: nothing refused, and the app password she holds ends.
 	if err := a.EnsurePerson(ctx, idp.Person{Username: "olga", Name: "Olga F.", Role: idp.Admin}); err != nil {
 		t.Errorf("an admin's name: %v", err)
+	}
+	if ts := f.tokens(); !slices.Equal(ts, []string{"lenas"}) {
+		t.Errorf("after the admin's change: %v, want hers ended, lena's kept", ts)
 	}
 	// Removed, then made an admin.
 	if err := a.RevokeAppPasswords(ctx, "lena"); err != nil {
 		t.Fatal(err)
 	}
-	if ts := f.tokens(); !slices.Equal(ts, []string{"olgas"}) {
-		t.Errorf("after revoking hers: %v, want only olga's left", ts)
+	if ts := f.tokens(); len(ts) != 0 {
+		t.Errorf("after revoking hers: %v, want none left", ts)
 	}
 	if err := a.EnsurePerson(ctx, lena); err != nil {
 		t.Errorf("made an admin once hers are gone: %v", err)
@@ -151,5 +154,43 @@ func TestTheAdminsAppPasswordsEnd(t *testing.T) {
 	}
 	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || len(got) != 0 {
 		t.Errorf("again: %v %v, want nobody", got, err)
+	}
+}
+
+// An admin whose app passwords couldn't be deleted isn't said to be ended: the error names them, and the next pass
+// tries again.
+func TestAnAdminsAppPasswordsThatDidntEndArentSaidToHave(t *testing.T) {
+	testenv.Isolate(t)
+	f := withPeople()
+	a := f.open(t)
+	f.objs["/core/tokens/"] = []map[string]any{token("olgas", 2, nil)}
+	f.refuse = "DELETE /core/tokens/"
+	got, err := a.EndAdminAppPasswords(context.Background())
+	if err == nil || len(got) != 0 {
+		t.Errorf("with the delete refused: %v %v, want nobody ended and an error", got, err)
+	}
+	f.refuse = ""
+	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || !slices.Equal(got, []string{"olga"}) {
+		t.Errorf("the next pass: %v %v, want olga's ended", got, err)
+	}
+}
+
+// The role read again after making an app password fails: the password is deleted, and the error is that failure, not
+// a refusal of an admin nobody saw.
+func TestAnAppPasswordWhoseRoleCantBeReadAgainIsDeleted(t *testing.T) {
+	testenv.Isolate(t)
+	f := withPeople()
+	a := f.open(t)
+	f.after = func() {
+		if f.changes[len(f.changes)-1] == "POST /core/tokens/" {
+			f.refuse = "GET /core/users/"
+		}
+	}
+	_, err := a.AppPassword(context.Background(), "homerslab-media", "lena")
+	if err == nil || errors.Is(err, idp.ErrAdminAppPassword) {
+		t.Errorf("the role unreadable afterwards: %v, want that error, not ErrAdminAppPassword", err)
+	}
+	if ts := f.tokens(); len(ts) != 0 {
+		t.Errorf("the app password made is still there: %v", ts)
 	}
 }

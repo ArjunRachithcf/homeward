@@ -991,11 +991,12 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 		}
 	}
 	body["groups"] = keep
-	if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/core/users/%d/", u.PK), body, nil); err != nil || !promoted {
+	if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/core/users/%d/", u.PK), body, nil); err != nil || p.Role != idp.Admin {
 		return err
 	}
 	// One made at the same moment (AppPassword reads the role after making it, this the app passwords after the
-	// change, so one of the two sees the other's): an admin now, so it ends.
+	// change, so one of the two sees the other's): an admin now, so it ends. For every admin, not only one just
+	// promoted, so a call again after a failure here still ends it.
 	ts, err := a.appPasswords(ctx, u)
 	if err != nil {
 		return err
@@ -1109,7 +1110,7 @@ func (a *Authentik) Credentials(ctx context.Context, username string) (idp.Crede
 		return idp.Credentials{}, err
 	}
 	for _, t := range ts {
-		live := !t.Expiring || t.Expires == nil || t.Expires.After(time.Now())
+		live := tokenLive(t.Expiring, t.Expires)
 		if t.User == u.PK && live && (t.Intent == "api" || t.Intent == "app_password" || t.Intent == "recovery") {
 			add(idp.CredToken)
 		}

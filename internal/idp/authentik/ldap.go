@@ -318,13 +318,17 @@ func (a *Authentik) AppPassword(ctx context.Context, slug, username string) (idp
 	// after its own, so one of the two sees the other's and ends the password (#281).
 	again, err := find[user](ctx, a.api, "/core/users/?username="+q(username), "username", username)
 	if err != nil || again == nil || slices.Contains(again.Groups, admins) {
+		why := idp.ErrAdminAppPassword
+		switch {
+		case err != nil:
+			why = err
+		case again == nil:
+			why = idp.ErrNoPerson
+		}
 		if derr := gone(a.api.call(ctx, http.MethodDelete, "/core/tokens/"+id+"/", nil, nil)); derr != nil {
-			return "", errors.Join(idp.ErrAdminAppPassword, err, derr)
+			return "", errors.Join(why, fmt.Errorf("authentik: deleting the app password just made: %w", derr))
 		}
-		if err != nil {
-			return "", err
-		}
-		return "", idp.ErrAdminAppPassword
+		return "", why
 	}
 	var k struct {
 		Key string `json:"key"`
@@ -358,8 +362,11 @@ type appPasswordObj struct {
 	Expires    *time.Time `json:"expires"`
 }
 
-func (t appPasswordObj) live() bool {
-	return !t.Expiring || t.Expires == nil || t.Expires.After(time.Now())
+func (t appPasswordObj) live() bool { return tokenLive(t.Expiring, t.Expires) }
+
+// tokenLive says a token still signs someone in: it never expires, or not yet.
+func tokenLive(expiring bool, expires *time.Time) bool {
+	return !expiring || expires == nil || expires.After(time.Now())
 }
 
 // appPasswords are every app password the person holds, for any app, made by Homeward or in Authentik's own settings,
@@ -430,7 +437,9 @@ func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]string, error) 
 			continue
 		}
 		if err := a.revokeAppPasswords(ctx, ts); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+			// Not ended: the error names them, and the next pass tries again.
+			errs = append(errs, fmt.Errorf("%s holds app passwords still: %w", p.Username, err))
+			continue
 		}
 		ended = append(ended, p.Username)
 	}
