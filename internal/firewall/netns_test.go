@@ -792,9 +792,9 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 		}
 		next += size
 	}
-	if out, err := host.Exec(ctx, host.Cmd{Name: "nft", Args: []string{"-t", "list", "set", "inet", "homerslab", "admitted"}}); err != nil ||
-		!strings.Contains(string(out), "# count 65535") {
-		t.Fatalf("the set of admitted flows isn't full: %v\n%s", err, out)
+	// Full: one more element is refused (nft lists no count of elements before 1.1).
+	if _, err := host.Exec(ctx, host.Cmd{Name: "nft", Args: []string{"add", "element", "inet", "homerslab", "admitted", "{", "4000000000", "}"}}); err == nil {
+		t.Fatal("the set of admitted flows isn't full")
 	}
 	full := []*session{n.session(t, "lan", "usession", "192.168.77.1:51820"), n.session(t, "peer", "tsession", "100.88.1.1:7031"),
 		n.session(t, "ctr", "usession", "192.168.77.50:53")}
