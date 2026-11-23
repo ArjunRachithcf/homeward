@@ -321,7 +321,7 @@ func TestOnTheCloudTheTokenIsGivenOnceInTheTerminal(t *testing.T) {
 	if !strings.Contains(strings.Join(up.Env, " "), "NB_SETUP_KEY=JOINKEY-") || !strings.Contains(strings.Join(up.Args, " "), "--management-url https://api.netbird.io") {
 		t.Errorf("netbird up %v", up.Args)
 	}
-	if table, on := p.host.Table(); !on || !strings.Contains(table, "tcp dport 7020 accept") {
+	if table, on := p.host.Table(); !on || !strings.Contains(table, "tcp dport 7020 goto admit") {
 		t.Errorf("the firewall table (%v):\n%s", on, table)
 	}
 	// What the agent sealed is Homeward's own token, never the one the admin gave.
