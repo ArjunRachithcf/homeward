@@ -15,6 +15,7 @@ package firewall_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -26,7 +27,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -41,7 +41,8 @@ import (
 
 const (
 	insideNamespaces = "HOMEWARD_FIREWALL_NETNS"
-	helper           = "HOMEWARD_FIREWALL_HELPER" // listen or dial, in a child namespace
+	helper           = "HOMEWARD_FIREWALL_HELPER"   // listen or dial, in a child namespace
+	udpFrom          = "HOMEWARD_FIREWALL_UDP_FROM" // udial's source port (wantUDP)
 )
 
 func TestMain(m *testing.M) {
@@ -76,16 +77,20 @@ func TestMain(m *testing.M) {
 			}
 			_, _ = c.WriteTo(buf[:n], from)
 		}
-	case "udial": // from the source port before the address: a new flow, never an earlier probe's (#279)
-		port, err := strconv.Atoi(os.Args[len(os.Args)-2])
+	case "udial": // from udpFrom's port: a new flow, never an earlier probe's (#279)
+		port, err := strconv.Atoi(os.Getenv(udpFrom))
 		if err != nil {
+			fmt.Fprintln(os.Stderr, "no source port:", err)
 			os.Exit(2)
 		}
 		d := net.Dialer{LocalAddr: &net.UDPAddr{Port: port}}
 		c, err := d.Dial("udp", os.Args[len(os.Args)-1])
-		if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2) // the probe never asked: not an answer of the table's
+		}
+		if err != nil {
+			os.Exit(1) // no route: unreachable
 		}
 		_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
 		if _, err := c.Write([]byte("hello\n")); err != nil {
@@ -646,7 +651,7 @@ func TestAUDPProbeIsANewFlowInNetworkNamespaces(t *testing.T) {
 	if err := fw.Apply(context.Background(), s); err != nil {
 		t.Fatal(err)
 	}
-	n.wantUDP(t, "an engine's bridge: no DHCP, even from the port the kernel handed the first probe", "vm", "192.168.122.1:67", false)
+	n.wantUDP(t, "an engine's bridge: no DHCP, though the kernel would hand the probe the first one's port", "vm", "192.168.122.1:67", false)
 }
 
 // guests are the bridges this namespace's kernel reads as of guests' ports only (lan.Network.Virtual).
@@ -798,7 +803,7 @@ type netns struct {
 	// for them all.
 	probes *sync.WaitGroup
 	// udpProbes counts the UDP probes, each from a source port of its own (wantUDP).
-	udpProbes atomic.Uint32
+	udpProbes int
 }
 
 func newNet(t *testing.T) *netns {
@@ -998,8 +1003,9 @@ func (n *netns) probe(check func()) {
 	n.probes.Go(check)
 }
 
-// firstUDPProbePort is the source port of a namespace's first UDP probe, the next one's the one above it: below every
-// kernel's ephemeral range (Linux's starts at 32768 by default), so no other socket has it.
+// firstUDPProbePort is the source port of a namespace's first UDP probe, the next one's the one above it: below the
+// ephemeral range (Linux's default starts at 32768, and these namespaces keep it or raise it), so the kernel hands no
+// other socket one of them.
 const firstUDPProbePort = 20000
 
 // wantUDP probes addr from its own source port, so the table is asked about a new flow (#279): the table lets a flow it
@@ -1007,15 +1013,18 @@ const firstUDPProbePort = 20000
 // it again, would be that flow's, answered by a table that refuses the probe.
 func (n *netns) wantUDP(t *testing.T, what, from, addr string, reach bool) {
 	t.Helper()
-	port := firstUDPProbePort + int(n.udpProbes.Add(1)) - 1
+	port := firstUDPProbePort + n.udpProbes // on the test's goroutine: probe may run check on another
+	n.udpProbes++
 	n.probe(func() {
 		cmd := n.helper(from, "udial", addr)
-		cmd.Args = slices.Insert(cmd.Args, len(cmd.Args)-1, strconv.Itoa(port))
+		cmd.Env = append(cmd.Env, udpFrom+"="+strconv.Itoa(port))
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		err := cmd.Run()
-		// 2: the probe never asked (its port taken, or the Go runtime failed, as at a task limit), which is no refusal.
-		if e, ok := err.(*exec.ExitError); ok && e.ExitCode() == 2 {
+		// The probe never asked, which is no refusal: it didn't start, or exited 2 (its port taken, or the Go runtime
+		// failed, as at a task limit).
+		var exit *exec.ExitError
+		if err != nil && (!errors.As(err, &exit) || exit.ExitCode() == 2) {
 			t.Errorf("%s: %s → %s/udp from port %d: no probe: %s", what, orBox(from), addr, port, bytes.TrimSpace(stderr.Bytes()))
 			return
 		}
