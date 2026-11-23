@@ -439,33 +439,36 @@ func (h Host) userStep(u User) (userCmd, error) {
 	newU, hasNewU := users[u.New]
 	oldG, hasOldG := groups[u.Old]
 	newG, hasNewG := groups[u.New]
-	// The ids whose files become the fixed id's: the old user's and group's when not the fixed one.
+	// The ids whose files become the fixed id's: the user's and group's when not the fixed one, both at once.
 	other := func(id int, has bool) int {
 		if has && id != u.ID {
 			return id
 		}
 		return -1
 	}
-	do := func(cmd string, uid, gid int, args ...string) (userCmd, error) {
-		return userCmd{cmd, args, uid, gid}, nil
-	}
+	id := strconv.Itoa(u.ID)
 	switch {
 	case hasOldU && oldU == u.ID && hasNewU && newU != u.ID:
-		return do("userdel", -1, -1, u.New)
+		return userCmd{cmd: "userdel", args: []string{u.New}, uid: -1, gid: -1}, nil
 	case hasOldG && oldG == u.ID && hasNewG && newG != u.ID:
-		return do("groupdel", -1, -1, u.New)
+		return userCmd{cmd: "groupdel", args: []string{u.New}, uid: -1, gid: -1}, nil
+	// main's user beside the new one sysusers made first: it goes, as no other user is in its groups on main.
 	case hasOldU && oldU != u.ID && hasNewU && newU == u.ID:
-		return do("userdel", oldU, other(oldG, hasOldG), u.Old)
+		return userCmd{cmd: "userdel", args: []string{u.Old}, uid: oldU, gid: other(oldG, hasOldG)}, nil
 	case hasOldG && oldG != u.ID && hasNewG && newG == u.ID:
-		return do("groupdel", -1, oldG, u.Old)
+		return userCmd{cmd: "groupdel", args: []string{u.Old}, uid: -1, gid: oldG}, nil
 	case hasOldG && !hasNewG:
-		return do("groupmod", -1, -1, "--new-name", u.New, u.Old)
+		return userCmd{cmd: "groupmod", args: []string{"--new-name", u.New, u.Old}, uid: -1, gid: -1}, nil
 	case hasOldU && !hasNewU:
-		return do("usermod", -1, -1, "--login", u.New, "--home", u.Home, u.Old)
+		return userCmd{cmd: "usermod", args: []string{"--login", u.New, "--home", u.Home, u.Old}, uid: -1, gid: -1}, nil
 	case !hasOldG && hasNewG && newG != u.ID && free(groups, u.ID, u.New):
-		return do("groupmod", -1, newG, "--gid", strconv.Itoa(u.ID), u.New)
+		return userCmd{cmd: "groupmod", args: []string{"--gid", id, u.New}, uid: other(newU, hasNewU && free(users, u.ID, u.New)), gid: newG}, nil
+	// usermod also chowns the home's tree, only when the home is the user's own: never "/", which is root's.
 	case !hasOldU && hasNewU && newU != u.ID && free(users, u.ID, u.New):
-		return do("usermod", newU, -1, "--uid", strconv.Itoa(u.ID), u.New)
+		return userCmd{cmd: "usermod", args: []string{"--uid", id, u.New}, uid: newU, gid: other(newG, hasNewG && free(groups, u.ID, u.New))}, nil
+	}
+	if hasOldU || hasOldG || hasNewU && newU != u.ID || hasNewG && newG != u.ID {
+		h.Log.Warn("a user is left at an id not its fixed one, or under its old name: another holds the fixed id", "user", u.New, "id", u.ID)
 	}
 	return userCmd{}, nil
 }
@@ -497,9 +500,20 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 	n := 0
 	for _, d := range Dirs {
 		for _, p := range []string{d.Old, d.New} {
-			err := filepath.WalkDir(h.at(p), func(p string, _ fs.DirEntry, err error) error {
+			top, err := os.Lstat(h.at(p))
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			err = filepath.WalkDir(h.at(p), func(p string, e fs.DirEntry, err error) error {
 				if err != nil {
 					return err
+				}
+				// Never into another filesystem: a share's mount point still mounted holds files of others' ids.
+				if e.IsDir() && !sameDevice(top, p) {
+					return fs.SkipDir
 				}
 				fu, fg, err := owner(p)
 				if err != nil {
@@ -522,7 +536,7 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 				n++
 				return chown(p, nu, ng)
 			})
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err != nil {
 				return err
 			}
 		}
@@ -531,6 +545,17 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 		r.Users = append(r.Users, fmt.Sprintf("chown %d files of uid %d, gid %d to %d", n, uid, gid, id))
 	}
 	return nil
+}
+
+// sameDevice says whether the folder p is on top's filesystem.
+func sameDevice(top fs.FileInfo, p string) bool {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return true // the walk's own error reports it
+	}
+	a, ok1 := top.Sys().(*syscall.Stat_t)
+	b, ok2 := fi.Sys().(*syscall.Stat_t)
+	return !ok1 || !ok2 || a.Dev == b.Dev
 }
 
 // lstatOwner is a file's owner, not following a link.

@@ -32,9 +32,10 @@ the tracker says which.
 - **When `integration` is ready** (every PR stacked for it is merged into it), the loop reviews the standing PR along
   several axes at once: security, correctness, the spec and ADRs, tests and isolation, the design system and
   accessibility, and supply chain and CI. It runs up to three rounds, incrementally (see step 9). When a round passes,
-  the loop squash-merges it into `main` (the maintainer, 2026-11-11). Three failed rounds park it for the maintainer.
+  the loop squash-merges it into `main` (the maintainer, 2026-11-11), on his word as every merge. Three failed rounds
+  park it for the maintainer.
 - **Every merge waits for the maintainer's word.** In practice the loop merges, into `integration` or `main`, only once
-  the maintainer has said so for that merge; a passed review makes a PR ready, not merged.
+  the maintainer has said so for that merge; a passed review makes a PR ready to merge, and the loop then asks.
 - **At most two agents run at once**, counting implementers and reviewers together, so the work stays inside the
   usage limit (the maintainer, 2026-11-11). Reviews that unblock `integration` come first, then the critical path.
   Agents keep their reports short (about 300 words), and the orchestrator keeps its own turns brief.
@@ -73,7 +74,7 @@ the tracker says which.
      - they review only what changed since the last round;
      - a new problem in code the round didn't change is filed as a follow-up issue, not a blocker, unless it is a
        high-severity security problem.
-10. **Merge.**
+10. **Merge**, on the maintainer's word (see Branches).
     1. Squash-merge into the PR's base and delete the branch.
     2. Remove `in-progress`.
     3. For `integration`: close the ticket by hand, with a comment naming the PR, since `Closes` fires only on `main`.

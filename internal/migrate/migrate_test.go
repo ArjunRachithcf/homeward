@@ -726,3 +726,22 @@ func TestAnOldGroupUserdelKeepsGoesToo(t *testing.T) {
 		t.Errorf("ran %q", n.ran)
 	}
 }
+
+// A file the run can't give the fixed id (it vanished, or chown fails) stops the run before the old id goes: no file
+// is left to an id nobody holds.
+func TestAFileThatCantBeReownedKeepsTheOldID(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, true)
+	h := migrate.WithOwners(n.host(), n.owner, func(p string, uid, gid int) error {
+		if strings.HasSuffix(p, "manager.db") {
+			return &fs.PathError{Op: "chown", Path: p, Err: fs.ErrNotExist}
+		}
+		return n.chown(p, uid, gid)
+	})
+	if _, err := migrate.Run(context.Background(), h); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("got %v, want the chown's error", err)
+	}
+	if !strings.Contains(n.read("etc/passwd"), "\nhomerslab:x:979:") || slices.Contains(n.ran, "userdel homerslab") {
+		t.Errorf("the old user went with a file still its own: ran %q", n.ran)
+	}
+}
