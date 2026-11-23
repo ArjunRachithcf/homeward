@@ -241,9 +241,9 @@ func sameSet(a, b []string) bool {
 }
 
 // guardSettingsDrift (#273): a guard's provider changed in the console where it decides who gets past it, its mappings
-// left alone. Each change alone shows in the report (ForwardAuth false); Prepare puts every one back. Header auth on is
-// the way in it would open: the outpost takes Authorization: Basic with a person's LDAP app password for a session,
-// through the provider's client_credentials grant, with no passkey; after Prepare, the guard refuses that request.
+// left alone. Each change alone shows in the report (ForwardAuth false); Prepare puts every one back. An app password
+// in an Authorization header, which the outpost takes for a session through the provider's client_credentials grant,
+// never gets a person past the guard as the edge asks it.
 func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 	return func(t *testing.T) {
 		ctx, slug, host := context.Background(), "homerslab-chores", "chores."+household.Domain
@@ -353,19 +353,27 @@ func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		w.raw(t, w.own, "PATCH", "/api/v3/outposts/instances/"+o.PK+"/", map[string]any{"providers": o.Providers}, nil)
 		report("back on the embedded outpost by hand", true)
 
-		// The way in: theo, a kid, has an app password for a kids' LDAP app, and chores is the kids' guarded app.
+		// The way in: theo, a kid, has an app password for a kids' LDAP app, and chores is the kids' guarded app. The
+		// outpost accepts client_credentials regardless of the provider's settings: Basic with the app password lets theo
+		// in. So the edge never passes Authorization or Proxy-Authorization to a guard (edge.CredentialHeaders, the
+		// request matrix's rows of #273); asked as the edge asks, the guard sends theo to sign in.
 		books := idp.LDAPApp{Slug: "homerslab-kids-books-273", Name: "Kids' books", Roles: []idp.Role{idp.Kid}}
 		if _, err := a.EnsureLDAP(ctx, books); err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = a.DeleteLDAP(context.Background(), books.Slug) }()
 		basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("theo:"+appPassword(t, a, books.Slug, "theo")))
-		ask := func() (int, string) {
+		ask := func(asTheEdge bool) (int, string) {
 			t.Helper()
 			req, _ := http.NewRequest("GET", upstream+"/outpost.goauthentik.io/auth/caddy", nil)
 			for k, v := range map[string]string{"X-Forwarded-Host": host, "X-Forwarded-Proto": "https", "X-Forwarded-Uri": "/", "X-Forwarded-Method": "GET",
-				"Authorization": basic} {
+				"Authorization": basic, "Proxy-Authorization": basic} {
 				req.Header.Set(k, v)
+			}
+			if asTheEdge {
+				for _, h := range edge.CredentialHeaders {
+					req.Header.Del(h)
+				}
 			}
 			c := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 			resp, err := c.Do(req)
@@ -377,19 +385,20 @@ func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		}
 		let := func(status int, uid string) bool { return status/100 == 2 && uid != "" }
 		// The outpost takes a provider's change a while after Authentik saves it.
-		until := func(how string, want bool) {
+		until := func(how string, asTheEdge, want bool) {
 			t.Helper()
-			status, uid := ask()
-			for deadline := time.Now().Add(3 * time.Minute); let(status, uid) != want && time.Now().Before(deadline); status, uid = ask() {
+			status, uid := ask(asTheEdge)
+			for deadline := time.Now().Add(3 * time.Minute); let(status, uid) != want && time.Now().Before(deadline); status, uid = ask(asTheEdge) {
 				time.Sleep(2 * time.Second)
 			}
 			if let(status, uid) != want {
-				t.Errorf("%s: Basic with theo's app password at %s: %d, uid %q; want let in %v", how, host, status, uid, want)
+				t.Errorf("%s: Basic with theo's app password at %s (as the edge asks: %v): %d, uid %q; want let in %v", how, host, asTheEdge, status, uid, want)
 			}
 		}
-		until("as Homeward made it", false)
+		until("claim: as Homeward made it, asked directly", false, true)
+		until("as Homeward made it", true, false)
 		patch(changes[0])
-		until("header auth on", true)
+		until("header auth on", true, false)
 
 		// Every change at once, then Prepare: each is put back, and the request is refused again.
 		for _, change := range changes[1:] {
@@ -417,6 +426,6 @@ func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		if !slices.Contains(embedded().Providers, pk) {
 			t.Errorf("after Prepare, the embedded outpost serves %v, want the guard %d too", embedded().Providers, pk)
 		}
-		until("after Prepare", false)
+		until("after Prepare", true, false)
 	}
 }

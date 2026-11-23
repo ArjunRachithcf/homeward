@@ -402,10 +402,17 @@ func Render(c Config) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// CredentialHeaders never reach a guard, neither its answer for an app nor the provider's own paths (#273). Authentik's
+// outpost accepts client_credentials regardless of its provider's settings (Basic with an app password, or a bearer
+// token, in an Authorization header, for a session), so an LDAP app password an app's container saw would open every
+// guarded app with no passkey. The app itself still gets the client's own. Header names are matched without regard to
+// case, over HTTP/1.1 and HTTP/2 alike.
+var CredentialHeaders = []string{"Authorization", "Proxy-Authorization"}
+
 // appRoute is a guarded app's site: the client's identity headers deleted first; the provider's own paths to the
-// provider; then the guard, whose 2xx answer sets the identity it names (and passes on the provider's refreshed cookie,
-// ADR 0006); then the app, without the provider's cookie, and without any cookie it sets for a whole household domain
-// (#83). It is the site's handler, which Render serves at the app's name with HSTS and Secure cookies, as every name.
+// provider, without the client's credentials (CredentialHeaders); then the guard, without them too, whose 2xx answer
+// sets the identity it names (and passes on the provider's refreshed cookie, ADR 0006); then the app, with the client's
+// credentials, without the provider's cookie, and without any cookie it sets for a whole household domain (#83). It is the site's handler, which Render serves at the app's name with HSTS and Secure cookies, as every name.
 func appRoute(a App, domains []string) (obj, error) {
 	if a.SignsIn {
 		return nativeRoute(a, domains)
@@ -420,8 +427,9 @@ func appRoute(a App, domains []string) (obj, error) {
 	// The provider's refreshed cookies, each its own header: a placeholder would join them into one with commas.
 	copied = append(copied, obj{"handle": []obj{{"handler": "copy_response_headers", "include": []string{"Set-Cookie"}}}})
 	guard := obj{"handler": "reverse_proxy", "upstreams": []obj{{"dial": g.Dial}},
-		"rewrite":         obj{"method": "GET", "uri": g.AuthURI},
-		"headers":         obj{"request": obj{"set": obj{"X-Forwarded-Method": []string{"{http.request.method}"}, "X-Forwarded-Uri": []string{"{http.request.uri}"}}}},
+		"rewrite": obj{"method": "GET", "uri": g.AuthURI},
+		"headers": obj{"request": obj{"delete": CredentialHeaders,
+			"set": obj{"X-Forwarded-Method": []string{"{http.request.method}"}, "X-Forwarded-Uri": []string{"{http.request.uri}"}}}},
 		"handle_response": []obj{{"match": obj{"status_code": []int{2}}, "routes": copied}}}
 	// The provider's cookies, out of the Cookie header the app gets; a Set-Cookie of the app's for a household domain,
 	// emptied (a browser ignores an empty one).
@@ -432,7 +440,8 @@ func appRoute(a App, domains []string) (obj, error) {
 	}
 	var own []obj
 	if len(g.Paths) > 0 {
-		own = []obj{{"match": []obj{{"path": g.Paths}}, "handle": []obj{{"handler": "reverse_proxy", "upstreams": []obj{{"dial": g.Dial}}}}, "terminal": true}}
+		own = []obj{{"match": []obj{{"path": g.Paths}}, "handle": []obj{{"handler": "reverse_proxy", "upstreams": []obj{{"dial": g.Dial}},
+			"headers": obj{"request": obj{"delete": CredentialHeaders}}}}, "terminal": true}}
 	}
 	sub := slices.Concat(
 		[]obj{{"handle": []obj{{"handler": "headers", "request": obj{"delete": identitySpellings}}}}},

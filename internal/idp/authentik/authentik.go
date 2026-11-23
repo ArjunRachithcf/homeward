@@ -1459,9 +1459,10 @@ type guardProvider struct {
 	Mode     string   `json:"mode"`
 	App      *string  `json:"assigned_application_slug"`
 	Mappings []string `json:"property_mappings"`
-	// Header auth takes an Authorization header for a session: Basic with an app password or a service account's
-	// token, or Bearer with a JWT of a federated source or provider, through the provider's client_credentials grant,
-	// which runs no flow. An LDAP app password an app's container saw would open every guarded app with no passkey.
+	// Header auth is Authentik's setting for taking an Authorization header (an app password, a token) for a session,
+	// through the provider's client_credentials grant, which runs no flow. The outpost accepts client_credentials
+	// regardless, so the edge never passes either credential header to a guard (edge.CredentialHeaders); Homeward keeps
+	// the setting off as well.
 	Intercept *bool `json:"intercept_header_auth"`
 	// Basic auth sends the app a username and password from the person's attributes.
 	Basic          *bool           `json:"basic_auth_enabled"`
