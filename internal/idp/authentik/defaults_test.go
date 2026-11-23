@@ -16,13 +16,20 @@ import (
 
 // Authentik is ready for Prepare once its default and system blueprints have applied, and every default flow is
 // there. A blueprint whose file an upgrade removed is orphaned: there is nothing left to apply, so it doesn't stop
-// Prepare; one that hasn't applied yet, or failed, does.
+// Prepare; one that hasn't applied yet, or failed, does. One in warning, or in a state Authentik doesn't have, fails at
+// once, naming the blueprint (#269): Authentik at Version never sets warning (its apply is all or nothing, and the
+// status is read-only over the API), so Homeward can't know what of it applied and doesn't wait for it to change.
 func TestDefaultsAreReadyOnceTheBlueprintsHaveApplied(t *testing.T) {
 	testenv.Isolate(t)
 	var blueprints []map[string]any
+	var applied []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var results []any
 		switch {
+		case r.Method == http.MethodPost:
+			applied = append(applied, r.URL.Path)
+			_, _ = w.Write([]byte("{}"))
+			return
 		case r.URL.Path == "/api/v3/flows/instances/":
 			results = []any{map[string]string{"pk": "f", "slug": r.URL.Query().Get("slug")}}
 		case r.URL.Path == "/api/v3/crypto/certificatekeypairs/":
@@ -43,25 +50,45 @@ func TestDefaultsAreReadyOnceTheBlueprintsHaveApplied(t *testing.T) {
 		t.Fatal(err)
 	}
 	bp := func(path, status string, enabled bool) map[string]any {
-		return map[string]any{"path": path, "status": status, "enabled": enabled}
+		return map[string]any{"pk": "pk-" + path, "path": path, "status": status, "enabled": enabled}
 	}
+	const ready, notYet, failed = "ready", "not ready yet", "failed"
 	for _, c := range []struct {
 		name  string
 		bps   []map[string]any
-		ready bool
+		want  string
+		names string // the blueprint a failure names
 	}{
-		{"all applied", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("system/b.yaml", "successful", true)}, true},
-		{"one removed by an upgrade (orphaned)", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("default/flow-gone.yaml", "orphaned", true)}, true},
-		{"one not applied yet", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("default/flow-b.yaml", "unknown", true)}, false},
-		{"one failed", []map[string]any{bp("default/flow-a.yaml", "error", true)}, false},
-		{"an example, disabled", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("example/x.yaml", "unknown", false)}, true},
-		{"none found yet", nil, false},
-		{"only orphaned ones", []map[string]any{bp("default/flow-gone.yaml", "orphaned", true)}, false},
+		{"all applied", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("system/b.yaml", "successful", true)}, ready, ""},
+		{"one removed by an upgrade (orphaned)", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("default/flow-gone.yaml", "orphaned", true)}, ready, ""},
+		{"one not applied yet", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("default/flow-b.yaml", "unknown", true)}, notYet, ""},
+		{"one failed", []map[string]any{bp("default/flow-a.yaml", "error", true)}, notYet, ""},
+		{"an example, disabled", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("example/x.yaml", "unknown", false)}, ready, ""},
+		{"none found yet", nil, notYet, ""},
+		{"only orphaned ones", []map[string]any{bp("default/flow-gone.yaml", "orphaned", true)}, notYet, ""},
+		{"one in warning", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("system/w.yaml", "warning", true)}, failed, "system/w.yaml"},
+		{"one in warning, another not applied yet", []map[string]any{bp("default/flow-b.yaml", "unknown", true), bp("default/flow-w.yaml", "warning", true)}, failed, "default/flow-w.yaml"},
+		{"one in a state Authentik doesn't have", []map[string]any{bp("default/flow-a.yaml", "half-done", true)}, failed, "default/flow-a.yaml"},
+		{"an example in warning, disabled", []map[string]any{bp("default/flow-a.yaml", "successful", true), bp("example/x.yaml", "warning", false)}, ready, ""},
 	} {
-		blueprints = c.bps
+		blueprints, applied = c.bps, nil
 		err := defaultsReady(context.Background(), a)
-		if c.ready != (err == nil) || (err != nil && !errors.Is(err, idp.ErrNotReady)) {
-			t.Errorf("%s: %v", c.name, err)
+		got := ready
+		switch {
+		case errors.Is(err, idp.ErrNotReady):
+			got = notYet
+		case err != nil:
+			got = failed
+		}
+		if got != c.want {
+			t.Errorf("%s: %s (%v), want %s", c.name, got, err, c.want)
+		}
+		if c.want == failed && err != nil && !strings.Contains(err.Error(), c.names) {
+			t.Errorf("%s: %v doesn't name %s", c.name, err, c.names)
+		}
+		// Only one in error is applied again; Homeward leaves one in a state it doesn't know as it found it.
+		if c.want == failed && len(applied) > 0 {
+			t.Errorf("%s: applied %q again", c.name, applied)
 		}
 		if err != nil && strings.Contains(err.Error(), "token-PLACEHOLDER") {
 			t.Errorf("%s: the error holds the token", c.name)

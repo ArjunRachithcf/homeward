@@ -223,6 +223,11 @@ const retryEvery = 20 * time.Second
 // guard: every flow of its default blueprints, with every default and system blueprint applied (they come one by one,
 // a fresh Authentik answers before they are), and the signing key. Prepare guards the flows it finds, so it must not
 // run before they all are there.
+//
+// A blueprint not applied yet ("unknown") or failed ("error") is not ready yet. One in any other state fails at once,
+// naming it (#269): Authentik at Version has a "warning" status but never sets it (its apply is one transaction, all
+// or nothing, and the status is read-only over the API), so a blueprint in warning, or in a state Authentik doesn't
+// have, holds Homeward doesn't know what, and won't turn into one Prepare can build on by waiting.
 func defaultsReady(ctx context.Context, a *api) error {
 	for _, slug := range DefaultFlows {
 		f, err := find[flow](ctx, a, "/flows/instances/?slug="+q(slug), "slug", slug)
@@ -252,8 +257,13 @@ func defaultsReady(ctx context.Context, a *api) error {
 			continue
 		}
 		n++
-		if b.Status == "successful" {
+		switch b.Status {
+		case "successful":
 			continue
+		case "unknown", "error":
+		default:
+			return fmt.Errorf("authentik: its blueprint %s is in %q, which Authentik %s never sets, so what of it applied "+
+				"is unknown: see it in Authentik's admin interface, and apply it again there", b.Path, b.Status, Version)
 		}
 		// One that failed is applied again, as Authentik's worker would only within the hour: at its first start the
 		// worker may apply a blueprint before the ones it builds on (#195's CI: default/flow-oobe.yaml). Not more often
