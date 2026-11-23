@@ -9,7 +9,9 @@
 // nothing of HomersLab's left is a no-op. Each step is idempotent, and leaves the node in a state the next run
 // finishes, wherever a run stopped (a crash, a power cut): a folder moves in one rename(2), with the sealed
 // credentials in it, so it is under its old name or its new one, never both or neither; a user is renamed in place,
-// keeping its fixed uid, so the files it owns stay its own. What the agent derives from its state (apps' and shares'
+// keeping its fixed uid, so the files it owns stay its own. A user main's HomersLab made before the fixed ids (#190),
+// with an id sysusers picked, ends at the fixed id too: the files that id owns in the package's folders are the fixed
+// id's first, one chown each, then the user takes the fixed id, or goes when sysusers made the new one first. What the agent derives from its state (apps' and shares'
 // units, the drop-ins of its own units) isn't moved but dropped: the run leaves a mark in the agent's state, and the
 // agent writes them again under the new names as it starts (agent.Renamed), and removes the mark only once that is
 // done.
@@ -29,13 +31,14 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/ArjunRachithcf/homeward/internal/atomicfile"
 	"github.com/ArjunRachithcf/homeward/internal/host"
 )
 
 // User is one of the package's users (packaging/sysusers.d), under its old and new name, with the fixed uid and gid
-// they share (#190) and the new home folder.
+// they share (#190) and the new home folder. A node main installed has the first only, with another id.
 type User struct {
 	Old, New string
 	ID       int
@@ -121,6 +124,10 @@ type Host struct {
 	UsersOnly bool
 	// fail, in tests, makes the named step fail before it changes anything: a crash at that point.
 	fail func(step string) error
+	// owner and chown, in tests that can't chown: a file's owner, not following a link, and setting it. os.Lstat's
+	// and os.Lchown when nil.
+	owner func(p string) (uid, gid int, err error)
+	chown func(p string, uid, gid int) error
 }
 
 // Result is what a run did.
@@ -371,7 +378,9 @@ func (h Host) stop(ctx context.Context, r *Result) error {
 
 // users renames each old user and group in place, keeping its fixed id. A new one that sysusers made first, with
 // another id because the old one held the fixed id (sysusers falls back to a free one), goes first: it owns nothing
-// yet, since nothing of Homeward's runs before a run.
+// yet, since nothing of Homeward's runs before a run. An old one of another id (main's, before the fixed ids of #190:
+// sysusers picked it) ends at the fixed id too: its files in the package's folders are the fixed id's first, then it
+// takes the fixed id, or goes when sysusers made the new one first with it.
 func (h Host) users(ctx context.Context, r *Result) error {
 	list := h.Users
 	if list == nil {
@@ -379,52 +388,162 @@ func (h Host) users(ctx context.Context, r *Result) error {
 	}
 	for _, u := range list {
 		// One step at a time, each from the files as they are now: userdel may take the user's group with it.
-		for range 4 {
-			cmd, args, err := h.userStep(u)
+		for range 6 {
+			s, err := h.userStep(u)
 			if err != nil {
 				return err
 			}
-			if cmd == "" {
+			if s.cmd == "" {
 				break
 			}
-			if err := h.step(cmd + " " + u.Old); err != nil {
+			if s.uid >= 0 || s.gid >= 0 {
+				// Before the id it stands for is gone: a run that stops in between does it again from the same files.
+				if err := h.reown(s.uid, s.gid, u.ID, r); err != nil {
+					return err
+				}
+			}
+			if err := h.step(s.cmd + " " + u.Old); err != nil {
 				return err
 			}
-			if _, err := h.Run(ctx, host.Cmd{Name: cmd, Args: args}); err != nil {
+			if _, err := h.Run(ctx, host.Cmd{Name: s.cmd, Args: s.args}); err != nil {
 				return err
 			}
-			r.Users = append(r.Users, cmd+" "+strings.Join(args, " "))
+			r.Users = append(r.Users, s.cmd+" "+strings.Join(s.args, " "))
 		}
 	}
 	return nil
 }
 
-// userStep is the next command that moves u to its new name, or "" when there is none: done, or nothing of it here.
-// A new user or group of another id goes only while the old one holds the fixed id; one of the fixed id is kept.
-func (h Host) userStep(u User) (string, []string, error) {
+// userCmd is the next command that moves a user to its new name and fixed id, and the ids (-1: none) whose files are
+// the fixed id's before it runs.
+type userCmd struct {
+	cmd      string
+	args     []string
+	uid, gid int
+}
+
+// userStep is the next command that moves u to its new name and fixed id, or "" when there is none: done, or nothing
+// of it here. A new user or group of another id goes only while the old one holds the fixed id; one of the fixed id is
+// kept, and an old one of another id goes then. A user or group of another id takes the fixed id only while nothing
+// else holds it.
+func (h Host) userStep(u User) (userCmd, error) {
 	users, err := readIDs(h.at("etc/passwd"))
 	if err != nil {
-		return "", nil, err
+		return userCmd{}, err
 	}
 	groups, err := readIDs(h.at("etc/group"))
 	if err != nil {
-		return "", nil, err
+		return userCmd{}, err
 	}
 	oldU, hasOldU := users[u.Old]
 	newU, hasNewU := users[u.New]
 	oldG, hasOldG := groups[u.Old]
 	newG, hasNewG := groups[u.New]
+	// The ids whose files become the fixed id's: the old user's and group's when not the fixed one.
+	other := func(id int, has bool) int {
+		if has && id != u.ID {
+			return id
+		}
+		return -1
+	}
+	do := func(cmd string, uid, gid int, args ...string) (userCmd, error) {
+		return userCmd{cmd, args, uid, gid}, nil
+	}
 	switch {
 	case hasOldU && oldU == u.ID && hasNewU && newU != u.ID:
-		return "userdel", []string{u.New}, nil
+		return do("userdel", -1, -1, u.New)
 	case hasOldG && oldG == u.ID && hasNewG && newG != u.ID:
-		return "groupdel", []string{u.New}, nil
+		return do("groupdel", -1, -1, u.New)
+	case hasOldU && oldU != u.ID && hasNewU && newU == u.ID:
+		return do("userdel", oldU, other(oldG, hasOldG), u.Old)
+	case hasOldG && oldG != u.ID && hasNewG && newG == u.ID:
+		return do("groupdel", -1, oldG, u.Old)
 	case hasOldG && !hasNewG:
-		return "groupmod", []string{"--new-name", u.New, u.Old}, nil
+		return do("groupmod", -1, -1, "--new-name", u.New, u.Old)
 	case hasOldU && !hasNewU:
-		return "usermod", []string{"--login", u.New, "--home", u.Home, u.Old}, nil
+		return do("usermod", -1, -1, "--login", u.New, "--home", u.Home, u.Old)
+	case !hasOldG && hasNewG && newG != u.ID && free(groups, u.ID, u.New):
+		return do("groupmod", -1, newG, "--gid", strconv.Itoa(u.ID), u.New)
+	case !hasOldU && hasNewU && newU != u.ID && free(users, u.ID, u.New):
+		return do("usermod", newU, -1, "--uid", strconv.Itoa(u.ID), u.New)
 	}
-	return "", nil, nil
+	return userCmd{}, nil
+}
+
+// free says whether no name but name has id.
+func free(ids map[string]int, id int, name string) bool {
+	for n, i := range ids {
+		if i == id && n != name {
+			return false
+		}
+	}
+	return true
+}
+
+// reown gives the files in the package's folders (under their old names and their new ones) that uid or gid owns (-1:
+// neither) the fixed id instead, a link's own owner too. Each file is changed in one chown, from its owner as it is
+// now, so a run that stops anywhere leaves the rest to the next.
+func (h Host) reown(uid, gid, id int, r *Result) error {
+	if h.UsersOnly {
+		return nil
+	}
+	owner, chown := h.owner, h.chown
+	if owner == nil {
+		owner = lstatOwner
+	}
+	if chown == nil {
+		chown = os.Lchown
+	}
+	n := 0
+	for _, d := range Dirs {
+		for _, p := range []string{d.Old, d.New} {
+			err := filepath.WalkDir(h.at(p), func(p string, _ fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				fu, fg, err := owner(p)
+				if err != nil {
+					return err
+				}
+				nu, ng := fu, fg
+				if fu == uid {
+					nu = id
+				}
+				if fg == gid {
+					ng = id
+				}
+				if nu == fu && ng == fg {
+					return nil
+				}
+				rel, _ := filepath.Rel(h.Root, p)
+				if err := h.step("reown " + rel); err != nil {
+					return err
+				}
+				n++
+				return chown(p, nu, ng)
+			})
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	if n > 0 {
+		r.Users = append(r.Users, fmt.Sprintf("chown %d files of uid %d, gid %d to %d", n, uid, gid, id))
+	}
+	return nil
+}
+
+// lstatOwner is a file's owner, not following a link.
+func lstatOwner(p string) (int, int, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return 0, 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf("%s: no owner", p)
+	}
+	return int(st.Uid), int(st.Gid), nil
 }
 
 // readIDs reads the names and ids of a passwd or group file.
