@@ -2,12 +2,16 @@ package authentik_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ArjunRachithcf/homeward/internal/edge"
 	"github.com/ArjunRachithcf/homeward/internal/idp"
 	"github.com/ArjunRachithcf/homeward/internal/idp/authentik"
 	"github.com/ArjunRachithcf/homeward/internal/idp/idptest"
@@ -234,4 +238,185 @@ func sameSet(a, b []string) bool {
 	slices.Sort(a)
 	slices.Sort(b)
 	return slices.Equal(a, b)
+}
+
+// guardSettingsDrift (#273): a guard's provider changed in the console where it decides who gets past it, its mappings
+// left alone. Each change alone shows in the report (ForwardAuth false); Prepare puts every one back. Header auth on is
+// the way in it would open: the outpost takes Authorization: Basic with a person's LDAP app password for a session,
+// through the provider's client_credentials grant, with no passkey; after Prepare, the guard refuses that request.
+func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx, slug, host := context.Background(), "homerslab-chores", "chores."+household.Domain
+		report := func(how string, want bool) {
+			t.Helper()
+			if r, err := a.Report(ctx); err != nil || r.ForwardAuth != want {
+				t.Errorf("%s: the report %+v %v, want ForwardAuth %v", how, r, err, want)
+			}
+		}
+		pk := w.guardProvider(t, slug).PK
+		at := fmt.Sprintf("/api/v3/providers/proxy/%d/", pk)
+		read := func() map[string]any {
+			t.Helper()
+			var p map[string]any
+			w.raw(t, w.own, "GET", at, nil, &p)
+			return p
+		}
+		patch := func(change map[string]any) {
+			t.Helper()
+			body := map[string]any{"mode": "forward_single"} // Authentik validates a partial update as proxy mode otherwise
+			for k, v := range change {
+				body[k] = v
+			}
+			w.raw(t, w.own, "PATCH", at, body, nil)
+		}
+		flowPK := func(slug string) string {
+			t.Helper()
+			var fs struct {
+				Results []struct {
+					PK   string `json:"pk"`
+					Slug string `json:"slug"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/flows/instances/?slug="+slug, nil, &fs)
+			if len(fs.Results) != 1 || fs.Results[0].Slug != slug {
+				t.Fatalf("the flow %s: %+v", slug, fs.Results)
+			}
+			return fs.Results[0].PK
+		}
+		var admin struct {
+			Results []struct {
+				PK int `json:"pk"`
+			}
+		}
+		w.raw(t, w.own, "GET", "/api/v3/providers/oauth2/?name=homerslab-admin", nil, &admin)
+		if len(admin.Results) != 1 {
+			t.Fatalf("Admin's provider: %+v", admin.Results)
+		}
+		report("as Homeward made it", true)
+		before := read()
+		changes := []map[string]any{
+			{"intercept_header_auth": true},
+			{"basic_auth_enabled": true, "basic_auth_user_attribute": "username", "basic_auth_password_attribute": "password"},
+			{"authentication_flow": flowPK("default-authentication-flow")},
+			{"authorization_flow": flowPK("default-provider-authorization-explicit-consent")},
+			{"invalidation_flow": flowPK("default-invalidation-flow")},
+			{"skip_path_regex": "^/.*$"},
+			{"jwt_federation_providers": []int{admin.Results[0].PK}},
+			{"cookie_domain": household.Domain},
+			{"access_token_validity": "weeks=52"},
+		}
+		// Whatever stops the case midway, the guard goes back as it was for the cases after it.
+		defer func() {
+			undo := map[string]any{}
+			for _, change := range changes {
+				for k := range change {
+					undo[k] = before[k]
+				}
+			}
+			patch(undo)
+		}()
+		for _, change := range changes {
+			patch(change)
+			report(fmt.Sprintf("changed: %v", change), false)
+			undo := map[string]any{}
+			for k := range change {
+				undo[k] = before[k]
+			}
+			patch(undo)
+			report(fmt.Sprintf("changed back by hand: %v", undo), true)
+		}
+
+		// Off the embedded outpost, which the edge asks.
+		type outpost struct {
+			PK        string `json:"pk"`
+			Managed   string `json:"managed"`
+			Providers []int  `json:"providers"`
+		}
+		embedded := func() outpost {
+			t.Helper()
+			var os struct{ Results []outpost }
+			w.raw(t, w.own, "GET", "/api/v3/outposts/instances/?managed__iexact=goauthentik.io/outposts/embedded", nil, &os)
+			if len(os.Results) != 1 || os.Results[0].Managed != "goauthentik.io/outposts/embedded" {
+				t.Fatalf("the embedded outpost: %+v", os.Results)
+			}
+			return os.Results[0]
+		}
+		o := embedded()
+		defer func() {
+			if now := embedded(); !slices.Contains(now.Providers, pk) {
+				w.raw(t, w.own, "PATCH", "/api/v3/outposts/instances/"+now.PK+"/", map[string]any{"providers": append(now.Providers, pk)}, nil)
+			}
+		}()
+		w.raw(t, w.own, "PATCH", "/api/v3/outposts/instances/"+o.PK+"/", map[string]any{"providers": slices.DeleteFunc(slices.Clone(o.Providers),
+			func(p int) bool { return p == pk })}, nil)
+		report("off the embedded outpost", false)
+		w.raw(t, w.own, "PATCH", "/api/v3/outposts/instances/"+o.PK+"/", map[string]any{"providers": o.Providers}, nil)
+		report("back on the embedded outpost by hand", true)
+
+		// The way in: theo, a kid, has an app password for a kids' LDAP app, and chores is the kids' guarded app.
+		books := idp.LDAPApp{Slug: "homerslab-kids-books-273", Name: "Kids' books", Roles: []idp.Role{idp.Kid}}
+		if _, err := a.EnsureLDAP(ctx, books); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = a.DeleteLDAP(context.Background(), books.Slug) }()
+		basic := "Basic " + base64.StdEncoding.EncodeToString([]byte("theo:"+appPassword(t, a, books.Slug, "theo")))
+		ask := func() (int, string) {
+			t.Helper()
+			req, _ := http.NewRequest("GET", upstream+"/outpost.goauthentik.io/auth/caddy", nil)
+			for k, v := range map[string]string{"X-Forwarded-Host": host, "X-Forwarded-Proto": "https", "X-Forwarded-Uri": "/", "X-Forwarded-Method": "GET",
+				"Authorization": basic} {
+				req.Header.Set(k, v)
+			}
+			c := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			resp, err := c.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			return resp.StatusCode, resp.Header.Get(edge.AuthentikGuard("").Person)
+		}
+		let := func(status int, uid string) bool { return status/100 == 2 && uid != "" }
+		// The outpost takes a provider's change a while after Authentik saves it.
+		until := func(how string, want bool) {
+			t.Helper()
+			status, uid := ask()
+			for deadline := time.Now().Add(3 * time.Minute); let(status, uid) != want && time.Now().Before(deadline); status, uid = ask() {
+				time.Sleep(2 * time.Second)
+			}
+			if let(status, uid) != want {
+				t.Errorf("%s: Basic with theo's app password at %s: %d, uid %q; want let in %v", how, host, status, uid, want)
+			}
+		}
+		until("as Homeward made it", false)
+		patch(changes[0])
+		until("header auth on", true)
+
+		// Every change at once, then Prepare: each is put back, and the request is refused again.
+		for _, change := range changes[1:] {
+			patch(change)
+		}
+		o = embedded()
+		w.raw(t, w.own, "PATCH", "/api/v3/outposts/instances/"+o.PK+"/", map[string]any{"providers": slices.DeleteFunc(slices.Clone(o.Providers),
+			func(p int) bool { return p == pk })}, nil)
+		report("every change at once", false)
+		if err := idptest.Prepare(ctx, a, household); err != nil {
+			t.Fatal(err)
+		}
+		report("after Prepare", true)
+		after := read()
+		for _, change := range changes {
+			for k := range change {
+				if k == "basic_auth_user_attribute" || k == "basic_auth_password_attribute" {
+					continue // Prepare empties them, which Basic auth off never reads
+				}
+				if fmt.Sprint(after[k]) != fmt.Sprint(before[k]) {
+					t.Errorf("after Prepare, %s is %v, want %v", k, after[k], before[k])
+				}
+			}
+		}
+		if !slices.Contains(embedded().Providers, pk) {
+			t.Errorf("after Prepare, the embedded outpost serves %v, want the guard %d too", embedded().Providers, pk)
+		}
+		until("after Prepare", false)
+	}
 }

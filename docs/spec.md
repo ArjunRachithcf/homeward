@@ -437,6 +437,10 @@ Stories 120–121 are decided in #87.
     - with Authentik, any other scope mapping on a guard's provider (Authentik's own aside), Homeward's mapping changed,
       or a provider not in `forward_single` mode could name the role instead: the provider's report then says it
       provides no forward-auth, and preparing the sign-in puts the guards' mappings back (#244);
+    - likewise a guard's provider with header auth on (the outpost would take `Authorization: Basic` with an app
+      password, or a federated bearer token, for a session through the provider's `client_credentials` grant, which
+      runs no flow), HTTP Basic sent to the app, other flows than Homeward's, a path that skips the sign-in, or off the
+      embedded outpost: reported as no forward-auth, and preparing the sign-in puts it back (#273);
     - a person without an id, without a name or username, in no role group or in more than one, is refused (403), never
       taken for an adult;
     - every name the edge serves deletes every `X-HomersLab-*` header a client sends, in any case, with underscores or

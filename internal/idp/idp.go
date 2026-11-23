@@ -156,7 +156,9 @@ type Report struct {
 	Provider string `json:"provider"` // authentik, kanidm
 	Version  string `json:"version"`
 	// OIDC, ForwardAuth and LDAP are the sign-in methods it provides to apps. ForwardAuth is false while a guard isn't
-	// as Homeward made it, so the role it names may not be Homeward's (#244); Prepare puts its mappings back.
+	// as Homeward made it, so the role it names may not be Homeward's (#244), or someone may get past it another way
+	// than its sign-in (#273); Prepare puts its mappings and settings back, and EnsureGuard, for its app, a guard
+	// whose application was handed another provider.
 	OIDC        bool `json:"oidc"`
 	ForwardAuth bool `json:"forwardAuth"`
 	LDAP        bool `json:"ldap"`
