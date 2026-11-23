@@ -1047,8 +1047,12 @@ func Main(m *testing.M) {
 	if len(os.Args) > 2 && os.Args[1] == "agent" && os.Args[2] == "read-project" {
 		os.Exit(agent.ReadProjectMain(os.Args[3:], os.Stdin, os.Stdout))
 	}
+	readsReady = agent.ReadsReady() // before any test replaces the files it reads
 	os.Exit(m.Run())
 }
+
+// readsReady is agent.ReadsReady as the test binary started (Main): why an agent run as root here can't read, or nil.
+var readsReady error
 
 var (
 	copied     sync.Once
@@ -1063,6 +1067,12 @@ func Executable(t testing.TB) string {
 	t.Helper()
 	if os.Geteuid() != 0 {
 		return os.Args[0]
+	}
+	// As root, a read's child runs as homeward-read, which the packages make and CI's jobs create
+	// (.github/workflows/ci.yml). Without it every read is refused, and a test would fail far from the cause.
+	if readsReady != nil {
+		t.Fatalf("run as root, an agent's compose reads need the packages' read user: %v. Run the tests as yourself "+
+			"(docker run -u \"$(id -u):$(id -g)\"), or create it first: systemd-sysusers packaging/sysusers.d/homeward.conf", readsReady)
 	}
 	copied.Do(func() {
 		dir, err := os.MkdirTemp("", "homeward-test-exe-")

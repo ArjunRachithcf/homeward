@@ -1040,6 +1040,14 @@ func readCredential() (*syscall.Credential, error) {
 	return &syscall.Credential{Uid: uid, Gid: gid, Groups: []uint32{}}, nil
 }
 
+// ReadsReady is why this agent couldn't start a compose read's child, or nil: always nil when it isn't root; as root,
+// readCredential's refusal (no fit homeward-read, or a child that would start dumpable). Tests check it before they run
+// an agent as root.
+func ReadsReady() error {
+	_, err := readCredential()
+	return err
+}
+
 // childCommand is the command that runs one compose read in dir, its own empty folder, for project name, and the
 // agent's ends of the child's control pipe, which the caller closes once the child is done. The child starts as cred
 // (readCredential) when it isn't nil: the IDs are set in the fork, before the exec, so the child never runs as root.
