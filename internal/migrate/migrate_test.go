@@ -745,3 +745,83 @@ func TestAFileThatCantBeReownedKeepsTheOldID(t *testing.T) {
 		t.Errorf("the old user went with a file still its own: ran %q", n.ran)
 	}
 }
+
+// Both ids not the fixed one: main's user at 979, the fixed id someone else's, and sysusers made the new user first at
+// another id. The old user goes, its files the new user's own id's, and a later run stops nothing.
+func TestANewUserAtAnotherIDTakesTheOldOnesFiles(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, false)
+	n.write("etc/passwd", n.read("etc/passwd")+"other:x:60600:60600::/:/usr/sbin/nologin\n"+
+		"homeward:x:978:978:Homeward manager:/var/lib/homeward:/usr/sbin/nologin\n")
+	n.write("etc/group", n.read("etc/group")+"other:x:60600:\nhomeward:x:978:\n")
+	if _, err := migrate.Run(context.Background(), n.host()); err != nil {
+		t.Fatal(err)
+	}
+	if p, g := n.read("etc/passwd"), n.read("etc/group"); strings.Contains(p, "homerslab") || strings.Contains(g, "homerslab") {
+		t.Errorf("the old user is left:\n%s\n%s", p, g)
+	}
+	tree := n.tree()
+	for p, want := range map[string]string{
+		"var/lib/homeward/manager.db": "the household (978:978)",
+		"var/lib/homeward/shared":     "the manager's, root's group (978:0)",
+		"var/lib/maria-app/data":      "someone else's, of the same id (979:979)",
+	} {
+		if tree[p] != want {
+			t.Errorf("/%s = %q, want %q", p, tree[p], want)
+		}
+	}
+	if err := os.Remove(n.at("var/lib/homeward-agent/" + migrate.Mark)); err != nil {
+		t.Fatal(err)
+	}
+	n.reboot()
+	n.units["homerslab-other.service"] = [2]string{"loaded", "active"}
+	if r, err := migrate.Run(context.Background(), n.host()); err != nil || r.Did() || n.units["homerslab-other.service"][1] != "active" {
+		t.Errorf("a later run did %+v, %v", r, err)
+	}
+}
+
+// A folder of another mount under the package's folders (a share bound or mounted there) is never walked: its files
+// keep their owners, even of the old id.
+func TestTheWalkNeverEntersAnotherMount(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, true)
+	n.write("var/lib/homerslab/bound/theirs", "a share's")
+	n.own("var/lib/homerslab/bound/theirs", 979, 979)
+	share := n.at("var/lib/homerslab/bound")
+	ino := n.ino(share)
+	h := migrate.WithMounts(n.host(), func(p string) (uint64, error) {
+		if fi, err := os.Lstat(p); err == nil && fi.Sys().(*syscall.Stat_t).Ino == ino {
+			return 2, nil
+		}
+		return 1, nil
+	})
+	if _, err := migrate.Run(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.tree()["var/lib/homeward/bound/theirs"]; got != "a share's (979:979)" {
+		t.Errorf("a file on another mount is %q", got)
+	}
+	if got := n.tree()["var/lib/homeward/manager.db"]; got != "the household (60600:60600)" {
+		t.Errorf("the manager's database is %q", got)
+	}
+}
+
+// The real mount id tells /proc, always a mount of its own, from /, and a folder from its parent on the same mount.
+func TestTheMountIDTellsMountsApart(t *testing.T) {
+	testenv.Isolate(t)
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]uint64{}
+	for _, p := range []string{"/", "/proc", dir, filepath.Join(dir, "sub")} {
+		id, err := migrate.MountID(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[p] = id
+	}
+	if ids["/"] == ids["/proc"] || ids[dir] != ids[filepath.Join(dir, "sub")] {
+		t.Errorf("mount ids %v", ids)
+	}
+}

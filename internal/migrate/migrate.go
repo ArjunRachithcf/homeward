@@ -33,6 +33,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ArjunRachithcf/homeward/internal/atomicfile"
 	"github.com/ArjunRachithcf/homeward/internal/host"
 )
@@ -128,6 +130,8 @@ type Host struct {
 	// and os.Lchown when nil.
 	owner func(p string) (uid, gid int, err error)
 	chown func(p string, uid, gid int) error
+	// mount, in tests that can't mount: the id of the mount a path is on. statx's STATX_MNT_ID when nil.
+	mount func(p string) (uint64, error)
 }
 
 // Result is what a run did.
@@ -398,7 +402,7 @@ func (h Host) users(ctx context.Context, r *Result) error {
 			}
 			if s.uid >= 0 || s.gid >= 0 {
 				// Before the id it stands for is gone: a run that stops in between does it again from the same files.
-				if err := h.reown(s.uid, s.gid, u.ID, r); err != nil {
+				if err := h.reown(s.uid, s.gid, s.toUID, s.toGID, r); err != nil {
 					return err
 				}
 			}
@@ -420,6 +424,8 @@ type userCmd struct {
 	cmd      string
 	args     []string
 	uid, gid int
+	// to is the id the files take: the fixed one, or the new user's own when it has another.
+	toUID, toGID int
 }
 
 // userStep is the next command that moves u to its new name and fixed id, or "" when there is none: done, or nothing
@@ -452,22 +458,30 @@ func (h Host) userStep(u User) (userCmd, error) {
 		return userCmd{cmd: "userdel", args: []string{u.New}, uid: -1, gid: -1}, nil
 	case hasOldG && oldG == u.ID && hasNewG && newG != u.ID:
 		return userCmd{cmd: "groupdel", args: []string{u.New}, uid: -1, gid: -1}, nil
-	// main's user beside the new one sysusers made first: it goes, as no other user is in its groups on main.
-	case hasOldU && oldU != u.ID && hasNewU && newU == u.ID:
-		return userCmd{cmd: "userdel", args: []string{u.Old}, uid: oldU, gid: other(oldG, hasOldG)}, nil
-	case hasOldG && oldG != u.ID && hasNewG && newG == u.ID:
-		return userCmd{cmd: "groupdel", args: []string{u.Old}, uid: -1, gid: oldG}, nil
+	// main's user beside the new one sysusers made first, at the fixed id or (when another holds it) at another: it
+	// goes, its files the new one's, as no other user is in its groups on main.
+	case hasOldU && oldU != u.ID && hasNewU:
+		gid, toGID := other(oldG, hasOldG), u.ID
+		if hasNewG {
+			toGID = newG
+		}
+		if gid == toGID {
+			gid = -1
+		}
+		return userCmd{cmd: "userdel", args: []string{u.Old}, uid: oldU, gid: gid, toUID: newU, toGID: toGID}, nil
+	case hasOldG && oldG != u.ID && hasNewG:
+		return userCmd{cmd: "groupdel", args: []string{u.Old}, uid: -1, gid: oldG, toGID: newG}, nil
 	case hasOldG && !hasNewG:
 		return userCmd{cmd: "groupmod", args: []string{"--new-name", u.New, u.Old}, uid: -1, gid: -1}, nil
 	case hasOldU && !hasNewU:
 		return userCmd{cmd: "usermod", args: []string{"--login", u.New, "--home", u.Home, u.Old}, uid: -1, gid: -1}, nil
 	case !hasOldG && hasNewG && newG != u.ID && free(groups, u.ID, u.New):
-		return userCmd{cmd: "groupmod", args: []string{"--gid", id, u.New}, uid: other(newU, hasNewU && free(users, u.ID, u.New)), gid: newG}, nil
+		return userCmd{cmd: "groupmod", args: []string{"--gid", id, u.New}, uid: other(newU, hasNewU && free(users, u.ID, u.New)), gid: newG, toUID: u.ID, toGID: u.ID}, nil
 	// usermod also chowns the home's tree, only when the home is the user's own: never "/", which is root's.
 	case !hasOldU && hasNewU && newU != u.ID && free(users, u.ID, u.New):
-		return userCmd{cmd: "usermod", args: []string{"--uid", id, u.New}, uid: newU, gid: other(newG, hasNewG && free(groups, u.ID, u.New))}, nil
+		return userCmd{cmd: "usermod", args: []string{"--uid", id, u.New}, uid: newU, gid: other(newG, hasNewG && free(groups, u.ID, u.New)), toUID: u.ID, toGID: u.ID}, nil
 	}
-	if hasOldU || hasOldG || hasNewU && newU != u.ID || hasNewG && newG != u.ID {
+	if hasNewU && newU != u.ID || hasNewG && newG != u.ID {
 		h.Log.Warn("a user is left at an id not its fixed one, or under its old name: another holds the fixed id", "user", u.New, "id", u.ID)
 	}
 	return userCmd{}, nil
@@ -484,26 +498,30 @@ func free(ids map[string]int, id int, name string) bool {
 }
 
 // reown gives the files in the package's folders (under their old names and their new ones) that uid or gid owns (-1:
-// neither) the fixed id instead, a link's own owner too. Each file is changed in one chown, from its owner as it is
-// now, so a run that stops anywhere leaves the rest to the next.
-func (h Host) reown(uid, gid, id int, r *Result) error {
+// neither) toUID and toGID instead, a link's own owner too. Each file is changed in one chown, from its owner as it is
+// now, so a run that stops anywhere leaves the rest to the next. It never enters another mount (a share's, a bind
+// mount), whose files may be others' of the same id.
+func (h Host) reown(uid, gid, toUID, toGID int, r *Result) error {
 	if h.UsersOnly {
 		return nil
 	}
-	owner, chown := h.owner, h.chown
+	owner, chown, mount := h.owner, h.chown, h.mount
 	if owner == nil {
 		owner = lstatOwner
 	}
 	if chown == nil {
 		chown = os.Lchown
 	}
+	if mount == nil {
+		mount = mountID
+	}
 	n := 0
 	for _, d := range Dirs {
 		for _, p := range []string{d.Old, d.New} {
-			top, err := os.Lstat(h.at(p))
-			if errors.Is(err, fs.ErrNotExist) {
+			if _, err := os.Lstat(h.at(p)); errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
+			top, err := mount(h.at(p))
 			if err != nil {
 				return err
 			}
@@ -511,9 +529,14 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 				if err != nil {
 					return err
 				}
-				// Never into another filesystem: a share's mount point still mounted holds files of others' ids.
-				if e.IsDir() && !sameDevice(top, p) {
-					return fs.SkipDir
+				if e.IsDir() {
+					m, err := mount(p)
+					if err != nil {
+						return err
+					}
+					if m != top {
+						return fs.SkipDir
+					}
 				}
 				fu, fg, err := owner(p)
 				if err != nil {
@@ -521,10 +544,10 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 				}
 				nu, ng := fu, fg
 				if fu == uid {
-					nu = id
+					nu = toUID
 				}
 				if fg == gid {
-					ng = id
+					ng = toGID
 				}
 				if nu == fu && ng == fg {
 					return nil
@@ -542,20 +565,22 @@ func (h Host) reown(uid, gid, id int, r *Result) error {
 		}
 	}
 	if n > 0 {
-		r.Users = append(r.Users, fmt.Sprintf("chown %d files of uid %d, gid %d to %d", n, uid, gid, id))
+		r.Users = append(r.Users, fmt.Sprintf("chown %d files of uid %d, gid %d to %d:%d", n, uid, gid, toUID, toGID))
 	}
 	return nil
 }
 
-// sameDevice says whether the folder p is on top's filesystem.
-func sameDevice(top fs.FileInfo, p string) bool {
-	fi, err := os.Lstat(p)
-	if err != nil {
-		return true // the walk's own error reports it
+// mountID is the id of the mount p is on (statx's STATX_MNT_ID, Linux 5.8), not following a link; on an older kernel,
+// its filesystem's device, which still tells another filesystem, not a bind mount of the same one.
+func mountID(p string) (uint64, error) {
+	var st unix.Statx_t
+	if err := unix.Statx(unix.AT_FDCWD, p, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_MNT_ID, &st); err != nil {
+		return 0, &fs.PathError{Op: "statx", Path: p, Err: err}
 	}
-	a, ok1 := top.Sys().(*syscall.Stat_t)
-	b, ok2 := fi.Sys().(*syscall.Stat_t)
-	return !ok1 || !ok2 || a.Dev == b.Dev
+	if st.Mask&unix.STATX_MNT_ID != 0 {
+		return st.Mnt_id, nil
+	}
+	return 1<<63 | uint64(st.Dev_major)<<32 | uint64(st.Dev_minor), nil
 }
 
 // lstatOwner is a file's owner, not following a link.
