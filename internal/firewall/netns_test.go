@@ -103,23 +103,43 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		os.Exit(0)
-	case "echo", "echoend": // a TCP echo, line by line, on every connection; echoend says "ended" when one ends
+	case "echo", "app": // a TCP echo, line by line, on every connection; app also says what reaches it: "read N", then "ended" or "reset"
 		ln, err := net.Listen("tcp", os.Args[len(os.Args)-1])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 		fmt.Println("listening")
+		says := os.Getenv(helper) == "app"
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				os.Exit(1)
 			}
 			go func() {
-				_, _ = io.Copy(c, c)
-				c.Close()
-				if os.Getenv(helper) == "echoend" {
-					fmt.Println("ended")
+				defer c.Close()
+				buf := make([]byte, 65536)
+				for {
+					n, err := c.Read(buf)
+					if n > 0 {
+						if says {
+							fmt.Println("read", n)
+						}
+						if _, err := c.Write(buf[:n]); err != nil {
+							return
+						}
+					}
+					switch {
+					case err == nil:
+					case says && errors.Is(err, syscall.ECONNRESET):
+						fmt.Println("reset")
+						return
+					default:
+						if says {
+							fmt.Println("ended")
+						}
+						return
+					}
 				}
 			}()
 		}
@@ -133,7 +153,19 @@ func TestMain(m *testing.M) {
 		fmt.Println("connected")
 		in, from := bufio.NewScanner(os.Stdin), bufio.NewReader(c)
 		for i := 0; in.Scan(); i++ {
-			if in.Text() == "close" {
+			_ = c.SetDeadline(time.Time{})
+			switch in.Text() {
+			case "close": // a FIN, and nothing else
+				c.Close()
+				os.Exit(0)
+			case "reset": // a RST
+				_ = c.(*net.TCPConn).SetLinger(0)
+				c.Close()
+				os.Exit(0)
+			case "cork": // a request held back, then closed: it leaves in the FIN's own segment
+				raw, _ := c.(*net.TCPConn).SyscallConn()
+				_ = raw.Control(func(fd uintptr) { _ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_CORK, 1) })
+				_, _ = c.Write(bytes.Repeat([]byte("GET / HTTP/1.1\r\nX-Forged: admin\r\n"), 15)) // under one MSS, so held back whole
 				c.Close()
 				os.Exit(0)
 			}
@@ -726,14 +758,16 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	n.serve(t, "lan", "echo", "203.0.113.50:9011")
 	n.serve(t, "lan", "ulisten", "203.0.113.50:9012")
 	n.serve(t, "ctr", "echo", "172.30.0.2:8447")
-	ends := n.serveEnds(t, "ctr", "172.30.0.2:8448")
+	finApp, corkApp, rstApp := n.serveApp(t, "ctr", "172.30.0.2:8448"), n.serveApp(t, "ctr", "172.30.0.2:8449"), n.serveApp(t, "ctr", "172.30.0.2:8450")
 
 	open := firewall.State{Mesh: []string{"wt0"}, WireGuard: []int{51820, 51821}, SetupPort: 7030, LAN: []string{"br-iot"},
 		LANPrefixes: []netip.Prefix{netip.MustParsePrefix("192.168.77.0/24")}, Uplinks4: []string{"br-iot"},
 		Bridges: []string{"br-test", "br-other", "docker0"}, Virtual: guests(t),
 		Resolvers: []netip.Addr{netip.MustParseAddr("192.168.77.50")},
 		Upstreams: []firewall.Upstream{{Addr: netip.MustParseAddrPort("172.30.0.2:8447"), UIDs: []uint32{0}},
-			{Addr: netip.MustParseAddrPort("172.30.0.2:8448"), UIDs: []uint32{0}}}}
+			{Addr: netip.MustParseAddrPort("172.30.0.2:8448"), UIDs: []uint32{0}},
+			{Addr: netip.MustParseAddrPort("172.30.0.2:8449"), UIDs: []uint32{0}},
+			{Addr: netip.MustParseAddrPort("172.30.0.2:8450"), UIDs: []uint32{0}}}}
 	// Stricter: the setup listener closed, one WireGuard port gone, no way to the IPv4 internet, no upstream.
 	strict := open
 	strict.SetupPort, strict.WireGuard, strict.Uplinks4, strict.Upstreams = 0, []int{51820}, nil, nil
@@ -761,9 +795,13 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	for i, f := range flows {
 		sessions[i] = n.session(t, f.from, f.mode, f.addr)
 	}
-	ending := n.session(t, "", "tsession", "172.30.0.2:8448")
-	if !ending.ask(t) {
-		t.Fatal("the box's flow into the app's network that ends: no answer under the table that admits it")
+	// Three more of the box's flows into the app's network, each to end its own way once the table refuses them.
+	finning, corking, resetting := n.session(t, "", "tsession", "172.30.0.2:8448"), n.session(t, "", "tsession", "172.30.0.2:8449"),
+		n.session(t, "", "tsession", "172.30.0.2:8450")
+	for _, s := range []*session{finning, corking, resetting} {
+		if !s.ask(t) {
+			t.Fatalf("%s: no answer under the table that admits it", s.what)
+		}
 	}
 	ask := func(when string, want func(kept bool) bool) {
 		t.Helper()
@@ -794,13 +832,45 @@ func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
 	if d, err := fw.Check(ctx); d != nil || err != nil {
 		t.Errorf("the flows the table admitted read as drift: %+v, %v", d, err)
 	}
-	// A flow the table refuses still ends: the box's process closes it, and the app sees the end (its FIN), rather than
-	// waiting on a flow that is gone (#286's review).
-	ending.close(t)
+	// A flow the table refuses still ends (#286's review): the box's process closes it, and the app sees its FIN, or its
+	// RST, rather than waiting on a flow that is gone. But no byte more reaches the app: a request held back (TCP_CORK)
+	// and sent with the FIN, in its segment, is dropped with it.
+	for _, app := range []<-chan string{finApp, corkApp, rstApp} {
+		drain(app)
+	}
+	finning.end(t, "close")
+	corking.end(t, "cork")
+	resetting.end(t, "reset")
+	for _, c := range []struct {
+		what string
+		app  <-chan string
+		want string
+	}{
+		{"closed (a FIN alone)", finApp, "ended"},
+		{"reset (a RST)", rstApp, "reset"},
+	} {
+		select {
+		case got := <-c.app:
+			if got != c.want {
+				t.Errorf("the box's flow the table refuses, %s: the app got %q, want %q", c.what, got, c.want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("the box's flow the table refuses, %s: the app never saw it end", c.what)
+		}
+	}
 	select {
-	case <-ends:
-	case <-time.After(3 * time.Second):
-		t.Error("the box closed a flow into an app's network the table refuses, and the app never saw it end")
+	case got := <-corkApp:
+		time.Sleep(time.Second)
+		for more := true; more; {
+			select {
+			case m := <-corkApp:
+				got += ", " + m
+			default:
+				more = false
+			}
+		}
+		t.Errorf("a refused process's request, held back and sent with its FIN, reached the app: %s", got)
+	case <-time.After(2 * time.Second):
 	}
 
 	// The set of admitted flows full: a flow is admitted all the same (and only asked again at its next packet).
@@ -853,19 +923,30 @@ func (n *netns) session(t *testing.T, from, mode, addr string) *session {
 	return s
 }
 
-// close closes the flow.
-func (s *session) close(t *testing.T) {
+// end ends the flow: close (a FIN), reset (a RST) or cork (a request held back, then a FIN).
+func (s *session) end(t *testing.T, how string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := io.WriteString(s.in, "close\n"); err != nil {
+	if _, err := io.WriteString(s.in, how+"\n"); err != nil {
 		t.Errorf("%s: the flow's process is gone", s.what)
 	}
 }
 
-// serveEnds starts a TCP echo (echoend) in a namespace, and says on the channel each time one of its connections ends.
-func (n *netns) serveEnds(t *testing.T, name, addr string) <-chan struct{} {
+// drain empties what an app said so far.
+func drain(app <-chan string) {
+	for {
+		select {
+		case <-app:
+		default:
+			return
+		}
+	}
+}
+
+// serveApp starts a TCP echo (app) in a namespace, and passes on what reaches it: "read N", "ended", "reset".
+func (n *netns) serveApp(t *testing.T, name, addr string) <-chan string {
 	t.Helper()
-	cmd := n.helper(name, "echoend", addr)
+	cmd := n.helper(name, "app", addr)
 	out, _ := cmd.StdoutPipe()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -873,17 +954,15 @@ func (n *netns) serveEnds(t *testing.T, name, addr string) <-chan struct{} {
 	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
 	lines := bufio.NewScanner(out)
 	if !lines.Scan() || lines.Text() != "listening" {
-		t.Fatalf("no echoend on %s in %s", addr, orBox(name))
+		t.Fatalf("no app on %s in %s", addr, orBox(name))
 	}
-	ends := make(chan struct{}, 8)
+	says := make(chan string, 64)
 	go func() {
 		for lines.Scan() {
-			if lines.Text() == "ended" {
-				ends <- struct{}{}
-			}
+			says <- lines.Text()
 		}
 	}()
-	return ends
+	return says
 }
 
 // ask asks the flow a question, and says whether it was answered.

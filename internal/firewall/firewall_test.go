@@ -380,7 +380,7 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 		"\tchain output {\n\t\ttype filter hook output priority filter - 5; policy accept;\n\t\toifname \"hla*\" jump to_apps\n",
 		`oifname { "br-app", "br-signin" } jump to_apps`,
 		"ip daddr . meta l4proto . th dport { 172.31.240.2 . tcp . 8080, 172.31.250.10 . tcp . 9000 } jump to_apps",
-		"\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | rst) != 0 accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n" +
+		"\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n" +
 			"\t\tip daddr . tcp dport . meta skuid { 172.31.240.2 . 8080 . 0, 172.31.240.2 . 8080 . 981, " +
 			"172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981 } goto admit\n\t\tdrop\n\t}\n",
 	} {
@@ -391,7 +391,7 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 	// No upstream: nothing of this machine opens a connection into an app's network at all; and an app's bridge the
 	// engines haven't listed yet is kept to the edge by its name.
 	none := firewall.Render(firewall.State{Mesh: []string{"wt0"}, LAN: []string{"enp5s0"}, Bridges: []string{"br-app"}, Virtual: []string{"br-app"}})
-	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | rst) != 0 accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n\t\tdrop\n\t}\n") {
+	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n\t\tdrop\n\t}\n") {
 		t.Errorf("without an upstream:\n%s", none)
 	}
 	// An upstream that isn't IPv4 with a port: never rendered. One with no user is closed to every process of this
@@ -490,12 +490,15 @@ func TestNoFlowRunsOnByItsStateAlone(t *testing.T) {
 	for _, l := range strings.Split(r, "\n") {
 		if strings.Contains(l, "established") && l != "\t\tct state established ct direction reply accept" &&
 			l != "\t\tct state established ct id @admitted update @admitted { ct id } accept" &&
-			l != "\t\tct state established tcp flags & (fin | rst) != 0 accept" {
+			l != "\t\tct state established tcp flags & (fin | syn | rst) == rst accept" &&
+			l != "\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone" {
 			t.Errorf("a flow runs on by its state: %q", l)
 		}
 	}
-	if strings.Count(r, "tcp flags & (fin | rst)") != 1 || !strings.Contains(r, "\t\tct state established ct id @admitted update @admitted { ct id } accept\n"+
-		"\t\tct state established tcp flags & (fin | rst) != 0 accept\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n") {
+	if strings.Count(r, "tcp flags & (fin | syn | rst)") != 2 || !strings.Contains(r, "\tchain fin_alone {\n\t\tip hdrlength 5 tcp doff 5 ip length 40 accept\n") ||
+		!strings.Contains(r, "\t\tip hdrlength 5 tcp doff 15 ip length 80 accept\n\t\tip6 nexthdr tcp tcp doff 5 ip6 length 20 accept\n") ||
+		!strings.Contains(r, "\t\tip6 nexthdr tcp tcp doff 15 ip6 length 60 accept\n\t}\n") || !strings.Contains(r, "\t\tct state established ct id @admitted update @admitted { ct id } accept\n"+
+		"\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n") {
 		t.Errorf("a flow's end passes to_apps, and nowhere else:\n%s", r)
 	}
 	for _, name := range []string{"input", "forward", "to_apps"} {

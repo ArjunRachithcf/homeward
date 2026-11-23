@@ -376,13 +376,26 @@ func Render(s State) string {
 	b.WriteString(lookup)
 	// A flow's end passes, whoever asks: a kernel's RST, and the FIN an orphaned socket sends after close(), carry no
 	// user skuid could match, and dropping them would leave the app waiting on a flow that is gone (#286's review). They
-	// only end a flow.
-	w("\t\tct state established tcp flags & (fin | rst) != 0 accept")
+	// only end a flow: a RST (whose payload the receiver discards), or a FIN that carries no byte (fin_alone), never one
+	// that carries a request held back for it (TCP_CORK).
+	w("\t\tct state established tcp flags & (fin | syn | rst) == rst accept")
+	w("\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone")
 	w("\t\tmeta l4proto { icmp, ipv6-icmp } goto admit")
 	if allowed := upstreamUsers(s.Upstreams); len(allowed) > 0 {
 		w("\t\tip daddr . tcp dport . meta skuid %s goto admit", set(allowed))
 	}
 	w("\t\tdrop")
+	w("\t}")
+	// A FIN with no payload: its IP length is its headers' alone, IPv4's without options and IPv6's without extension
+	// headers, for each length of TCP header (nft can't subtract one field from another, and a set of nft 1.0's can't
+	// hold these concatenations). Anything else returns to to_apps, and its drop.
+	w("\tchain fin_alone {")
+	for doff := 5; doff <= 15; doff++ {
+		w("\t\tip hdrlength 5 tcp doff %d ip length %d accept", doff, 20+4*doff)
+	}
+	for doff := 5; doff <= 15; doff++ {
+		w("\t\tip6 nexthdr tcp tcp doff %d ip6 length %d accept", doff, 4*doff)
+	}
 	w("\t}")
 	// To the internet only: out through an uplink of the packet's family (the LAN's, a VPN's), to an address that is
 	// neither private nor the LAN's. A family with no uplink has no way out.
