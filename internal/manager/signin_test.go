@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -69,11 +70,15 @@ type fakeSignIn struct {
 	tidies      int
 	ldapFails   error
 	credentials int
+	// appPasswords counts each person's app passwords (#281); ended lists the admins whose EndAdminAppPasswords ended.
+	appPasswords map[string]int
+	ended        []string
 }
 
 func newFakeSignIn(t *testing.T) *fakeSignIn {
 	k, _ := rsa.GenerateKey(rand.Reader, 2048)
-	f := &fakeSignIn{t: t, people: map[string]idp.Person{}, passkeys: map[string]int{}, key: k, codes: map[string]map[string]any{}, others: map[string][]string{}}
+	f := &fakeSignIn{t: t, people: map[string]idp.Person{}, passkeys: map[string]int{}, key: k, codes: map[string]map[string]any{}, others: map[string][]string{},
+		appPasswords: map[string]int{}}
 	f.issuer = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.issuer.Close)
 	return f
@@ -353,6 +358,28 @@ func (f *fakeSignIn) DeleteLDAP(_ context.Context, slug string) error {
 
 func (f *fakeSignIn) AppPassword(context.Context, string, string) (idp.Secret, error) {
 	return "", errors.New("the manager makes no app password")
+}
+
+func (f *fakeSignIn) RevokeAppPasswords(_ context.Context, u string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.appPasswords, u)
+	return nil
+}
+
+func (f *fakeSignIn) EndAdminAppPasswords(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for u, n := range f.appPasswords {
+		if n > 0 && f.people[u].Role == idp.Admin {
+			out = append(out, u)
+			delete(f.appPasswords, u)
+		}
+	}
+	slices.Sort(out)
+	f.ended = append(f.ended, out...)
+	return out, nil
 }
 
 // atJoin is a primary whose first half is done: Authentik chosen, NetBird's cloud joined (household port 9443), the

@@ -66,3 +66,32 @@ func (m *Manager) ensureLDAPApps(ctx context.Context) error {
 	}
 	return errors.Join(errs...)
 }
+
+// warnAppPasswords is the security event's source, per admin, when one held app passwords (#281).
+const warnAppPasswords = "security:app-passwords:"
+
+// endAdminAppPasswords ends every admin's app passwords, at every pass of the schedule (#281): Homeward makes none for
+// an admin, but with Kanidm a person makes their own, an admin too, and a console can. Each admin found is a security
+// event. It runs whether or not the household has an LDAP app: an app password is a credential either way.
+func (m *Manager) endAdminAppPasswords(ctx context.Context) error {
+	ans, err := m.db.Answers(ctx)
+	if err != nil || ans[ansSignInBootstrapped] == "" {
+		return err // no household account yet: nobody holds anything
+	}
+	provider, err := m.provider(ctx, ans)
+	if err != nil {
+		return err
+	}
+	directory, ok := provider.(idp.LDAP)
+	if !ok {
+		return nil
+	}
+	ended, err := directory.EndAdminAppPasswords(ctx)
+	for _, who := range ended {
+		m.log.Error("ended an admin's app passwords", "username", who)
+		m.warnOnce(ctx, warnAppPasswords+who, "security: "+who+" held app passwords for LDAP apps, which an admin never does, so "+
+			"Homeward ended them. An admin uses LDAP apps with a separate account that isn't an admin; if "+who+" didn't make them, "+
+			"check what else changed on their account.")
+	}
+	return err
+}

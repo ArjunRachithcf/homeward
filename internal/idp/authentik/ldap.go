@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -299,12 +300,31 @@ func (a *Authentik) AppPassword(ctx context.Context, slug, username string) (idp
 	if u == nil {
 		return "", idp.ErrNoPerson
 	}
+	admins, err := a.adminGroup(ctx)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(u.Groups, admins) {
+		return "", idp.ErrAdminAppPassword
+	}
 	b := make([]byte, 12)
 	_, _ = rand.Read(b)
 	id := ldapPasswordOf(ldapObj(slug)) + hex.EncodeToString(b)
 	if err := a.api.call(ctx, http.MethodPost, "/core/tokens/", map[string]any{"identifier": id, "intent": "app_password",
 		"user": u.PK, "expiring": false, "description": "HomersLab: an app password for " + slug + " over LDAP"}, nil); err != nil {
 		return "", err
+	}
+	// Made an admin while it was being made: EnsurePerson reads the app passwords after its change, and this the role
+	// after its own, so one of the two sees the other's and ends the password (#281).
+	again, err := find[user](ctx, a.api, "/core/users/?username="+q(username), "username", username)
+	if err != nil || again == nil || slices.Contains(again.Groups, admins) {
+		if derr := gone(a.api.call(ctx, http.MethodDelete, "/core/tokens/"+id+"/", nil, nil)); derr != nil {
+			return "", errors.Join(idp.ErrAdminAppPassword, err, derr)
+		}
+		if err != nil {
+			return "", err
+		}
+		return "", idp.ErrAdminAppPassword
 	}
 	var k struct {
 		Key string `json:"key"`
@@ -316,6 +336,106 @@ func (a *Authentik) AppPassword(ctx context.Context, slug, username string) (idp
 		return "", errors.New("authentik: the app password has no key")
 	}
 	return idp.Secret(k.Key), nil
+}
+
+// adminGroup is the pk of the admins' role group.
+func (a *Authentik) adminGroup(ctx context.Context) (string, error) {
+	g, err := find[group](ctx, a.api, "/core/groups/?name="+q(idp.RoleGroup(idp.Admin)), "name", idp.RoleGroup(idp.Admin))
+	if err != nil {
+		return "", err
+	}
+	if g == nil {
+		return "", errors.New("authentik: the groups for roles are missing: prepare the sign-in first")
+	}
+	return g.PK, nil
+}
+
+type appPasswordObj struct {
+	Identifier string     `json:"identifier"`
+	Intent     string     `json:"intent"`
+	User       int        `json:"user"`
+	Expiring   bool       `json:"expiring"`
+	Expires    *time.Time `json:"expires"`
+}
+
+func (t appPasswordObj) live() bool {
+	return !t.Expiring || t.Expires == nil || t.Expires.After(time.Now())
+}
+
+// appPasswords are every app password the person holds, for any app, made by Homeward or in Authentik's own settings,
+// expired ones included. The list's filters are checked, never trusted (#219).
+func (a *Authentik) appPasswords(ctx context.Context, u *user) ([]appPasswordObj, error) {
+	ts, err := list[appPasswordObj](ctx, a.api, "/core/tokens/?intent=app_password&user__username="+q(u.Username))
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(ts, func(t appPasswordObj) bool { return t.User != u.PK || t.Intent != "app_password" }), nil
+}
+
+// liveAppPasswords counts the app passwords that still bind.
+func liveAppPasswords(ts []appPasswordObj) int {
+	n := 0
+	for _, t := range ts {
+		if t.live() {
+			n++
+		}
+	}
+	return n
+}
+
+// revokeAppPasswords deletes app passwords; one gone already is.
+func (a *Authentik) revokeAppPasswords(ctx context.Context, ts []appPasswordObj) error {
+	var errs []error
+	for _, t := range ts {
+		errs = append(errs, gone(a.api.call(ctx, http.MethodDelete, "/core/tokens/"+url.PathEscape(t.Identifier)+"/", nil, nil)))
+	}
+	return errors.Join(errs...)
+}
+
+// RevokeAppPasswords deletes every app password of the person's, for every app, whoever made it (#281).
+func (a *Authentik) RevokeAppPasswords(ctx context.Context, username string) error {
+	u, err := a.person(ctx, username)
+	if err != nil {
+		return err
+	}
+	ts, err := a.appPasswords(ctx, u)
+	if err != nil {
+		return err
+	}
+	return a.revokeAppPasswords(ctx, ts)
+}
+
+// EndAdminAppPasswords deletes the app passwords of every admin who holds one that still binds, and says whose they
+// were (#281). Authentik's own settings let anyone make themselves an app password, an admin too. One admin's failure
+// spares no other.
+func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]string, error) {
+	admins, err := a.People(ctx, idp.Admin)
+	if err != nil {
+		return nil, err
+	}
+	ended := []string{}
+	var errs []error
+	for _, p := range admins {
+		u, err := a.person(ctx, p.Username)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+			continue
+		}
+		ts, err := a.appPasswords(ctx, u)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+			continue
+		}
+		if liveAppPasswords(ts) == 0 {
+			continue
+		}
+		if err := a.revokeAppPasswords(ctx, ts); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+		}
+		ended = append(ended, p.Username)
+	}
+	slices.Sort(ended)
+	return ended, errors.Join(errs...)
 }
 
 type ldapProviderObj struct {

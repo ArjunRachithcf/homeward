@@ -2,6 +2,8 @@ package authentik_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -62,6 +64,25 @@ func appPassword(t *testing.T, a *authentik.Authentik, slug, username string) st
 		t.Fatalf("an app password for %s at %s: %v", username, slug, err)
 	}
 	return pw.Reveal()
+}
+
+// OwnAppPassword makes the person an app password for the app as Authentik's own settings let anyone make one, an admin
+// too: a token of theirs, its identifier the app's, which AppPassword's refusals never see (#281).
+func (w *world) OwnAppPassword(t *testing.T, slug, username string) string {
+	t.Helper()
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	id := authentik.LDAPPasswordPrefix(slug) + "own" + hex.EncodeToString(b)
+	w.raw(t, w.own, "POST", "/api/v3/core/tokens/", map[string]any{"identifier": id, "intent": "app_password",
+		"user": w.userPK(t, username), "expiring": false}, nil)
+	var k struct {
+		Key string `json:"key"`
+	}
+	w.raw(t, w.own, "GET", "/api/v3/core/tokens/"+id+"/view_key/", nil, &k)
+	if k.Key == "" {
+		t.Fatalf("%s's own app password has no key", username)
+	}
+	return k.Key
 }
 
 func (w *world) Search(t *testing.T, dn, password, base string) ([]ldaptest.Entry, error) {
@@ -411,9 +432,10 @@ func ldapOrphan(w *world, a *authentik.Authentik) func(*testing.T) {
 			t.Fatal(err)
 		}
 		pw := map[string]string{}
-		for _, who := range []string{"lena", "kiko", "olga"} {
+		for _, who := range []string{"lena", "kiko"} {
 			pw[who] = appPassword(t, a, app.Slug, who)
 		}
+		pw["olga"] = w.OwnAppPassword(t, app.Slug, "olga") // an admin gets none from Homeward (#281)
 		bind := func(who string) error { return w.Bind(t, fmt.Sprintf(creds.UserDN, who), pw[who]) }
 		for deadline := time.Now().Add(90 * time.Second); bind("lena") != nil; time.Sleep(3 * time.Second) {
 			if time.Now().After(deadline) {
@@ -510,9 +532,10 @@ func ldapImpostors(w *world, a *authentik.Authentik) func(*testing.T) {
 			t.Fatal(err)
 		}
 		pw := map[string]string{}
-		for _, who := range []string{"lena", "kiko", "olga"} {
+		for _, who := range []string{"lena", "kiko"} {
 			pw[who] = appPassword(t, a, real.Slug, who)
 		}
+		pw["olga"] = w.OwnAppPassword(t, real.Slug, "olga") // an admin gets none from Homeward (#281)
 		// Another adults' app, whose app passwords open it alone.
 		other := idp.LDAPApp{Slug: "homerslab-other", Name: "Other", Roles: []idp.Role{idp.Adult}}
 		if _, err := a.EnsureLDAP(ctx, other); err != nil {

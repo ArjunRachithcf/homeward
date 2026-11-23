@@ -972,6 +972,18 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 		body["groups"] = []string{want}
 		return a.api.call(ctx, http.MethodPost, "/core/users/", body, nil)
 	}
+	// Made an admin: refused while they hold an app password that binds (#281), before anything changes.
+	promoted := p.Role == idp.Admin && !slices.Contains(u.Groups, want)
+	if promoted {
+		ts, err := a.appPasswords(ctx, u)
+		if err != nil {
+			return err
+		}
+		if n := liveAppPasswords(ts); n > 0 {
+			return fmt.Errorf("authentik: %s holds %d app passwords for LDAP apps; remove them first, or keep them on a separate account: %w",
+				p.Username, n, idp.ErrAdminAppPassword)
+		}
+	}
 	keep := []string{want}
 	for _, g := range u.Groups {
 		if _, role := groups[g]; !role {
@@ -979,7 +991,16 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 		}
 	}
 	body["groups"] = keep
-	return a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/core/users/%d/", u.PK), body, nil)
+	if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/core/users/%d/", u.PK), body, nil); err != nil || !promoted {
+		return err
+	}
+	// One made at the same moment (AppPassword reads the role after making it, this the app passwords after the
+	// change, so one of the two sees the other's): an admin now, so it ends.
+	ts, err := a.appPasswords(ctx, u)
+	if err != nil {
+		return err
+	}
+	return a.revokeAppPasswords(ctx, ts)
 }
 
 // People are the household's people in a role.

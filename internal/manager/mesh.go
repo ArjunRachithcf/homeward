@@ -543,7 +543,8 @@ func (m *Manager) currentToken(ctx context.Context, ans map[string]string) (mesh
 }
 
 // RunDue runs the scheduler's jobs that are due: so far, the mesh token's rotation, the mesh's drift check, the
-// certificate's renewal, the DNS zone's inventory record (#179), and each LDAP app's directory (#204).
+// certificate's renewal, the DNS zone's inventory record (#179), each LDAP app's directory (#204), and the admins'
+// app passwords, ended (#281).
 func (m *Manager) RunDue(ctx context.Context) {
 	if err := m.giveSetupPort(ctx); err != nil {
 		m.log.Error("giving the agent the setup listener's port", "err", err)
@@ -567,6 +568,9 @@ func (m *Manager) RunDue(ctx context.Context) {
 	}
 	if err := m.ensureLDAPApps(ctx); err != nil {
 		m.log.Error("putting the LDAP apps' directories back", "err", err)
+	}
+	if err := m.endAdminAppPasswords(ctx); err != nil {
+		m.log.Error("ending the admins' app passwords", "err", err)
 	}
 }
 

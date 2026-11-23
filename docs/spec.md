@@ -539,7 +539,14 @@ Stories 120–121 are decided in #87.
     inside it: an app's container sees its LDAP password in the clear, and a provider setting drifted behind
     Homeward's back could take it outside the bind flow (#278). So an admin who uses an LDAP app does it with a
     separate account that isn't an admin, and Homeward makes no app password for an admin. Admin lists such
-    credentials among the admin's credentials;
+    credentials among the admin's credentials. Enforced with either provider (#281):
+    - the adapter refuses an app password for an admin, one made an admin while it is being made included;
+    - someone who holds app passwords isn't made an admin: the role change is refused, changing nothing, and says to
+      remove them first (or keep them on a separate account). Refusing locks nobody out: whoever asks is an admin
+      already, the first admin is a new account, and `homeward admin recover` enrols a passkey without changing a role;
+    - with Kanidm, a person makes their own app passwords in Kanidm's settings, an admin too, and Homeward can't stop
+      it there; Authentik's settings and console allow the same. So every pass of the manager's schedule reads every
+      admin's app passwords and ends them, with a security event per admin that says the way;
 - optional SSH sign-in on nodes: SSSD with Authentik, kanidm-unixd with Kanidm;
 - a report of what it can do.
 
@@ -1441,3 +1448,4 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 187 | The LAN includes the default-route interfaces' on-link global IPv6 prefixes | First-time setup in two halves (#73) |
 | 188 | Admins' app-scoped LDAP credentials count against the passkey-only check; an admin uses LDAP apps with a separate account that isn't an admin (decided) | Adapter contracts (#104, #274) |
 | 189 | The catalog's app waves, and two apps per purpose beyond classic | The catalog's app waves (#118–#122, #123) |
+| 190 | No app password for an admin, enforced with either provider: refused for an admin, the promotion of someone holding one refused, admins' own (Kanidm's, a console's) ended at every pass with a security event (decided by default) | Adapter contracts (#281) |
