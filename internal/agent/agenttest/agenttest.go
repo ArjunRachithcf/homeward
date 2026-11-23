@@ -751,7 +751,7 @@ func (h *Host) Run(ctx context.Context, c host.Cmd) ([]byte, error) {
 	case line == "nft -f -":
 		h.table, h.hasTable = string(c.Stdin), true
 		return nil, nil
-	case line == "nft -s list table inet homerslab":
+	case line == "nft -s -t list table inet homerslab":
 		if !h.hasTable {
 			return nil, &host.Error{Cmd: line, Err: errors.New("exit status 1"), Stderr: "Error: No such file or directory"}
 		}

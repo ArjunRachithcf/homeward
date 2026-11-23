@@ -395,8 +395,8 @@ func TestTheTableFollowsTheLANAndTheEnginesBridges(t *testing.T) {
 	if !strings.Contains(table, "2001:db8:5::/64") {
 		t.Errorf("the table didn't follow the LAN's new prefix:\n%s", table)
 	}
-	if !strings.Contains(table, `oifname { "br-iot" } ip daddr { 192.168.1.1 } meta l4proto { tcp, udp } th dport 53 accept`) ||
-		!strings.Contains(table, `oifname { "br-iot" } ip6 daddr { 2001:db8:1::1 } meta l4proto { tcp, udp } th dport 53 accept`) {
+	if !strings.Contains(table, `oifname { "br-iot" } ip daddr { 192.168.1.1 } meta l4proto { tcp, udp } th dport 53 goto admit`) ||
+		!strings.Contains(table, `oifname { "br-iot" } ip6 daddr { 2001:db8:1::1 } meta l4proto { tcp, udp } th dport 53 goto admit`) {
 		t.Errorf("the apps can't ask the machine's resolvers:\n%s", table)
 	}
 	var s agent.FirewallStatus
@@ -485,7 +485,7 @@ func TestTheJoinTakesTheManagersSetupPort(t *testing.T) {
 	r := joinBody()
 	r.SetupPort = 7444
 	call(t, sock, "POST", "/v1/mesh/join", r)
-	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7444 accept") || strings.Contains(table, "7020") {
+	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7444 goto admit") || strings.Contains(table, "7020") {
 		t.Errorf("the setup listener's port isn't the manager's:\n%s", table)
 	}
 }
@@ -717,11 +717,11 @@ func TestTheManagersSetupPortIsKeptForTheNextBoot(t *testing.T) {
 	}
 	// After the join, the table follows the port the manager gives; once closed, there is no port to give.
 	call(t, sock, "POST", "/v1/mesh/join", joinBody())
-	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7444 accept") {
+	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7444 goto admit") {
 		t.Errorf("the join's table lost the manager's port:\n%s", table)
 	}
 	call(t, sock, "PUT", "/v1/firewall/setup-listener", map[string]any{"open": true, "port": 7445})
-	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7445 accept") || strings.Contains(table, "7444") {
+	if table, _ := h.Table(); !strings.Contains(table, "tcp dport 7445 goto admit") || strings.Contains(table, "7444") {
 		t.Errorf("the table didn't follow the manager's new port:\n%s", table)
 	}
 	call(t, sock, "PUT", "/v1/firewall/setup-listener", map[string]bool{"open": false})
@@ -995,7 +995,7 @@ func TestTheTableLetsAppsOutThroughTheUplinks(t *testing.T) {
 		!strings.Contains(table, `meta nfproto ipv6 oifname != { "enp5s0" } drop`) {
 		t.Errorf("apps can't leave through the VPN's tunnel, or leave over IPv6 through it, which it doesn't cover:\n%s", table)
 	}
-	if !strings.Contains(table, `iifname { "enp5s0" } tcp dport 7020 accept`) || strings.Contains(table, `"wg0" } tcp dport`) {
+	if !strings.Contains(table, `iifname { "enp5s0" } tcp dport 7020 goto admit`) || strings.Contains(table, `"wg0" } tcp dport`) {
 		t.Errorf("the setup listener isn't the LAN's alone:\n%s", table)
 	}
 }

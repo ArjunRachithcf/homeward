@@ -174,7 +174,7 @@ func TestTheEdgeAloneReachesTheApp(t *testing.T) {
 		}
 	}
 	table, _ := h.Table()
-	if !strings.Contains(table, "ip daddr . tcp dport . meta skuid { 172.31.240.2 . 8080 . 0, 172.31.240.2 . 8080 . 981, 172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981, 172.31.250.10 . 9000 . 982 } accept") {
+	if !strings.Contains(table, "ip daddr . tcp dport . meta skuid { 172.31.240.2 . 8080 . 0, 172.31.240.2 . 8080 . 981, 172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981, 172.31.250.10 . 9000 . 982 } goto admit") {
 		t.Errorf("the firewall table:\n%s", table)
 	}
 }
@@ -192,7 +192,7 @@ func TestOnlyTheLDAPSPortsProcessOpensTheOutpost(t *testing.T) {
 	if !strings.Contains(table, "172.31.250.11 . tcp . 3389, 172.31.250.11 . tcp . 6636, 172.31.250.11 . tcp . 9300 } jump to_apps") {
 		t.Errorf("the outpost's ports aren't kept to to_apps:\n%s", table)
 	}
-	if !strings.Contains(table, "172.31.250.10 . 9000 . 982, 172.31.250.11 . 3389 . 60604 } accept") {
+	if !strings.Contains(table, "172.31.250.10 . 9000 . 982, 172.31.250.11 . 3389 . 60604 } goto admit") {
 		t.Errorf("the LDAPS port's process can't open the outpost:\n%s", table)
 	}
 	for _, bad := range []string{"172.31.250.11 . 3389 . 0", "172.31.250.11 . 3389 . 98", "172.31.250.11 . 6636 .", "172.31.250.11 . 9300 ."} {
@@ -222,7 +222,7 @@ func TestAppsReachTheSignInThroughItsListener(t *testing.T) {
 	if !strings.Contains(cfg, `"sign-in":{`) || !strings.Contains(cfg, `"listen":["172.31.255.241:443"]`) {
 		t.Errorf("the edge has no sign-in listener:\n%s", cfg)
 	}
-	if table, _ := h.Table(); !strings.Contains(table, "\tchain apps_in {\n\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local accept\n\t\tip daddr . tcp dport { 172.31.255.241 . 443 } accept\n") {
+	if table, _ := h.Table(); !strings.Contains(table, "\tchain apps_in {\n\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local goto admit\n\t\tip daddr . tcp dport { 172.31.255.241 . 443 } goto admit\n") {
 		t.Errorf("the firewall table doesn't let apps reach the listener:\n%s", table)
 	}
 	if o, _ := os.ReadFile(filepath.Join(state, "apps", "bentopdf", "homeward.yaml")); !strings.Contains(string(o), "extra_hosts:\n      - \"auth.example.test=172.31.255.241\"\n") {

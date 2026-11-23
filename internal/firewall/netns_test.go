@@ -13,6 +13,7 @@ package firewall_test
 // internet" behind it. VPNs' servers, vpn and vpn2, are at the other ends of the box's tun0 and tap0 (TestTunnelsInNetworkNamespaces).
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -100,6 +101,48 @@ func TestMain(m *testing.M) {
 		n, err := c.Read(b)
 		if err != nil || string(b[:n]) != "hello\n" {
 			os.Exit(1)
+		}
+		os.Exit(0)
+	case "echo": // a TCP echo, line by line, on every connection
+		ln, err := net.Listen("tcp", os.Args[len(os.Args)-1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("listening")
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				os.Exit(1)
+			}
+			go func() { _, _ = io.Copy(c, c); c.Close() }()
+		}
+	case "tsession", "usession": // one flow, kept open: a line on stdin asks it a question, "ok" or "no" says if it was answered
+		proto := map[string]string{"tsession": "tcp", "usession": "udp"}[os.Getenv(helper)]
+		c, err := net.DialTimeout(proto, os.Args[len(os.Args)-1], 500*time.Millisecond)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("connected")
+		in, from := bufio.NewScanner(os.Stdin), bufio.NewReader(c)
+		for i := 0; in.Scan(); i++ {
+			q := fmt.Sprintf("q%d\n", i)
+			_ = c.SetDeadline(time.Now().Add(700 * time.Millisecond))
+			_, err := c.Write([]byte(q))
+			var a string
+			if err == nil {
+				a, err = from.ReadString('\n')
+			}
+			// A late answer to an earlier question is no answer to this one.
+			for err == nil && a != q {
+				a, err = from.ReadString('\n')
+			}
+			if err != nil {
+				fmt.Println("no")
+			} else {
+				fmt.Println("ok")
+			}
 		}
 		os.Exit(0)
 	case "dial":
@@ -652,6 +695,164 @@ func TestAUDPProbeIsANewFlowInNetworkNamespaces(t *testing.T) {
 		t.Fatal(err)
 	}
 	n.wantUDP(t, "an engine's bridge: no DHCP, though the kernel would hand the probe the first one's port", "vm", "192.168.122.1:67", false)
+}
+
+// A table takes effect on the flows already running, not just on new ones (#285): the moment Apply returns, a flow the
+// new table refuses is cut, in each direction it was opened (into the box, forwarded, from the box into an app's
+// network), TCP and UDP alike, while a flow it still admits (the mesh session that runs Apply, a LAN host's WireGuard,
+// an app's resolver) runs on. A full set of admitted flows refuses no flow.
+func TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces(t *testing.T) {
+	testenv.Isolate(t)
+	if os.Getenv(insideNamespaces) != "1" {
+		reexec(t, "^TestApplyCutsTheFlowsTheNewTableRefusesInNetworkNamespaces$")
+		return
+	}
+	n := newNet(t)
+	n.serve(t, "", "echo", ":7030")     // the setup listener
+	n.serve(t, "", "echo", ":7031")     // a listener of the box's, for the mesh
+	n.serve(t, "", "ulisten", ":51820") // the mesh's WireGuard port, kept
+	n.serve(t, "", "ulisten", ":51821") // another WireGuard port, closed
+	n.serve(t, "", "ulisten", ":7032")  // a UDP listener of the box's, for the mesh
+	n.serve(t, "lan", "echo", "203.0.113.50:9011")
+	n.serve(t, "lan", "ulisten", "203.0.113.50:9012")
+	n.serve(t, "ctr", "echo", "172.30.0.2:8447")
+
+	open := firewall.State{Mesh: []string{"wt0"}, WireGuard: []int{51820, 51821}, SetupPort: 7030, LAN: []string{"br-iot"},
+		LANPrefixes: []netip.Prefix{netip.MustParsePrefix("192.168.77.0/24")}, Uplinks4: []string{"br-iot"},
+		Bridges: []string{"br-test", "br-other", "docker0"}, Virtual: guests(t),
+		Resolvers: []netip.Addr{netip.MustParseAddr("192.168.77.50")},
+		Upstreams: []firewall.Upstream{{Addr: netip.MustParseAddrPort("172.30.0.2:8447"), UIDs: []uint32{0}}}}
+	// Stricter: the setup listener closed, one WireGuard port gone, no way to the IPv4 internet, no upstream.
+	strict := open
+	strict.SetupPort, strict.WireGuard, strict.Uplinks4, strict.Upstreams = 0, []int{51820}, nil, nil
+
+	fw := &firewall.Firewall{Run: host.Exec}
+	ctx := context.Background()
+	if err := fw.Apply(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	flows := []struct {
+		what, from, mode, addr string
+		kept                   bool
+	}{
+		{"the LAN's TCP flow to the setup listener", "lan", "tsession", "192.168.77.1:7030", false},
+		{"the LAN's UDP flow to a WireGuard port that closed", "lan", "usession", "192.168.77.1:51821", false},
+		{"an app's TCP flow to the internet", "ctr", "tsession", "203.0.113.50:9011", false},
+		{"an app's UDP flow to the internet", "ctr", "usession", "203.0.113.50:9012", false},
+		{"the box's TCP flow into an app's network, from a user no upstream names now", "", "tsession", "172.30.0.2:8447", false},
+		{"the mesh's TCP session (the one that runs Apply)", "peer", "tsession", "100.88.1.1:7031", true},
+		{"the mesh's UDP flow", "peer", "usession", "100.88.1.1:7032", true},
+		{"the LAN's UDP flow to the WireGuard port that stays", "lan", "usession", "192.168.77.1:51820", true},
+		{"an app's UDP flow to its resolver", "ctr", "usession", "192.168.77.50:53", true},
+	}
+	sessions := make([]*session, len(flows))
+	for i, f := range flows {
+		sessions[i] = n.session(t, f.from, f.mode, f.addr)
+	}
+	ask := func(when string, want func(kept bool) bool) {
+		t.Helper()
+		var wg sync.WaitGroup
+		for i, f := range flows {
+			wg.Go(func() {
+				if got := sessions[i].ask(t); got != want(f.kept) {
+					t.Errorf("%s: %s answers %v, want %v", when, f.what, got, want(f.kept))
+				}
+			})
+		}
+		wg.Wait()
+	}
+	always := func(bool) bool { return true }
+	ask("under the table that admits them", always)
+	ask("again", always)
+
+	if err := fw.Apply(ctx, strict); err != nil {
+		t.Fatal(err)
+	}
+	kept := func(k bool) bool { return k }
+	ask("right after the stricter table applied", kept)
+	ask("and after that", kept)
+	if err := fw.Apply(ctx, strict); err != nil {
+		t.Fatal(err)
+	}
+	ask("after the same table applied again", kept)
+	if d, err := fw.Check(ctx); d != nil || err != nil {
+		t.Errorf("the flows the table admitted read as drift: %+v, %v", d, err)
+	}
+
+	// The set of admitted flows full: a flow is admitted all the same (and only asked again at its next packet).
+	for next, size := 1, 4096; size > 0; {
+		var els []string
+		for j := next; j < next+size; j++ {
+			els = append(els, strconv.Itoa(j))
+		}
+		if _, err := host.Exec(ctx, host.Cmd{Name: "nft", Args: []string{"-f", "-"},
+			Stdin: []byte("add element " + firewall.Table + " admitted { " + strings.Join(els, ", ") + " }\n")}); err != nil {
+			size /= 2 // full, or too few places left for so many
+			continue
+		}
+		next += size
+	}
+	if out, err := host.Exec(ctx, host.Cmd{Name: "nft", Args: []string{"-t", "list", "set", "inet", "homerslab", "admitted"}}); err != nil ||
+		!strings.Contains(string(out), "# count 65535") {
+		t.Fatalf("the set of admitted flows isn't full: %v\n%s", err, out)
+	}
+	full := []*session{n.session(t, "lan", "usession", "192.168.77.1:51820"), n.session(t, "peer", "tsession", "100.88.1.1:7031"),
+		n.session(t, "ctr", "usession", "192.168.77.50:53")}
+	for _, s := range full {
+		if !s.ask(t) || !s.ask(t) {
+			t.Errorf("with the set of admitted flows full, a new flow the table admits isn't answered: %s", s.what)
+		}
+	}
+}
+
+// session is one flow kept open from a namespace (tsession, usession).
+type session struct {
+	what string
+	in   io.Writer
+	out  *bufio.Scanner
+	mu   sync.Mutex
+}
+
+func (n *netns) session(t *testing.T, from, mode, addr string) *session {
+	t.Helper()
+	cmd := n.helper(from, mode, addr)
+	in, _ := cmd.StdinPipe()
+	out, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	s := &session{what: fmt.Sprintf("%s → %s (%s)", orBox(from), addr, mode), in: in, out: bufio.NewScanner(out)}
+	if !s.out.Scan() || s.out.Text() != "connected" {
+		t.Fatalf("%s: no flow", s.what)
+	}
+	return s
+}
+
+// ask asks the flow a question, and says whether it was answered.
+func (s *session) ask(t *testing.T) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := io.WriteString(s.in, "\n"); err != nil || !s.out.Scan() {
+		t.Errorf("%s: the flow's process is gone", s.what)
+		return false
+	}
+	return s.out.Text() == "ok"
+}
+
+// serve starts a helper that serves addr (listen, echo, ulisten) in a namespace ("" for the box's own).
+func (n *netns) serve(t *testing.T, name, mode, addr string) {
+	t.Helper()
+	cmd := n.helper(name, mode, addr)
+	out, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	line := make([]byte, 10)
+	if _, err := io.ReadFull(out, line); err != nil || string(line) != "listening\n" {
+		t.Fatalf("no %s on %s in %s", mode, addr, orBox(name))
+	}
 }
 
 // guests are the bridges this namespace's kernel reads as of guests' ports only (lan.Network.Virtual).
