@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 
-import { answer, claim, getPrimary, getSetup, Unreachable, WAIT, type StepState } from './api.ts';
+import { answer, claim, CLAIM_RETRIES, getPrimary, getSetup, Unreachable, WAIT, type StepState } from './api.ts';
 
 const step = (id: string): StepState => ({ id, half: 'lan', state: 'todo', revision: 1 });
 
@@ -76,7 +76,7 @@ test('an answer whose body never comes gives up as Unreachable too', async () =>
 });
 
 test('a claim and its three tries again (1, 2 and 4 s apart, App.tsx) end inside the manager’s minute for the same claim', () => {
-  assert.ok(4 * WAIT.claim + 7_000 < 60_000); // internal/manager/setup: ClaimAgainWithin
+  assert.ok((CLAIM_RETRIES.length + 1) * WAIT.claim + CLAIM_RETRIES.reduce((a, b) => a + b, 0) < 60_000); // internal/manager/setup: ClaimAgainWithin
 });
 
 test('an answer whose body is cut off is no answer: Unreachable, not an empty setup', async () => {
@@ -91,18 +91,14 @@ test('the limits: a quick read, a step’s answer, and the network step a little
   assert.ok(WAIT.network <= 4 * 60_000);
 });
 
-test('an answer in time stops the clock: nothing gives up on it later', async () => {
-  globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({ half: 'lan', current: 'you', steps: [], answers: {} }),
-    { status: 200, headers: { 'Content-Type': 'application/json' } }))) as typeof fetch;
-  const late: unknown[] = [];
-  const onLate = (e: unknown) => late.push(e);
-  process.on('unhandledRejection', onLate);
-  try {
-    assert.equal((await getSetup()).current, 'you');
-    mock.timers.tick(WAIT.network);
-    await standing(Promise.resolve());
-    assert.deepEqual(late, []);
-  } finally {
-    process.off('unhandledRejection', onLate);
-  }
+test('an answer in time stops the clock: the request isn’t cancelled later', async () => {
+  let signal: AbortSignal | undefined;
+  globalThis.fetch = ((_: string, init: RequestInit) => {
+    signal = init.signal ?? undefined;
+    return Promise.resolve(new Response(JSON.stringify({ half: 'lan', current: 'you', steps: [], answers: {} }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }));
+  }) as typeof fetch;
+  assert.equal((await getSetup()).current, 'you');
+  mock.timers.tick(WAIT.network);
+  assert.equal(signal?.aborted, false);
 });

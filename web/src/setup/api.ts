@@ -102,6 +102,9 @@ export class Refused extends Error {
  */
 export const WAIT = { read: 15_000, claim: 10_000, answer: 30_000, network: 195_000 } as const;
 
+/** A claim that got no answer is sent again after each of these pauses (App.tsx), then left to "Try again". */
+export const CLAIM_RETRIES = [1000, 2000, 4000];
+
 /** Steps whose answer does slow work of its own, and how long each may take. */
 const SLOW: Record<string, number> = { network: WAIT.network };
 

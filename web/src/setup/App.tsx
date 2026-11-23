@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { rich, t, type Key } from '../i18n/t';
-import { answer, claim, dropLink, getPrimary, getSetup, goodNonce, heldLink, holdLink, keepSession, newNonce, Refused, Unreachable, type Facts, type Link, type Reason, type Setup } from './api';
+import { answer, claim, CLAIM_RETRIES, dropLink, getPrimary, getSetup, goodNonce, heldLink, holdLink, keepSession, newNonce, Refused, Unreachable, type Facts, type Link, type Reason, type Setup } from './api';
 import { Assistant, Field, Icon, stepTitle, type Screen } from './Assistant';
 import { diskSize, memory } from './format';
 
@@ -145,9 +145,6 @@ function fromAddress(): Link | null {
   const held = heldLink();
   return { key, nonce: goodNonce(nonce) ? nonce : held?.key === key ? held.nonce : newNonce() };
 }
-
-// A claim that got no answer is sent again after each of these pauses, then left to "Try again".
-const CLAIM_RETRIES = [1000, 2000, 4000];
 
 type Claim = { kind: 'claimed'; token: string } | { kind: 'refused' } | { kind: 'unanswered'; error: unknown };
 

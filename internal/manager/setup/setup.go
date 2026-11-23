@@ -162,7 +162,9 @@ const (
 	// SessionMax is how long a session lasts at most; then a new link continues where setup stopped.
 	SessionMax = 2 * time.Hour
 	// ClaimAgainWithin is how long after a claim the same tab may send it again, from the same address with the same
-	// nonce, and get its session back: for a claim whose answer the network lost, or a reload while it was out.
+	// nonce, and get its session back: for a claim whose answer the network lost, or a reload while it was out. The
+	// setup page's claim and its tries again end inside it (web/src/setup/api.ts: WAIT.claim, CLAIM_RETRIES, copied
+	// by hand): change both together.
 	ClaimAgainWithin = time.Minute
 )
 

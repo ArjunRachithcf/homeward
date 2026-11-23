@@ -1,5 +1,6 @@
 // First-time setup, opened from its one-time link: scripted from the setup prototype (prototypes/setup.html), with
 // the real manager and agent behind the page.
+import type { Page } from '@playwright/test';
 import { expect, test } from './primary';
 
 test('the link opens first-time setup, which shows the machine as its agent reports it', async ({ page, primary }) => {
@@ -67,13 +68,19 @@ test('setup takes one question per screen, and resumes where it stopped', async 
 test('a link works once', async ({ browser, primary }) => {
   const link = await primary.newLink();
   const first = await browser.newPage();
-  await first.goto(link.localUrl);
-  await expect(first.getByRole('heading', { level: 1 })).toContainText('Let’s set up Homeward');
+  let second: Page | undefined;
+  try {
+    await first.goto(link.localUrl);
+    await expect(first.getByRole('heading', { level: 1 })).toContainText('Let’s set up Homeward');
 
-  const second = await (await browser.newContext()).newPage();
-  await second.goto(link.localUrl);
-  await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
-  await expect(second.getByText('sudo homeward setup link')).toBeVisible();
+    second = await (await browser.newContext()).newPage();
+    await second.goto(link.localUrl);
+    await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
+    await expect(second.getByText('sudo homeward setup link')).toBeVisible();
+  } finally { // pages left open outlive the test: a claim still out would be sent again into the next one
+    await first.context().close();
+    await second?.context().close();
+  }
 });
 
 test('the page without a link says how to get one', async ({ page, primary }) => {
