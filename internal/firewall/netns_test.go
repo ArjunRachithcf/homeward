@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -75,10 +76,16 @@ func TestMain(m *testing.M) {
 			}
 			_, _ = c.WriteTo(buf[:n], from)
 		}
-	case "udial":
-		c, err := net.Dial("udp", os.Args[len(os.Args)-1])
+	case "udial": // from the source port before the address: a new flow, never an earlier probe's (#279)
+		port, err := strconv.Atoi(os.Args[len(os.Args)-2])
 		if err != nil {
-			os.Exit(1)
+			os.Exit(2)
+		}
+		d := net.Dialer{LocalAddr: &net.UDPAddr{Port: port}}
+		c, err := d.Dial("udp", os.Args[len(os.Args)-1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2) // the probe never asked: not an answer of the table's
 		}
 		_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
 		if _, err := c.Write([]byte("hello\n")); err != nil {
@@ -612,6 +619,36 @@ func TestABridgeWithANICInNetworkNamespaces(t *testing.T) {
 	})
 }
 
+// A UDP probe is a new flow, whatever the probes before it (#279): the table lets a flow it admitted run on
+// (ct state established), so a probe from an earlier, answered probe's source port is that flow's, not a question to
+// the table that now refuses it. Here the VM's kernel has one ephemeral port to hand out, so every probe it picked
+// the port for would be the first one's flow: the VM gets the box's DHCP while virbr0 is a local virtual network, and
+// none once it is an engine's bridge (an app network).
+func TestAUDPProbeIsANewFlowInNetworkNamespaces(t *testing.T) {
+	testenv.Isolate(t)
+	if os.Getenv(insideNamespaces) != "1" {
+		reexec(t, "^TestAUDPProbeIsANewFlowInNetworkNamespaces$")
+		return
+	}
+	n := newNet(t)
+	if out, err := exec.Command("nsenter", "-t", strconv.Itoa(n.pids["vm"]), "-n", "sh", "-ec",
+		"echo '40000 40000' > /proc/sys/net/ipv4/ip_local_port_range").CombinedOutput(); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	fw := &firewall.Firewall{Run: host.Exec}
+	s := firewall.State{Mesh: []string{"wt0"}, LAN: []string{"br-iot"}, Uplinks4: []string{"br-iot"},
+		Bridges: []string{"br-test", "br-other", "docker0"}, Virtual: guests(t)}
+	if err := fw.Apply(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	n.wantUDP(t, "a local virtual network: the VM gets the box's DHCP", "vm", "192.168.122.1:67", true)
+	s.Bridges = append(s.Bridges, "virbr0")
+	if err := fw.Apply(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	n.wantUDP(t, "an engine's bridge: no DHCP, even from the port the kernel handed the first probe", "vm", "192.168.122.1:67", false)
+}
+
 // guests are the bridges this namespace's kernel reads as of guests' ports only (lan.Network.Virtual).
 func guests(t *testing.T) []string {
 	t.Helper()
@@ -760,6 +797,8 @@ type netns struct {
 	// probes, while together runs: want and wantUDP then run at once, each in its own process, and together waits
 	// for them all.
 	probes *sync.WaitGroup
+	// udpProbes counts the UDP probes, each from a source port of its own (wantUDP).
+	udpProbes atomic.Uint32
 }
 
 func newNet(t *testing.T) *netns {
@@ -959,10 +998,28 @@ func (n *netns) probe(check func()) {
 	n.probes.Go(check)
 }
 
+// firstUDPProbePort is the source port of a namespace's first UDP probe, the next one's the one above it: below every
+// kernel's ephemeral range (Linux's starts at 32768 by default), so no other socket has it.
+const firstUDPProbePort = 20000
+
+// wantUDP probes addr from its own source port, so the table is asked about a new flow (#279): the table lets a flow it
+// admitted run on (ct state established), and a probe from an earlier, answered probe's port, as the kernel may pick
+// it again, would be that flow's, answered by a table that refuses the probe.
 func (n *netns) wantUDP(t *testing.T, what, from, addr string, reach bool) {
 	t.Helper()
+	port := firstUDPProbePort + int(n.udpProbes.Add(1)) - 1
 	n.probe(func() {
-		got := n.helper(from, "udial", addr).Run() == nil
+		cmd := n.helper(from, "udial", addr)
+		cmd.Args = slices.Insert(cmd.Args, len(cmd.Args)-1, strconv.Itoa(port))
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		// 2: the probe never asked (its port taken, or the Go runtime failed, as at a task limit), which is no refusal.
+		if e, ok := err.(*exec.ExitError); ok && e.ExitCode() == 2 {
+			t.Errorf("%s: %s → %s/udp from port %d: no probe: %s", what, orBox(from), addr, port, bytes.TrimSpace(stderr.Bytes()))
+			return
+		}
+		got := err == nil
 		if got != reach {
 			t.Errorf("%s: %s → %s/udp answers %v, want %v", what, orBox(from), addr, got, reach)
 		}
