@@ -142,6 +142,34 @@
                       "handle": [
                         {
                           "handler": "reverse_proxy",
+                          "headers": {
+                            "request": {
+                              "delete": [
+                                "Authorization",
+                                "Proxy-Authorization"
+                              ]
+                            }
+                          },
+                          "upstreams": [
+                            {
+                              "dial": "172.31.250.10:9000"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/outpost.goauthentik.io/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "reverse_proxy",
                           "upstreams": [
                             {
                               "dial": "172.31.250.10:9000"
@@ -1007,6 +1035,34 @@
                             "/api/v3/flows/executor/initial-setup/*",
                             "/api/v3/flows/instances/initial-setup",
                             "/api/v3/flows/instances/initial-setup/*"
+                          ]
+                        }
+                      ],
+                      "terminal": true
+                    },
+                    {
+                      "handle": [
+                        {
+                          "handler": "reverse_proxy",
+                          "headers": {
+                            "request": {
+                              "delete": [
+                                "Authorization",
+                                "Proxy-Authorization"
+                              ]
+                            }
+                          },
+                          "upstreams": [
+                            {
+                              "dial": "172.31.250.10:9000"
+                            }
+                          ]
+                        }
+                      ],
+                      "match": [
+                        {
+                          "path": [
+                            "/outpost.goauthentik.io/*"
                           ]
                         }
                       ],

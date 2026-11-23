@@ -865,6 +865,12 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			q: toListener("pdf.example.test", "pdf.example.test", "/"), want: "error: ", notWants: "App,"},
 		{name: "the first-admin flow: 403, never the provider", from: "app",
 			q: toListener("auth.example.test", "auth.example.test", "/if/flow/initial-setup/"), want: "403 ", notWants: "Authentik"},
+		{name: "an app password at the embedded outpost's paths: no credentials reach the provider (#273)", from: "app",
+			q: func() request {
+				q := toListener("auth.example.test", "auth.example.test", "/outpost.goauthentik.io/auth/nginx")
+				q.Headers = map[string]string{"Authorization": basicOf("ines"), "X-Original-URL": "https://pdf.example.test/"}
+				return q
+			}(), want: "200 Authentik, at auth.example.test /outpost.goauthentik.io/auth/nginx\n", notWants: "with credentials"},
 		{name: "the edge machine's mesh listener, from an app: dropped", from: "app",
 			q: request{Addr: edgeApps + ":443", SNI: "auth.example.test", Host: "auth.example.test"}, want: "error: ", notWants: "Authentik"},
 	} {
@@ -1045,6 +1051,33 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			got := ask("phone", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test", Path: path})
 			if !strings.HasPrefix(got, "403 ") || strings.Contains(got, "Authentik") {
 				t.Errorf("%s: %q", path, got)
+			}
+		})
+	}
+
+	// Authentik's server answers its embedded outpost's paths at the sign-in's name too, with the outpost's session for
+	// an app it names (#273): no client credentials reach it there, in any spelling or protocol; its API still gets
+	// them.
+	for _, row := range []struct {
+		name string
+		q    request
+		want string
+		bad  string
+	}{
+		{"Basic at the outpost's nginx endpoint", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/outpost.goauthentik.io/auth/nginx", Headers: map[string]string{"Authorization": basicOf("ines"), "X-Original-URL": "https://pdf.example.test/"}},
+			"Authentik, at auth.example.test /outpost.goauthentik.io/auth/nginx", "with credentials"},
+		{"Basic in lower case over HTTP/2 at the outpost's start", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fpdf.example.test%2F", H2: true, Raw: [][2]string{{"authorization", basicOf("ines")}}},
+			"Authentik, at auth.example.test /outpost.goauthentik.io/start", "with credentials"},
+		{"a bearer token at the API: it reaches the provider", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/api/v3/core/users/me/", Headers: map[string]string{"Authorization": "Bearer an-api-token"}},
+			"Authentik, at auth.example.test /api/v3/core/users/me/ with credentials", ""},
+	} {
+		t.Run("the sign-in, "+row.name, func(t *testing.T) {
+			got := ask("phone", row.q)
+			if !strings.Contains(got, row.want) || row.bad != "" && strings.Contains(got, row.bad) {
+				t.Errorf("%q, want %q and never %q", got, row.want, row.bad)
 			}
 		})
 	}
