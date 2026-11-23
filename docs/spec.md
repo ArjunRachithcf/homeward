@@ -526,9 +526,12 @@ Stories 120–121 are decided in #87.
   - before accepting a step-up, Homeward also asks the provider for the admin's credentials. Anything but passkeys
     refuses the step-up, raises a security event, and says the way out (`homeward admin recover`, or another
     admin);
-  - an admin's app-scoped LDAP credentials (Kanidm's per-app passwords; the LDAP bind's own credentials with
-    Authentik) are exempt from that check. They are never accepted by the sign-in flow, and Admin lists them among
-    the admin's credentials (#104);
+  - an admin's app-scoped LDAP credentials (Kanidm's per-app passwords; Authentik's app passwords) count like
+    anything else, and refuse the step-up (#104, #274). The sign-in flow never accepts them, but they don't stay
+    inside it: an app's container sees its LDAP password in the clear, and a provider setting drifted behind
+    Homeward's back could take it outside the bind flow (#278). So an admin who uses an LDAP app does it with a
+    separate account that isn't an admin, and Homeward makes no app password for an admin. Admin lists such
+    credentials among the admin's credentials;
 - optional SSH sign-in on nodes: SSSD with Authentik, kanidm-unixd with Kanidm;
 - a report of what it can do.
 
@@ -1428,5 +1431,5 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 185 | Enrolment and recovery links run Homeward's own passkey-enrolment flow | Adapter contracts (#84, #87, second review of #94) |
 | 186 | The installer prints the command, not the link | First-time setup in two halves (#74) |
 | 187 | The LAN includes the default-route interfaces' on-link global IPv6 prefixes | First-time setup in two halves (#73) |
-| 188 | Admins' app-scoped LDAP credentials are exempt from the passkey-only check | Adapter contracts (#104) |
+| 188 | Admins' app-scoped LDAP credentials count against the passkey-only check; an admin uses LDAP apps with a separate account that isn't an admin (decided) | Adapter contracts (#104, #274) |
 | 189 | The catalog's app waves, and two apps per purpose beyond classic | The catalog's app waves (#118–#122, #123) |
