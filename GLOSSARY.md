@@ -185,7 +185,7 @@ _Avoid_: proxy, reverse proxy, ingress, gateway
 **Identity contract**:
 What a guarded app is told about who someone is, by the edge alone: their stable id, their name and their role; with
 `homerslab-v2`, and only when the app asks, also their **sign-in time**: when they last signed in, which a refresh of
-their session doesn't move.
+their session doesn't move. The app reads it from the request's headers only, never its trailers.
 _Avoid_: identity headers (the providers' own, which never reach an app), SSO headers
 
 **Exposure**:
