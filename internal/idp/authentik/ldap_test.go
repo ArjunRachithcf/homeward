@@ -388,11 +388,12 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 				pk, _ := sessionBinding()
 				w.raw(t, w.own, "PATCH", "/api/v3/flows/bindings/"+pk+"/", map[string]any{"policy_engine_mode": "any"}, nil)
 			}, false},
-			{"passing on failure", func() { failing(noAdmin.Results[0].PK, true) }, true},
 			{"naming another group", func() {
 				w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+noAdmin.Results[0].PK+"/",
 					map[string]any{"expression": strings.ReplaceAll(authentik.LDAPNoAdminExpr(admins), admins, "00000000-0000-4000-8000-000000000000")}, nil)
-			}, false},
+			}, true},
+			// Passing on failure, after the group's drift was seen alone: Prepare puts both back.
+			{"passing on failure", func() { failing(noAdmin.Results[0].PK, true) }, false},
 		} {
 			drift.do()
 			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
