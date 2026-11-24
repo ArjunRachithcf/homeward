@@ -153,24 +153,26 @@ func TestTheAdminsAppPasswordsEnd(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	f.objs["/core/users/"] = append(f.objs["/core/users/"],
 		map[string]any{"pk": 3, "username": "bea", "type": "internal", "path": userPath, "is_active": true, "groups": []any{"group-admin"}},
-		// Admins the console made, outside Homeward's path, one inactive (it can be made active again); a service account
-		// in the group, which signs in to nothing; someone of the console's in another group only.
+		// Admins the console made, outside Homeward's path, one inactive (it can be made active again), one external, and
+		// a service account put in the group; someone of the console's in another group only.
 		map[string]any{"pk": 4, "username": "carla", "type": "internal", "path": "users", "is_active": true, "groups": []any{"group-admin"}},
 		map[string]any{"pk": 5, "username": "dora", "type": "internal", "path": "users", "is_active": false, "groups": []any{"group-admin"}},
 		map[string]any{"pk": 6, "username": "svc", "type": "service_account", "path": "users", "is_active": true, "groups": []any{"group-admin"}},
+		map[string]any{"pk": 8, "username": "fay", "type": "external", "path": "users", "is_active": true, "groups": []any{"group-admin"}},
+		map[string]any{"pk": 9, "username": "ak-outpost-x", "type": "internal_service_account", "path": "goauthentik.io/outposts", "is_active": true, "groups": []any{"group-admin"}},
 		map[string]any{"pk": 7, "username": "eva", "type": "internal", "path": "users", "is_active": true, "groups": []any{"group-authentik-admins"}})
 	f.objs["/core/tokens/"] = []map[string]any{token("lenas", 1, nil), token("olgas", 2, nil), token("olgas-2", 2, nil),
 		token("beas-old", 3, &past), {"pk": "olgas-api", "identifier": "olgas-api", "intent": "api", "user": 2},
-		token("carlas", 4, nil), token("doras", 5, nil), token("svcs", 6, nil), token("evas", 7, nil)}
+		token("carlas", 4, nil), token("doras", 5, nil), token("svcs", 6, nil), token("evas", 7, nil), token("fays", 8, nil), token("outposts", 9, nil)}
 	got, err := a.EndAdminAppPasswords(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := names(got); !slices.Equal(n, []string{"carla", "dora", "olga"}) {
-		t.Errorf("ended: %v, want the admins' (the console's on any path, inactive included; bea's is expired, lena isn't one)", n)
+	if n := names(got); !slices.Equal(n, []string{"ak-outpost-x", "carla", "dora", "fay", "olga", "svc"}) {
+		t.Errorf("ended: %v, want every member of the admins' group's (any path, type, inactive too; bea's is expired, lena isn't one)", n)
 	}
-	if ts := f.tokens(); !slices.Equal(ts, []string{"lenas", "beas-old", "olgas-api", "svcs", "evas"}) {
-		t.Errorf("left: %v, want the adult's, the expired one, the API token, the service account's and the non-admin's", ts)
+	if ts := f.tokens(); !slices.Equal(ts, []string{"lenas", "beas-old", "olgas-api", "evas"}) {
+		t.Errorf("left: %v, want the adult's, the expired one, the API token and the non-admin's", ts)
 	}
 	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || len(got) != 0 {
 		t.Errorf("again: %v %v, want nobody", got, err)

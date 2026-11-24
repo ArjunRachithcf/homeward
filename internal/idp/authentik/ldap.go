@@ -414,8 +414,9 @@ func (a *Authentik) RevokeAppPasswords(ctx context.Context, username string) err
 
 // EndAdminAppPasswords deletes the app passwords of every admin who holds one that still binds, and says whose they
 // were (#281). Authentik's own settings let anyone make themselves an app password, an admin too. The admins are every
-// member of the admins' group, checked by the group's pk: an internal account the console made (on another path, or
-// inactive, which can be made active again) is an admin as much as Homeward's own, since Admin reads only the groups.
+// member of the admins' group, checked by the group's pk: an account the console made or put there (on another path,
+// external, or inactive, which can be made active again) is an admin as much as Homeward's own, since Admin reads only
+// the groups.
 // One admin's failure spares no other.
 func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]idp.AdminAppPasswords, error) {
 	g, err := a.adminGroup(ctx)
@@ -429,7 +430,9 @@ func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]idp.AdminAppPas
 	found := []idp.AdminAppPasswords{}
 	var errs []error
 	for _, u := range us {
-		if u.Type != "internal" || !slices.Contains(u.Groups, g) { // the filter is checked, never trusted (#219)
+		// Every type: the console can put an external account in the group, which Admin takes for an admin as it reads
+		// only the groups; a service account there is none of Homeward's, so ending its app passwords costs nothing.
+		if !slices.Contains(u.Groups, g) { // the filter is checked, never trusted (#219)
 			continue
 		}
 		ts, err := a.appPasswords(ctx, &u)
