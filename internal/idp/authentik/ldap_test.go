@@ -323,58 +323,16 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 			}
 			return out
 		}
-		// Either of the session stage's policies bound to pass when it fails (an exception, a timeout), as the console
-		// allows (#298): a failing policy would let anyone through. Each shows; the app's own is put back by hand, the
-		// no-admin policy's by the Prepare after the last drift below (Prepares are kept few, for the suite's time).
-		type sessionPB struct {
-			PK      string `json:"pk"`
-			Policy  string `json:"policy"`
-			Order   int    `json:"order"`
-			Failure bool   `json:"failure_result"`
-		}
-		sessionPolicies := func() []sessionPB {
-			_, pbm := sessionBinding()
-			var pbs struct{ Results []sessionPB }
-			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+pbm, nil, &pbs)
-			return pbs.Results
-		}
-		failing := func(pk string, failure bool) {
-			_, pbm := sessionBinding()
-			for _, b := range sessionPolicies() {
-				if b.Policy != pk {
-					continue
-				}
-				// As for negate, the binding is made again.
-				w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
-				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": pk, "order": b.Order,
-					"negate": false, "enabled": true, "timeout": 30, "failure_result": failure}, nil)
-			}
-		}
-		failing(own.Results[0].PK, true)
-		if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
-			t.Errorf("the app's own app-password policy passing on failure: %+v %v, want not passkey-only", r, err)
-		}
-		failing(own.Results[0].PK, false)
 		admins := w.groupPK(t, idp.RoleGroup(idp.Admin))
 		for i, drift := range []struct {
 			what string
 			do   func()
-			// next: no Prepare after it, to keep the suite inside its time; the next drift takes its binding's place.
-			next bool
 		}{
 			{"taken off the session stage", func() {
 				for _, b := range noAdminBindings() {
 					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
 				}
-			}, false},
-			{"switched off", func() {
-				_, pbm := sessionBinding()
-				for _, b := range noAdminBindings() {
-					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
-				}
-				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
-					"order": 10, "negate": false, "enabled": false, "timeout": 30}, nil)
-			}, true},
+			}},
 			{"negated", func() {
 				// Authentik answers a PATCH of negate alone with a 500: the binding is made again, negated.
 				_, pbm := sessionBinding()
@@ -383,24 +341,19 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 				}
 				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
 					"order": 10, "negate": true, "enabled": true, "timeout": 30}, nil)
-			}, false},
+			}},
 			{"outvoted: the session stage passes on any one policy", func() {
 				pk, _ := sessionBinding()
 				w.raw(t, w.own, "PATCH", "/api/v3/flows/bindings/"+pk+"/", map[string]any{"policy_engine_mode": "any"}, nil)
-			}, false},
+			}},
 			{"naming another group", func() {
 				w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+noAdmin.Results[0].PK+"/",
 					map[string]any{"expression": strings.ReplaceAll(authentik.LDAPNoAdminExpr(admins), admins, "00000000-0000-4000-8000-000000000000")}, nil)
-			}, true},
-			// Passing on failure, after the group's drift was seen alone: Prepare puts both back.
-			{"passing on failure", func() { failing(noAdmin.Results[0].PK, true) }, false},
+			}},
 		} {
 			drift.do()
 			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
 				t.Errorf("the no-admin policy %s: %+v %v, want not passkey-only", drift.what, r, err)
-			}
-			if drift.next {
-				continue
 			}
 			if err := idptest.Prepare(ctx, a, household); err != nil {
 				t.Fatal(err)
@@ -412,13 +365,111 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		if bs := noAdminBindings(); len(bs) != 1 {
 			t.Errorf("the no-admin policy's bindings on the session stage, put back: %v, want one", bs)
 		}
-		for _, b := range sessionPolicies() {
-			if b.Policy == noAdmin.Results[0].PK && b.Failure {
-				t.Error("the no-admin policy, put back: still passing on failure")
-			}
-		}
 		t.Run("a session stage left refusing by a failure halfway is put back by the next pass", func(t *testing.T) { ldapHalfDone(t, w, a, app) })
 		t.Run("one app's bind flow that can't be put back keeps Prepare from nothing else, the first part's bind flow going among it", func(t *testing.T) { ldapOneStuck(t, w, a) })
+	}
+}
+
+// ldapFailClosed binds the session stage's policies of an app's bind flow to pass when they fail (an exception, a
+// timeout), or switches the one refusing admins off, as the console allows (#298): a failing policy would let anyone
+// through. Each shows alone in the report, and Prepare puts them back, each bound once, on and failing closed.
+func ldapFailClosed(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		app := idp.LDAPApp{Slug: "homerslab-closed", Name: "Closed", Roles: []idp.Role{idp.Adult}}
+		if _, err := a.EnsureLDAP(ctx, app); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+				t.Error(err)
+			}
+		}()
+		policy := func(name string) string {
+			var ps struct {
+				Results []struct {
+					PK   string `json:"pk"`
+					Name string `json:"name"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name="+url.QueryEscape(name), nil, &ps)
+			if len(ps.Results) != 1 || ps.Results[0].Name != name {
+				t.Fatalf("the policy %s: %+v", name, ps.Results)
+			}
+			return ps.Results[0].PK
+		}
+		own, noAdmin := policy(app.Slug+"-ldap-app-password"), policy("homerslab-ldap-no-admin")
+		type pb struct {
+			PK      string `json:"pk"`
+			Policy  string `json:"policy"`
+			Order   int    `json:"order"`
+			On      bool   `json:"enabled"`
+			Failure bool   `json:"failure_result"`
+		}
+		// The session stage's binding (its policy binding model) and the policies bound to it.
+		session := func() (string, []pb) {
+			var fsb struct {
+				Results []struct {
+					PBM   string `json:"policybindingmodel_ptr_id"`
+					Order int    `json:"order"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/flows/bindings/?target="+flowPK(t, w, authentik.LDAPBindFlow(app.Slug)), nil, &fsb)
+			for _, b := range fsb.Results {
+				if b.Order == 30 {
+					var pbs struct{ Results []pb }
+					w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+b.PBM, nil, &pbs)
+					return b.PBM, pbs.Results
+				}
+			}
+			t.Fatalf("no session stage: %+v", fsb.Results)
+			return "", nil
+		}
+		// As for negate, a binding is made again rather than patched.
+		rebind := func(policy string, on, failure bool) {
+			pbm, bs := session()
+			for _, b := range bs {
+				if b.Policy == policy {
+					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
+					w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": policy, "order": b.Order,
+						"negate": false, "enabled": on, "timeout": 30, "failure_result": failure}, nil)
+				}
+			}
+		}
+		drifted := func(what string) {
+			t.Helper()
+			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+				t.Errorf("%s: %+v %v, want not passkey-only", what, r, err)
+			}
+		}
+		// Each alone, the first two put back by hand, the last by Prepare (Prepares are few, for the suite's time).
+		rebind(own, true, true)
+		drifted("the app's own app-password policy passing on failure")
+		rebind(own, true, false)
+		rebind(noAdmin, false, false)
+		drifted("the no-admin policy switched off")
+		rebind(noAdmin, true, false)
+		rebind(noAdmin, true, true)
+		drifted("the no-admin policy passing on failure")
+		if err := idptest.Prepare(ctx, a, household); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+			t.Errorf("after Prepare: %+v %v", r, err)
+		}
+		_, bs := session()
+		n := 0
+		for _, b := range bs {
+			if b.Policy == noAdmin {
+				n++
+			}
+			if b.Failure || !b.On {
+				t.Errorf("after Prepare, a session policy's binding %+v: want on and failing closed", b)
+			}
+		}
+		if n != 1 {
+			t.Errorf("after Prepare, the no-admin policy's bindings: %d, want one", n)
+		}
 	}
 }
 
