@@ -47,7 +47,9 @@ person sees changing. They are the maker's namespace, as `X-HomersLab-*` is.
 **A node installed as HomersLab moves once** (`homeward agent migrate`, from `homeward-migrate.service`): at boot
 before systemd-sysusers, the sockets, the firewall table and the agent, which requires it. It stops the old units (but
 the firewall table's, which the engines require), renames the users and groups in place with their ids kept (a new
-user sysusers made first, with another id, goes), moves each folder in one rename(2) (the agent's with every sealed
+user sysusers made first, with another id, goes; main's manager user, made before the fixed ids with an id sysusers
+picked, takes the fixed id once the files that id owns in the package's folders are the fixed id's, or goes when
+sysusers made the new one first), moves each folder in one rename(2) (the agent's with every sealed
 credential in it: the credentials' names carry no product name, so nothing is sealed again), drops what the agent
 derives from its state, and leaves the agent a mark; the agent writes its units and drop-ins again under the new names
 and removes the mark once all of it is in place. Every step is idempotent, and a run that stops anywhere is finished

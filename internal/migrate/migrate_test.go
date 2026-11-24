@@ -24,6 +24,8 @@ type node struct {
 	root  string
 	units map[string][2]string // loaded units: name → load, active state
 	ran   []string
+	// owners are the owners the node's files have other than root's, by inode: a rename keeps them, as on a real disk.
+	owners map[uint64][2]int
 }
 
 // oldNode is a node as HomersLab 0.x installed it, with an app on a share, the sign-in and the edge: what the package
@@ -31,7 +33,7 @@ type node struct {
 // and what the agent wrote.
 func oldNode(t *testing.T) *node {
 	t.Helper()
-	n := &node{t: t, root: t.TempDir(), units: map[string][2]string{
+	n := &node{t: t, root: t.TempDir(), owners: map[uint64][2]int{}, units: map[string][2]string{
 		"homerslab-agent.service":            {"loaded", "active"},
 		"homerslab-manager.service":          {"loaded", "active"},
 		"homerslab-admin.socket":             {"loaded", "active"},
@@ -84,6 +86,82 @@ func oldNode(t *testing.T) *node {
 	return n
 }
 
+// mainNode is a node as main's HomersLab installed it, before the fixed ids (#190): one user, the manager's, with an id
+// sysusers picked (979) and its own group of that id, owning the manager's folder. With sysusersFirst, the new
+// package's sysusers ran before any run (an upgrade without a reboot): it found the fixed ids free and made the new
+// users with them, beside the old one.
+func mainNode(t *testing.T, sysusersFirst bool) *node {
+	t.Helper()
+	n := &node{t: t, root: t.TempDir(), owners: map[uint64][2]int{}, units: map[string][2]string{
+		"homerslab-agent.service":   {"loaded", "active"},
+		"homerslab-manager.service": {"loaded", "active"},
+	}}
+	passwd := "root:x:0:0:root:/root:/bin/bash\n" +
+		"homerslab:x:979:979:HomersLab manager:/var/lib/homerslab:/usr/sbin/nologin\n" +
+		"maria:x:1000:1000::/home/maria:/bin/bash\n"
+	group := "root:x:0:\nwheel:x:10:maria\nhomerslab:x:979:\nmaria:x:1000:\n"
+	if sysusersFirst {
+		passwd += "homeward:x:60600:60600:Homeward manager:/var/lib/homeward:/usr/sbin/nologin\n" +
+			"homeward-edge:x:60601:60601:Homeward edge:/var/lib/homeward-edge:/usr/sbin/nologin\n"
+		group += "homeward:x:60600:\nhomeward-edge:x:60601:\n"
+	}
+	n.write("etc/passwd", passwd)
+	n.write("etc/group", group)
+	n.write("var/lib/homerslab/manager.db", "the household")
+	n.write("var/lib/homerslab/keys/session.key", "the manager's")
+	n.write("var/lib/homerslab/shared", "the manager's, root's group")
+	for _, p := range []string{"var/lib/homerslab", "var/lib/homerslab/manager.db", "var/lib/homerslab/keys", "var/lib/homerslab/keys/session.key"} {
+		n.own(p, 979, 979)
+	}
+	n.own("var/lib/homerslab/shared", 979, 0)
+	n.link("var/lib/homerslab/db-link", "../maria-app/data") // a link's own owner changes, never what it points at
+	n.own("var/lib/homerslab/db-link", 979, 979)
+	n.link("etc/systemd/system/multi-user.target.wants/homerslab-manager.service", "/usr/lib/systemd/system/homerslab-manager.service")
+	n.link("etc/systemd/system/multi-user.target.wants/homerslab-agent.service", "/usr/lib/systemd/system/homerslab-agent.service")
+	n.link("etc/systemd/system/multi-user.target.wants/sshd.service", "/usr/lib/systemd/system/sshd.service")
+	n.write("var/lib/maria-app/data", "someone else's, of the same id") // outside the package's folders: never touched
+	n.own("var/lib/maria-app/data", 979, 979)
+	n.mkdir("var/lib/homeward-agent")
+	n.mkdir("etc/homeward/units")
+	return n
+}
+
+// own gives p (not following a link) an owner other than root.
+func (n *node) own(p string, uid, gid int) {
+	n.t.Helper()
+	n.owners[n.ino(p)] = [2]int{uid, gid}
+}
+
+func (n *node) ino(p string) uint64 {
+	n.t.Helper()
+	fi, err := os.Lstat(p)
+	if !filepath.IsAbs(p) {
+		fi, err = os.Lstat(n.at(p))
+	}
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+// owner and chown are the node's file owners, for the run.
+func (n *node) owner(p string) (int, int, error) {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return 0, 0, err
+	}
+	o := n.owners[fi.Sys().(*syscall.Stat_t).Ino]
+	return o[0], o[1], nil
+}
+
+func (n *node) chown(p string, uid, gid int) error {
+	if !strings.HasPrefix(p, n.root+string(filepath.Separator)) {
+		n.t.Errorf("chown outside the node's root: %s", p)
+	}
+	n.owners[n.ino(p)] = [2]int{uid, gid}
+	return nil
+}
+
 // reboot is the next boot, without the old package: its units' files are gone, so systemd only remembers them.
 func (n *node) reboot() {
 	for u := range n.units {
@@ -128,7 +206,9 @@ func (n *node) read(p string) string {
 	return string(b)
 }
 
-func (n *node) host() migrate.Host { return migrate.Host{Root: n.root, Run: n.run} }
+func (n *node) host() migrate.Host {
+	return migrate.WithOwners(migrate.Host{Root: n.root, Run: n.run}, n.owner, n.chown)
+}
 
 // run is systemctl and the shadow tools, on the node's own files.
 func (n *node) run(_ context.Context, c host.Cmd) ([]byte, error) {
@@ -153,15 +233,40 @@ func (n *node) run(_ context.Context, c host.Cmd) ([]byte, error) {
 				}
 			}
 		}
-	case "groupmod": // --new-name NEW OLD
-		n.edit("etc/group", func(f []string) []string {
+	case "groupmod":
+		if c.Args[0] == "--gid" { // --gid ID NAME: and the users whose primary group it is, as shadow's groupmod does
+			var old string
+			n.edit("etc/group", func(f []string) []string {
+				if f[0] == c.Args[2] {
+					old, f[2] = f[2], c.Args[1]
+				}
+				return f
+			})
+			n.edit("etc/passwd", func(f []string) []string {
+				if f[3] == old {
+					f[3] = c.Args[1]
+				}
+				return f
+			})
+			break
+		}
+		n.edit("etc/group", func(f []string) []string { // --new-name NEW OLD
 			if f[0] == c.Args[2] {
 				f[0] = c.Args[1]
 			}
 			return f
 		})
-	case "usermod": // --login NEW --home HOME OLD
-		n.edit("etc/passwd", func(f []string) []string {
+	case "usermod":
+		if c.Args[0] == "--uid" { // --uid ID NAME
+			n.edit("etc/passwd", func(f []string) []string {
+				if f[0] == c.Args[2] {
+					f[2] = c.Args[1]
+				}
+				return f
+			})
+			break
+		}
+		n.edit("etc/passwd", func(f []string) []string { // --login NEW --home HOME OLD
 			if f[0] == c.Args[4] {
 				f[0], f[5] = c.Args[1], c.Args[3]
 			}
@@ -177,7 +282,7 @@ func (n *node) run(_ context.Context, c host.Cmd) ([]byte, error) {
 			f[3] = strings.Join(members, ",")
 			return f
 		})
-	case "userdel": // and its own group with it, as Debian's and Fedora's do
+	case "userdel": // and its own group with it, as Debian's and Fedora's do, unless the group has other members
 		n.edit("etc/passwd", func(f []string) []string {
 			if f[0] == c.Args[0] {
 				return nil
@@ -185,7 +290,7 @@ func (n *node) run(_ context.Context, c host.Cmd) ([]byte, error) {
 			return f
 		})
 		n.edit("etc/group", func(f []string) []string {
-			if f[0] == c.Args[0] {
+			if f[0] == c.Args[0] && f[3] == "" {
 				return nil
 			}
 			return f
@@ -229,6 +334,9 @@ func (n *node) tree() map[string]string {
 		default:
 			b, _ := os.ReadFile(p)
 			out[rel] = string(b)
+		}
+		if o, ok := n.owners[n.ino(p)]; ok && o != [2]int{} {
+			out[rel] += fmt.Sprintf(" (%d:%d)", o[0], o[1])
 		}
 		return nil
 	})
@@ -358,7 +466,17 @@ func TestPendingCountsAFolderItCantLookAt(t *testing.T) {
 // no folder is lost or doubled, no user made twice, and the agent's mark is there before what it stands for goes.
 func TestARunThatStopsAnywhereIsFinishedByTheNext(t *testing.T) {
 	testenv.Isolate(t)
-	ref := oldNode(t)
+	for name, install := range map[string]func(*testing.T) *node{
+		"fixed ids":                         oldNode,
+		"main's dynamic id":                 func(t *testing.T) *node { return mainNode(t, false) },
+		"main's dynamic id, sysusers first": func(t *testing.T) *node { return mainNode(t, true) },
+	} {
+		t.Run(name, func(t *testing.T) { stopsAnywhere(t, install) })
+	}
+}
+
+func stopsAnywhere(t *testing.T, install func(*testing.T) *node) {
+	ref := install(t)
 	var steps []string
 	if _, err := migrate.Run(context.Background(), migrate.WithFail(ref.host(), func(s string) error {
 		steps = append(steps, s)
@@ -367,11 +485,11 @@ func TestARunThatStopsAnywhereIsFinishedByTheNext(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := ref.tree()
-	if len(steps) < 15 {
+	if len(steps) < 8 {
 		t.Fatalf("only %d steps: %q", len(steps), steps)
 	}
 	for k, at := range steps {
-		n := oldNode(t)
+		n := install(t)
 		crash := errors.New("the power went")
 		seen := 0
 		_, err := migrate.Run(context.Background(), migrate.WithFail(n.host(), func(string) error {
@@ -481,5 +599,229 @@ func TestPendingIsAnyOfHomersLabsFolders(t *testing.T) {
 	}
 	if !migrate.Pending(root) {
 		t.Error("a node with /etc/homerslab isn't pending")
+	}
+}
+
+// A node main installed, before the fixed ids (#190), had the manager's user with an id sysusers picked. Whichever ran
+// first at the upgrade, the run or the new package's sysusers, the node ends with the package's user and group at their
+// fixed id, under the new name, and the old user gone: the files the old id owned in the package's folders are the
+// fixed id's (a link's own owner too), nothing else is touched, and a later run, once the agent has done its part, is
+// a no-op that stops nothing.
+func TestANodeMainInstalledTakesTheFixedIDs(t *testing.T) {
+	testenv.Isolate(t)
+	for _, sysusersFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sysusers first %v", sysusersFirst), func(t *testing.T) {
+			n := mainNode(t, sysusersFirst)
+			if _, err := migrate.Run(context.Background(), n.host()); err != nil {
+				t.Fatal(err)
+			}
+			p, g := n.read("etc/passwd"), n.read("etc/group")
+			if !strings.Contains(p, "\nhomeward:x:60600:60600:") || strings.Contains(p, "homerslab") || strings.Contains(p, ":979:") {
+				t.Errorf("the users are\n%s", p)
+			}
+			if !strings.Contains(g, "\nhomeward:x:60600:\n") || strings.Contains(g, "homerslab") || strings.Contains(g, ":979:") {
+				t.Errorf("the groups are\n%s", g)
+			}
+			tree := n.tree()
+			for p, want := range map[string]string{
+				"var/lib/homeward":                       "/ (60600:60600)",
+				"var/lib/homeward/manager.db":            "the household (60600:60600)",
+				"var/lib/homeward/keys":                  "/ (60600:60600)",
+				"var/lib/homeward/keys/session.key":      "the manager's (60600:60600)",
+				"var/lib/homeward/shared":                "the manager's, root's group (60600:0)",
+				"var/lib/homeward/db-link":               "→ ../maria-app/data (60600:60600)",
+				"var/lib/maria-app/data":                 "someone else's, of the same id (979:979)",
+				"var/lib/homeward-agent/" + migrate.Mark: "homerslab\n",
+			} {
+				if tree[p] != want {
+					t.Errorf("/%s = %q, want %q", p, tree[p], want)
+				}
+			}
+			if err := os.Remove(n.at("var/lib/homeward-agent/" + migrate.Mark)); err != nil { // the agent did its part
+				t.Fatal(err)
+			}
+			n.reboot()
+			n.units["homerslab-other.service"] = [2]string{"loaded", "active"} // another app of the maker's
+			before, ran := n.tree(), len(n.ran)
+			r, err := migrate.Run(context.Background(), n.host())
+			if err != nil || r.Did() || !maps.Equal(n.tree(), before) || len(n.ran) != ran {
+				t.Errorf("a later run did %+v, %v, ran %q", r, err, n.ran[ran:])
+			}
+			if n.units["homerslab-other.service"][1] != "active" {
+				t.Error("a later run stopped a unit named homerslab-*")
+			}
+		})
+	}
+}
+
+// A fixed id that something else already holds isn't taken from it: the user keeps the id it has, under its new name.
+func TestAFixedIDSomeoneElseHoldsIsLeftToThem(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, false)
+	n.write("etc/passwd", n.read("etc/passwd")+"other:x:60600:60600::/:/usr/sbin/nologin\n")
+	n.write("etc/group", n.read("etc/group")+"other:x:60600:\n")
+	if _, err := migrate.Run(context.Background(), n.host()); err != nil {
+		t.Fatal(err)
+	}
+	if p := n.read("etc/passwd"); !strings.Contains(p, "\nhomeward:x:979:979:") || !strings.Contains(p, "\nother:x:60600:60600:") {
+		t.Errorf("the users are\n%s", p)
+	}
+	if got := n.tree()["var/lib/homeward/manager.db"]; got != "the household (979:979)" {
+		t.Errorf("the manager's database is %q", got)
+	}
+}
+
+// The same, with the real files' owners: as root (CI's container), the files the old id owns are the fixed id's, a
+// link's own owner and not what it points at, and nothing else is touched.
+func TestTheFilesOfTheOldIDAreReallyReowned(t *testing.T) {
+	testenv.Isolate(t)
+	if os.Geteuid() != 0 {
+		t.Skip("as root only: it chowns files")
+	}
+	n := mainNode(t, false)
+	for ino, o := range n.owners {
+		err := filepath.WalkDir(n.root, func(p string, _ fs.DirEntry, err error) error {
+			if err == nil && n.ino(p) == ino {
+				err = os.Lchown(p, o[0], o[1])
+			}
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := migrate.Run(context.Background(), migrate.Host{Root: n.root, Run: n.run}); err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[string][2]uint32{
+		"var/lib/homeward":                  {60600, 60600},
+		"var/lib/homeward/manager.db":       {60600, 60600},
+		"var/lib/homeward/keys/session.key": {60600, 60600},
+		"var/lib/homeward/shared":           {60600, 0},
+		"var/lib/homeward/db-link":          {60600, 60600},
+		"var/lib/maria-app/data":            {979, 979},
+	} {
+		fi, err := os.Lstat(n.at(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := fi.Sys().(*syscall.Stat_t); [2]uint32{st.Uid, st.Gid} != want {
+			t.Errorf("/%s is %d:%d, want %v", p, st.Uid, st.Gid, want)
+		}
+	}
+}
+
+// userdel keeps the old user's group when someone else is in it: the run removes it too, its files the fixed id's.
+func TestAnOldGroupUserdelKeepsGoesToo(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, true)
+	n.write("etc/group", strings.Replace(n.read("etc/group"), "homerslab:x:979:\n", "homerslab:x:979:maria\n", 1))
+	if _, err := migrate.Run(context.Background(), n.host()); err != nil {
+		t.Fatal(err)
+	}
+	if g := n.read("etc/group"); strings.Contains(g, "homerslab") || strings.Contains(g, ":979:") {
+		t.Errorf("the groups are\n%s", g)
+	}
+	if !slices.Contains(n.ran, "groupdel homerslab") {
+		t.Errorf("ran %q", n.ran)
+	}
+}
+
+// A file the run can't give the fixed id (it vanished, or chown fails) stops the run before the old id goes: no file
+// is left to an id nobody holds.
+func TestAFileThatCantBeReownedKeepsTheOldID(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, true)
+	h := migrate.WithOwners(n.host(), n.owner, func(p string, uid, gid int) error {
+		if strings.HasSuffix(p, "manager.db") {
+			return &fs.PathError{Op: "chown", Path: p, Err: fs.ErrNotExist}
+		}
+		return n.chown(p, uid, gid)
+	})
+	if _, err := migrate.Run(context.Background(), h); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("got %v, want the chown's error", err)
+	}
+	if !strings.Contains(n.read("etc/passwd"), "\nhomerslab:x:979:") || slices.Contains(n.ran, "userdel homerslab") {
+		t.Errorf("the old user went with a file still its own: ran %q", n.ran)
+	}
+}
+
+// Both ids not the fixed one: main's user at 979, the fixed id someone else's, and sysusers made the new user first at
+// another id. The old user goes, its files the new user's own id's, and a later run stops nothing.
+func TestANewUserAtAnotherIDTakesTheOldOnesFiles(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, false)
+	n.write("etc/passwd", n.read("etc/passwd")+"other:x:60600:60600::/:/usr/sbin/nologin\n"+
+		"homeward:x:978:978:Homeward manager:/var/lib/homeward:/usr/sbin/nologin\n")
+	n.write("etc/group", n.read("etc/group")+"other:x:60600:\nhomeward:x:978:\n")
+	if _, err := migrate.Run(context.Background(), n.host()); err != nil {
+		t.Fatal(err)
+	}
+	if p, g := n.read("etc/passwd"), n.read("etc/group"); strings.Contains(p, "homerslab") || strings.Contains(g, "homerslab") {
+		t.Errorf("the old user is left:\n%s\n%s", p, g)
+	}
+	tree := n.tree()
+	for p, want := range map[string]string{
+		"var/lib/homeward/manager.db": "the household (978:978)",
+		"var/lib/homeward/shared":     "the manager's, root's group (978:0)",
+		"var/lib/maria-app/data":      "someone else's, of the same id (979:979)",
+	} {
+		if tree[p] != want {
+			t.Errorf("/%s = %q, want %q", p, tree[p], want)
+		}
+	}
+	if err := os.Remove(n.at("var/lib/homeward-agent/" + migrate.Mark)); err != nil {
+		t.Fatal(err)
+	}
+	n.reboot()
+	n.units["homerslab-other.service"] = [2]string{"loaded", "active"}
+	if r, err := migrate.Run(context.Background(), n.host()); err != nil || r.Did() || n.units["homerslab-other.service"][1] != "active" {
+		t.Errorf("a later run did %+v, %v", r, err)
+	}
+}
+
+// A folder of another mount under the package's folders (a share bound or mounted there) is never walked: its files
+// keep their owners, even of the old id.
+func TestTheWalkNeverEntersAnotherMount(t *testing.T) {
+	testenv.Isolate(t)
+	n := mainNode(t, true)
+	n.write("var/lib/homerslab/bound/theirs", "a share's")
+	n.own("var/lib/homerslab/bound/theirs", 979, 979)
+	share := n.at("var/lib/homerslab/bound")
+	ino := n.ino(share)
+	h := migrate.WithMounts(n.host(), func(p string) (uint64, error) {
+		if fi, err := os.Lstat(p); err == nil && fi.Sys().(*syscall.Stat_t).Ino == ino {
+			return 2, nil
+		}
+		return 1, nil
+	})
+	if _, err := migrate.Run(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.tree()["var/lib/homeward/bound/theirs"]; got != "a share's (979:979)" {
+		t.Errorf("a file on another mount is %q", got)
+	}
+	if got := n.tree()["var/lib/homeward/manager.db"]; got != "the household (60600:60600)" {
+		t.Errorf("the manager's database is %q", got)
+	}
+}
+
+// The real mount id tells /proc, always a mount of its own, from /, and a folder from its parent on the same mount.
+func TestTheMountIDTellsMountsApart(t *testing.T) {
+	testenv.Isolate(t)
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]uint64{}
+	for _, p := range []string{"/", "/proc", dir, filepath.Join(dir, "sub")} {
+		id, err := migrate.MountID(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[p] = id
+	}
+	if ids["/"] == ids["/proc"] || ids[dir] != ids[filepath.Join(dir, "sub")] {
+		t.Errorf("mount ids %v", ids)
 	}
 }

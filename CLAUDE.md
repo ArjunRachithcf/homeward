@@ -41,8 +41,9 @@ parking, and asking the maintainer.
 
 ## The security core
 
-These areas are the **security core**. A PR touching them is labelled `security-core` and is merged by the
-maintainer, never by an agent:
+These areas are the **security core**. A PR touching them is labelled `security-core` and stacks on `integration`,
+which reaches `main` as one squash that the loop merges once its multi-axis review passes, on the maintainer's explicit
+word, as every merge (`docs/loop.md`, Branches). The areas:
 - identity provider adapters, sign-in and step-up;
 - secrets;
 - firewall rules;

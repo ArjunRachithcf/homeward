@@ -1,16 +1,17 @@
 # The loop
 
-The loop works Homeward's GitHub issues from the map of tickets to merged PRs, and never waits on the maintainer.
-It asks him only for decisions and for one review of the security core: security-core work stacks on the
-**integration branch**, which reaches `main` as a single squash that he merges. Each **iteration** runs these steps in order. An iteration is done
-when its ticket is merged, waiting for the maintainer, or parked, and the tracker says which.
+The loop works Homeward's GitHub issues from the map of tickets to merged PRs, and never idles while it waits for the
+maintainer. It asks him only for decisions and for his word on merges: security-core work stacks on the **integration
+branch**, which reaches `main` as a single squash once its multi-axis review passes (see Branches). Each **iteration**
+runs these steps in order. An iteration is done when its ticket is merged, waiting for the maintainer, or parked, and
+the tracker says which.
 
 ## Labels
 
 | Label | Meaning |
 |---|---|
 | `in-progress` | Claimed by an iteration |
-| `security-core` | Waiting for the maintainer to merge (see `CLAUDE.md`) |
+| `security-core` | Touches the security core (see `CLAUDE.md`): stacks on `integration` |
 | `needs-decision` | The loop asked the maintainer something |
 | `parked` | Failed three times (or twice without a clear fix), written up |
 | `bug` | Found while working; worked before slices |
@@ -31,7 +32,10 @@ when its ticket is merged, waiting for the maintainer, or parked, and the tracke
 - **When `integration` is ready** (every PR stacked for it is merged into it), the loop reviews the standing PR along
   several axes at once: security, correctness, the spec and ADRs, tests and isolation, the design system and
   accessibility, and supply chain and CI. It runs up to three rounds, incrementally (see step 9). When a round passes,
-  the loop squash-merges it into `main` (the maintainer, 2026-11-11). Three failed rounds park it for the maintainer.
+  the loop squash-merges it into `main` (the maintainer, 2026-11-11), on his word as every merge. Three failed rounds
+  park it for the maintainer.
+- **Every merge waits for the maintainer's word.** In practice the loop merges, into `integration` or `main`, only once
+  the maintainer has said so for that merge; a passed review makes a PR ready to merge, and the loop then asks.
 - **At most two agents run at once**, counting implementers and reviewers together, so the work stays inside the
   usage limit (the maintainer, 2026-11-11). Reviews that unblock `integration` come first, then the critical path.
   Agents keep their reports short (about 300 words), and the orchestrator keeps its own turns brief.
@@ -41,7 +45,7 @@ when its ticket is merged, waiting for the maintainer, or parked, and the tracke
 1. **Sync.**
    - Update `main`.
    - Merge `main` into `integration` whenever `main` has moved.
-   - If the maintainer has squash-merged the integration PR, recreate `integration` from `main` and open a fresh
+   - Once the integration PR is squash-merged, recreate `integration` from `main` and open a fresh
      standing PR when there is new work for it.
 2. **Find the frontier.** Open issues labelled `slice` or `bug` with:
    - every blocking issue closed;
@@ -70,7 +74,7 @@ when its ticket is merged, waiting for the maintainer, or parked, and the tracke
      - they review only what changed since the last round;
      - a new problem in code the round didn't change is filed as a follow-up issue, not a blocker, unless it is a
        high-severity security problem.
-10. **Merge.**
+10. **Merge**, on the maintainer's word (see Branches).
     1. Squash-merge into the PR's base and delete the branch.
     2. Remove `in-progress`.
     3. For `integration`: close the ticket by hand, with a comment naming the PR, since `Closes` fires only on `main`.
@@ -95,6 +99,15 @@ Once a day, update one issue labelled `digest`, titled `Digest <date>`. It lists
 - **next**: the frontier.
 
 The digest is the maintainer's one place to look.
+
+## The red-team gate
+
+Once the first working setup is built, and again after each wave of apps and before 1.0, several agents attack a
+throwaway test install of it (a VM or compose project of its own, never a live household or anything outside). Each
+attacks as one threat: a stranger on the LAN, a stranger on the internet through the public path, a family member, a
+kid, a malicious app container, a malicious catalog, a stolen session or assistant token, the supply chain. Each
+finding is verified, fixed in a PR and attacked again. Rounds repeat until a whole round finds nothing new; only then
+is that setup done.
 
 ## Standing work
 
