@@ -33,6 +33,11 @@
 // An interface name is rendered only when it is a plain name an interface can have: a wildcard or a quote from an
 // engine never reaches nft. The one wildcard is the table's own: the bridges the agent names for apps (hla*).
 //
+// A table takes effect on the flows already running too, not only on new ones (#285): a flow is let through on its
+// state only once this table admitted it, so after Apply a flow an earlier table admitted is asked again at its next
+// packet, by the rules, in the direction that opened it, and cut there if this table refuses it; the flows it still
+// admits (the mesh session that runs Apply) never notice. Replies and related packets pass as before.
+//
 // A drop in any base chain is final in nftables, whatever other tables (firewalld, Docker's) accept, so this table
 // holds whatever else the machine runs. It changes no other table.
 package firewall
@@ -43,6 +48,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -109,6 +115,24 @@ type State struct {
 	// LDAPS port (ADR 0020, #204).
 	LDAP []LDAPApp `json:"ldap,omitempty"`
 }
+
+// The set of the flows a table admitted (#285): as many as nft's default for a dynamic set, each forgotten once it has
+// been idle that long (then asked again at its next packet, and added again).
+const (
+	admittedSize = 65535
+	admittedFor  = "30s"
+)
+
+// admitted opens each base chain's rules, and to_apps': a packet of a flow's other direction (a reply), and one related
+// to a flow (an ICMP error), pass as they always did; a connection a conntrack helper expected (FTP's data, say) is
+// admitted with its first packet, so the rest of it runs on. A reply can't be asked again: the rules read the direction
+// that opened a flow, and a reply to this machine's own connections (to the internet, say) matches none of them.
+const admitted = "\t\tct state related ct status expected goto admit\n" +
+	"\t\tct state related accept\n" +
+	"\t\tct state established ct direction reply accept\n"
+
+// lookup lets a flow this table admitted run on, and keeps it remembered while it runs.
+const lookup = "\t\tct state established ct id @admitted update @admitted { ct id } accept\n"
 
 // LDAPSPort is the sign-in listener's LDAPS port.
 const LDAPSPort = 636
@@ -186,14 +210,31 @@ func Render(s State) string {
 	})
 	b.WriteString(header)
 
+	// The flows this table admitted (#285): a flow is let through without asking again only once this table admitted it,
+	// so one an earlier table admitted is asked again at its next packet, in the direction that opened it, and cut there
+	// if this table refuses it. Every accept below the lookup goes to admit, which adds the flow. An element is a hint:
+	// one that is missing (expired, the set full, a new table) costs that packet the rules, never the flow.
+	w("\tset admitted {")
+	w("\t\ttypeof ct id")
+	w("\t\tsize %d", admittedSize)
+	w("\t\tflags dynamic,timeout")
+	w("\t\ttimeout %s", admittedFor)
+	w("\t}")
+	w("\tchain admit {")
+	// When the set is full the update fails, and the packet goes on to the accept below it: never dropped for that.
+	w("\t\tupdate @admitted { ct id }")
+	w("\t\taccept")
+	w("\t}")
+
 	w("\tchain input {")
 	w("\t\ttype filter hook input priority filter - 5; policy drop;")
-	w("\t\tct state established,related accept")
+	b.WriteString(admitted)
 	w("\t\tct state invalid drop")
 	w("\t\tiif \"lo\" accept")
 	if len(mesh) > 0 {
 		w("\t\tiifname %s accept", set(quoted(mesh)))
 	}
+	b.WriteString(lookup)
 	if len(apps) > 0 {
 		// An engine's bridge is a bridge to the kernel too (#148): a tunnel an engine names is no app network. And one
 		// of guests' ports only (#169).
@@ -213,19 +254,20 @@ func Render(s State) string {
 		// LAN may itself be a bridge (a VM host's br0), and no bridge is taken for a local virtual network.
 		w("\t\tiifname %s meta iifkind \"bridge\" jump virtual_in", set(quoted(virtual)))
 	}
-	w("\t\tmeta l4proto { icmp, ipv6-icmp } accept")
-	w("\t\tudp dport { 68, 546, 5353 } accept")
+	w("\t\tmeta l4proto { icmp, ipv6-icmp } goto admit")
+	w("\t\tudp dport { 68, 546, 5353 } goto admit")
 	for _, p := range uniq(s.WireGuard) {
-		w("\t\tudp dport %d accept", p)
+		w("\t\tudp dport %d goto admit", p)
 	}
 	if s.SetupPort > 0 && len(lan) > 0 {
-		w("\t\tiifname %s tcp dport %d accept", set(quoted(lan)), s.SetupPort)
+		w("\t\tiifname %s tcp dport %d goto admit", set(quoted(lan)), s.SetupPort)
 	}
 	w("\t}")
 
 	w("\tchain forward {")
 	w("\t\ttype filter hook forward priority filter - 5; policy drop;")
-	w("\t\tct state established,related accept")
+	b.WriteString(admitted)
+	b.WriteString(lookup)
 	if len(mesh) > 0 {
 		w("\t\tiifname %s drop", set(quoted(mesh)))
 	}
@@ -276,27 +318,27 @@ func Render(s State) string {
 	// Apps to this machine: only the DNS an engine serves on a bridge's gateway (an address of that bridge itself, never
 	// the mesh's, the LAN's or another bridge's), and IPv6's neighbour discovery.
 	w("\tchain apps_in {")
-	w("\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local accept")
+	w("\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local goto admit")
 	if l := listenerAddrs(s.SignInListener); len(l) > 0 {
-		w("\t\tip daddr . tcp dport %s accept", set(l))
+		w("\t\tip daddr . tcp dport %s goto admit", set(l))
 		var ldaps []netip.AddrPort
 		for _, a := range s.SignInListener {
 			ldaps = append(ldaps, netip.AddrPortFrom(a.Addr(), LDAPSPort))
 		}
 		for _, app := range s.LDAP {
 			if ValidName(app.Bridge) && app.Subnet.Addr().Is4() {
-				w("\t\tiifname %q ip saddr %s ip daddr . tcp dport %s accept", app.Bridge, app.Subnet.Masked(), set(listenerAddrs(ldaps)))
+				w("\t\tiifname %q ip saddr %s ip daddr . tcp dport %s goto admit", app.Bridge, app.Subnet.Masked(), set(listenerAddrs(ldaps)))
 			}
 		}
 	}
-	w("\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept")
+	w("\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } goto admit")
 	w("\t\tdrop")
 	w("\t}")
 	// Local virtual networks to this machine: their DHCP and their DNS (dnsmasq, on the network's own gateway; never
 	// the mesh's resolver or another address of the machine), then the machine's basics.
 	w("\tchain virtual_in {")
-	w("\t\tudp dport { 67, 547 } accept")
-	w("\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local accept")
+	w("\t\tudp dport { 67, 547 } goto admit")
+	w("\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local goto admit")
 	// Belt and braces: the input chain's policy drops these too, but port 53 is decided here, whatever is added below.
 	w("\t\tmeta l4proto { tcp, udp } th dport 53 drop")
 	w("\t}")
@@ -304,7 +346,7 @@ func Render(s State) string {
 	// bridge copies: on purpose; never one at a mesh peer), the internet.
 	w("\tchain apps_out {")
 	for _, br := range apps {
-		w("\t\tiifname %q oifname %q accept", br, br)
+		w("\t\tiifname %q oifname %q goto admit", br, br)
 	}
 	var r4, r6 []string
 	for _, r := range s.Resolvers {
@@ -319,10 +361,10 @@ func Render(s State) string {
 	// A resolver is reached through the LAN, where DHCP or a router's advertisement found it even with no default route
 	// of its family (#169's review), or through an uplink of its family; never through a tunnel that isn't one.
 	if to4 := uniqStrings(slices.Concat(lan, out4)); len(r4) > 0 && len(to4) > 0 {
-		w("\t\toifname %s ip daddr %s meta l4proto { tcp, udp } th dport 53 accept", set(quoted(to4)), set(uniqStrings(r4)))
+		w("\t\toifname %s ip daddr %s meta l4proto { tcp, udp } th dport 53 goto admit", set(quoted(to4)), set(uniqStrings(r4)))
 	}
 	if to6 := uniqStrings(slices.Concat(lan, out6)); len(r6) > 0 && len(to6) > 0 {
-		w("\t\toifname %s ip6 daddr %s meta l4proto { tcp, udp } th dport 53 accept", set(quoted(to6)), set(uniqStrings(r6)))
+		w("\t\toifname %s ip6 daddr %s meta l4proto { tcp, udp } th dport 53 goto admit", set(quoted(to6)), set(uniqStrings(r6)))
 	}
 	w("\t\tjump outbound")
 	w("\t}")
@@ -330,12 +372,30 @@ func Render(s State) string {
 	// local process can't reach an app around the edge and hand it a forged identity header. By the apps' bridges,
 	// and by the upstreams' addresses on whatever interface leads to them. Replies, and ping, pass.
 	w("\tchain to_apps {")
-	w("\t\tct state established,related accept")
-	w("\t\tmeta l4proto { icmp, ipv6-icmp } accept")
+	b.WriteString(admitted)
+	b.WriteString(lookup)
+	// A flow's end passes, whoever asks: a kernel's RST, and the FIN an orphaned socket sends after close(), carry no
+	// user skuid could match, and dropping them would leave the app waiting on a flow that is gone (#286's review). They
+	// only end a flow: a RST (whose payload the receiver discards), or a FIN that carries no byte (fin_alone), never one
+	// that carries a request held back for it (TCP_CORK).
+	w("\t\tct state established tcp flags & (fin | syn | rst) == rst accept")
+	w("\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone")
+	w("\t\tmeta l4proto { icmp, ipv6-icmp } goto admit")
 	if allowed := upstreamUsers(s.Upstreams); len(allowed) > 0 {
-		w("\t\tip daddr . tcp dport . meta skuid %s accept", set(allowed))
+		w("\t\tip daddr . tcp dport . meta skuid %s goto admit", set(allowed))
 	}
 	w("\t\tdrop")
+	w("\t}")
+	// A FIN with no payload: its IP length is its headers' alone, IPv4's without options and IPv6's without extension
+	// headers, for each length of TCP header (nft can't subtract one field from another, and a set of nft 1.0's can't
+	// hold these concatenations). Anything else returns to to_apps, and its drop.
+	w("\tchain fin_alone {")
+	for doff := 5; doff <= 15; doff++ {
+		w("\t\tip hdrlength 5 tcp doff %d ip length %d accept", doff, 20+4*doff)
+	}
+	for doff := 5; doff <= 15; doff++ {
+		w("\t\tip6 nexthdr tcp tcp doff %d ip6 length %d accept", doff, 4*doff)
+	}
 	w("\t}")
 	// To the internet only: out through an uplink of the packet's family (the LAN's, a VPN's), to an address that is
 	// neither private nor the LAN's. A family with no uplink has no way out.
@@ -365,7 +425,7 @@ func Render(s State) string {
 	}
 	w("\t\tip daddr %s drop", set(uniqStrings(v4)))
 	w("\t\tip6 daddr %s drop", set(uniqStrings(v6)))
-	w("\t\taccept")
+	w("\t\tgoto admit")
 	w("\t}")
 	w("}")
 	return b.String()
@@ -618,7 +678,8 @@ func (f *Firewall) Note(what string) {
 
 var errMissing = errors.New("the table is missing")
 
-// list is the table as nft lists it, without counters or other state.
+// list is the table as nft lists it, without counters or other state: nor the flows it admitted (the set admitted's
+// elements, and its count of them), which change with every flow and are no drift. Any other set is listed whole.
 func (f *Firewall) list(ctx context.Context) (string, error) {
 	out, err := f.Run(ctx, host.Cmd{Name: "nft", Args: []string{"-s", "list", "table", "inet", "homerslab"}})
 	if err != nil {
@@ -628,8 +689,30 @@ func (f *Firewall) list(ctx context.Context) (string, error) {
 		}
 		return "", err
 	}
-	return string(out), nil
+	return withoutAdmitted(string(out)), nil
 }
+
+// withoutAdmitted is a listing with the set admitted's elements, and nft's count of them, left out: its block alone.
+func withoutAdmitted(listing string) string {
+	start := strings.Index(listing, "\n\tset admitted {\n")
+	if start < 0 {
+		return listing
+	}
+	start++
+	length := strings.Index(listing[start:], "\n\t}\n")
+	if length < 0 {
+		return listing
+	}
+	block := listing[start : start+length]
+	if i := strings.Index(block, "\n\t\telements = "); i >= 0 {
+		block = block[:i] // the elements are the block's last lines
+	}
+	block = count.ReplaceAllString(block, "")
+	return listing[:start] + block + listing[start+length:]
+}
+
+// count is the count of elements nft lists after a set's size.
+var count = regexp.MustCompile(`(?m)\s*# count \d+$`)
 
 // Check compares the table with what was applied, and puts it back if it drifted. It returns the drift it found, if
 // any.

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -22,11 +23,12 @@ func TestTheTableIsReplacedInOneTransactionAndChangesNoOtherTable(t *testing.T) 
 		t.Errorf("the script doesn't replace the table atomically:\n%s", r)
 	}
 	for _, l := range lines {
-		if f := strings.Fields(l); len(f) >= 2 && (f[0] == "table" || f[0] == "delete" || f[0] == "flush" || f[0] == "add") && !strings.Contains(l, "inet homerslab") {
+		// A rule's update of the table's own set names no table.
+		if f := strings.Fields(l); len(f) >= 2 && !strings.HasPrefix(f[1], "@") && (f[0] == "table" || f[0] == "delete" || f[0] == "flush" || f[0] == "add") && !strings.Contains(l, "inet homerslab") {
 			t.Errorf("the script touches another table: %q", l)
 		}
 	}
-	if strings.Count(r, "udp dport 51820 accept") != 1 {
+	if strings.Count(r, "udp dport 51820 goto admit") != 1 {
 		t.Errorf("the WireGuard port isn't open exactly once:\n%s", r)
 	}
 	if strings.Count(r, "policy drop;") != 2 {
@@ -40,7 +42,7 @@ func TestOnlyAnOpenSetupListenerIsLetIn(t *testing.T) {
 	open := firewall.Render(firewall.State{Mesh: []string{"wt0"}, SetupPort: 7020, LAN: lan})
 	closed := firewall.Render(firewall.State{Mesh: []string{"wt0"}, LAN: lan})
 	noLAN := firewall.Render(firewall.State{Mesh: []string{"wt0"}, SetupPort: 7020})
-	if !strings.Contains(open, `iifname { "enp5s0" } tcp dport 7020 accept`) {
+	if !strings.Contains(open, `iifname { "enp5s0" } tcp dport 7020 goto admit`) {
 		t.Errorf("the open setup listener isn't let in:\n%s", open)
 	}
 	if strings.Contains(closed, "tcp dport") {
@@ -159,17 +161,17 @@ func TestPort53IsTheGatewaysOwnAndTheResolversOnlyThroughTheLAN(t *testing.T) {
 		body, _, _ := strings.Cut(after, "\t}\n")
 		return body
 	}
-	local := "meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local accept"
+	local := "meta l4proto { tcp, udp } th dport 53 fib daddr . iif type local goto admit"
 	if got := chain("apps_in"); !strings.HasPrefix(got, "\t\t"+local+"\n") || strings.Count(got, "dport 53") != 1 {
 		t.Errorf("apps_in lets port 53 in beyond the bridge's own address:\n%s", got)
 	}
-	if got := chain("virtual_in"); got != "\t\tudp dport { 67, 547 } accept\n\t\t"+local+"\n\t\tmeta l4proto { tcp, udp } th dport 53 drop\n" {
+	if got := chain("virtual_in"); got != "\t\tudp dport { 67, 547 } goto admit\n\t\t"+local+"\n\t\tmeta l4proto { tcp, udp } th dport 53 drop\n" {
 		t.Errorf("virtual_in, want its own gateway's DNS and then port 53 dropped:\n%s", got)
 	}
 	out := chain("apps_out")
 	for _, want := range []string{
-		`oifname { "enp5s0" } ip daddr { 192.168.1.1 } meta l4proto { tcp, udp } th dport 53 accept`,
-		`oifname { "enp5s0" } ip6 daddr { 2001:db8:1::1 } meta l4proto { tcp, udp } th dport 53 accept`,
+		`oifname { "enp5s0" } ip daddr { 192.168.1.1 } meta l4proto { tcp, udp } th dport 53 goto admit`,
+		`oifname { "enp5s0" } ip6 daddr { 2001:db8:1::1 } meta l4proto { tcp, udp } th dport 53 goto admit`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("apps_out lacks %q:\n%s", want, out)
@@ -202,8 +204,8 @@ func TestAppsLeaveThroughAVPNsTunnelThatIsNotTheLAN(t *testing.T) {
 	for name, want := range map[string]string{
 		"outbound": `meta nfproto ipv4 oifname != { "eth0", "wg0" } drop`,
 		"forward":  `iifname { "eth0", "wg0" } drop`,
-		"apps_out": `oifname { "eth0", "wg0" } ip daddr { 10.2.0.1 } meta l4proto { tcp, udp } th dport 53 accept`,
-		"input":    `iifname { "eth0" } tcp dport 7020 accept`,
+		"apps_out": `oifname { "eth0", "wg0" } ip daddr { 10.2.0.1 } meta l4proto { tcp, udp } th dport 53 goto admit`,
+		"input":    `iifname { "eth0" } tcp dport 7020 goto admit`,
 	} {
 		if !strings.Contains(chain(name), want) {
 			t.Errorf("%s lacks %q:\n%s", name, want, chain(name))
@@ -326,8 +328,8 @@ func TestEachFamilyLeavesOnlyThroughItsOwnUplinks(t *testing.T) {
 		t.Errorf("outbound, want each family through its own uplinks:\n%s", got)
 	}
 	for _, want := range []string{
-		`oifname { "eth0", "v4only" } ip daddr { 192.0.2.53 } meta l4proto { tcp, udp } th dport 53 accept`,
-		`oifname { "eth0", "v6only" } ip6 daddr { 2001:db8:53::53 } meta l4proto { tcp, udp } th dport 53 accept`,
+		`oifname { "eth0", "v4only" } ip daddr { 192.0.2.53 } meta l4proto { tcp, udp } th dport 53 goto admit`,
+		`oifname { "eth0", "v6only" } ip6 daddr { 2001:db8:53::53 } meta l4proto { tcp, udp } th dport 53 goto admit`,
 	} {
 		if !strings.Contains(chain(r, "apps_out"), want) {
 			t.Errorf("apps_out lacks %q:\n%s", want, chain(r, "apps_out"))
@@ -346,12 +348,12 @@ func TestEachFamilyLeavesOnlyThroughItsOwnUplinks(t *testing.T) {
 		"\t\tmeta nfproto ipv6 drop\n") {
 		t.Errorf("with no IPv6 uplink, want no way out over IPv6:\n%s", got)
 	}
-	if got := chain(r, "apps_out"); !strings.Contains(got, `oifname { "eth0" } ip6 daddr { 2001:db8:53::53 } meta l4proto { tcp, udp } th dport 53 accept`) {
+	if got := chain(r, "apps_out"); !strings.Contains(got, `oifname { "eth0" } ip6 daddr { 2001:db8:53::53 } meta l4proto { tcp, udp } th dport 53 goto admit`) {
 		t.Errorf("with no IPv6 uplink, want the IPv6 resolver on the LAN only:\n%s", got)
 	}
 	v6only := s
 	v6only.Uplinks4 = nil
-	if got := chain(firewall.Render(v6only), "apps_out"); !strings.Contains(got, `oifname { "eth0" } ip daddr { 192.0.2.53 } meta l4proto { tcp, udp } th dport 53 accept`) {
+	if got := chain(firewall.Render(v6only), "apps_out"); !strings.Contains(got, `oifname { "eth0" } ip daddr { 192.0.2.53 } meta l4proto { tcp, udp } th dport 53 goto admit`) {
 		t.Errorf("with no IPv4 uplink, want the IPv4 resolver on the LAN only:\n%s", got)
 	}
 	none := s
@@ -378,9 +380,9 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 		"\tchain output {\n\t\ttype filter hook output priority filter - 5; policy accept;\n\t\toifname \"hla*\" jump to_apps\n",
 		`oifname { "br-app", "br-signin" } jump to_apps`,
 		"ip daddr . meta l4proto . th dport { 172.31.240.2 . tcp . 8080, 172.31.250.10 . tcp . 9000 } jump to_apps",
-		"\tchain to_apps {\n\t\tct state established,related accept\n\t\tmeta l4proto { icmp, ipv6-icmp } accept\n" +
+		"\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n" +
 			"\t\tip daddr . tcp dport . meta skuid { 172.31.240.2 . 8080 . 0, 172.31.240.2 . 8080 . 981, " +
-			"172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981 } accept\n\t\tdrop\n\t}\n",
+			"172.31.250.10 . 9000 . 0, 172.31.250.10 . 9000 . 980, 172.31.250.10 . 9000 . 981 } goto admit\n\t\tdrop\n\t}\n",
 	} {
 		if !strings.Contains(r, want) {
 			t.Errorf("the table lacks %q:\n%s", want, r)
@@ -389,7 +391,7 @@ func TestOnlyTheUpstreamsUsersOpenConnectionsIntoAppNetworks(t *testing.T) {
 	// No upstream: nothing of this machine opens a connection into an app's network at all; and an app's bridge the
 	// engines haven't listed yet is kept to the edge by its name.
 	none := firewall.Render(firewall.State{Mesh: []string{"wt0"}, LAN: []string{"enp5s0"}, Bridges: []string{"br-app"}, Virtual: []string{"br-app"}})
-	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state established,related accept\n\t\tmeta l4proto { icmp, ipv6-icmp } accept\n\t\tdrop\n\t}\n") {
+	if !strings.Contains(none, "\t\toifname \"hla*\" jump to_apps\n") || !strings.Contains(none, "\tchain to_apps {\n\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n\t\tct state established ct id @admitted update @admitted { ct id } accept\n\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n\t\tdrop\n\t}\n") {
 		t.Errorf("without an upstream:\n%s", none)
 	}
 	// An upstream that isn't IPv4 with a port: never rendered. One with no user is closed to every process of this
@@ -413,8 +415,8 @@ func TestAppsReachTheSignInListenerAndNothingElseOfTheMachine(t *testing.T) {
 		SignInListener: []netip.AddrPort{netip.MustParseAddrPort("172.31.255.241:443"), netip.MustParseAddrPort("[fd00::1]:443"),
 			netip.MustParseAddrPort("172.31.255.241:0")}}
 	r := firewall.Render(s)
-	want := "\tchain apps_in {\n\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local accept\n" +
-		"\t\tip daddr . tcp dport { 172.31.255.241 . 443 } accept\n"
+	want := "\tchain apps_in {\n\t\tmeta l4proto { tcp, udp } th dport 53 fib daddr . iif type local goto admit\n" +
+		"\t\tip daddr . tcp dport { 172.31.255.241 . 443 } goto admit\n"
 	if !strings.Contains(r, want) || strings.Contains(r, "fd00::1") {
 		t.Errorf("the table lacks the sign-in listener, or has more:\n%s", r)
 	}
@@ -454,8 +456,8 @@ func TestOnlyLDAPAppsReachTheListenersLDAPSPort(t *testing.T) {
 		LDAP: []firewall.LDAPApp{{Bridge: "hla1u", Subnet: netip.MustParsePrefix("172.31.240.16/28")},
 			{Bridge: "bad\"name", Subnet: netip.MustParsePrefix("172.31.240.32/28")}, {Bridge: "hla2u", Subnet: netip.MustParsePrefix("fd00::/64")}}}
 	r := firewall.Render(s)
-	want := "\t\tip daddr . tcp dport { 172.31.255.241 . 443 } accept\n" +
-		"\t\tiifname \"hla1u\" ip saddr 172.31.240.16/28 ip daddr . tcp dport { 172.31.255.241 . 636 } accept\n" +
+	want := "\t\tip daddr . tcp dport { 172.31.255.241 . 443 } goto admit\n" +
+		"\t\tiifname \"hla1u\" ip saddr 172.31.240.16/28 ip daddr . tcp dport { 172.31.255.241 . 636 } goto admit\n" +
 		"\t\ticmpv6"
 	if !strings.Contains(r, want) || strings.Count(r, ". 636") != 1 {
 		t.Errorf("the table lacks the LDAP app's rule, or has more:\n%s", r)
@@ -469,5 +471,75 @@ func TestOnlyLDAPAppsReachTheListenersLDAPSPort(t *testing.T) {
 	if r := firewall.Render(firewall.State{Mesh: s.Mesh, LAN: s.LAN, Bridges: s.Bridges, Virtual: s.Virtual,
 		SignInListener: []netip.AddrPort{netip.MustParseAddrPort("172.31.255.241:443")}}); strings.Contains(r, "636") {
 		t.Errorf("without an LDAP app:\n%s", r)
+	}
+}
+
+// A flow an earlier table admitted runs on only if this one admits it too (#285): no rule lets an established flow
+// through on its state alone, but a reply (the other direction) or a related packet; the rest is let through only once
+// this table admitted it (the set admitted, which every table starts empty), or asked again by the rules.
+func TestNoFlowRunsOnByItsStateAlone(t *testing.T) {
+	testenv.Isolate(t)
+	s := firewall.State{Mesh: []string{"wt0"}, WireGuard: []int{51820}, SetupPort: 7020, LAN: []string{"eth0"},
+		LANPrefixes: []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, Uplinks4: []string{"eth0"}, Uplinks6: []string{"eth0"},
+		Bridges: []string{"hla0u", "docker0", "br-nic"}, Virtual: []string{"hla0u", "docker0", "virbr0"},
+		Resolvers:      []netip.Addr{netip.MustParseAddr("192.168.1.1")},
+		Upstreams:      []firewall.Upstream{{Addr: netip.MustParseAddrPort("172.31.240.2:8080"), UIDs: []uint32{981}}},
+		SignInListener: []netip.AddrPort{netip.MustParseAddrPort("172.31.255.241:443")},
+		LDAP:           []firewall.LDAPApp{{Bridge: "hla0u", Subnet: netip.MustParsePrefix("172.31.240.0/28")}}}
+	r := firewall.Render(s)
+	for _, l := range strings.Split(r, "\n") {
+		if strings.Contains(l, "established") && l != "\t\tct state established ct direction reply accept" &&
+			l != "\t\tct state established ct id @admitted update @admitted { ct id } accept" &&
+			l != "\t\tct state established tcp flags & (fin | syn | rst) == rst accept" &&
+			l != "\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone" {
+			t.Errorf("a flow runs on by its state: %q", l)
+		}
+	}
+	if strings.Count(r, "tcp flags & (fin | syn | rst)") != 2 || !strings.Contains(r, "\tchain fin_alone {\n\t\tip hdrlength 5 tcp doff 5 ip length 40 accept\n") ||
+		!strings.Contains(r, "\t\tip hdrlength 5 tcp doff 15 ip length 80 accept\n\t\tip6 nexthdr tcp tcp doff 5 ip6 length 20 accept\n") ||
+		!strings.Contains(r, "\t\tip6 nexthdr tcp tcp doff 15 ip6 length 60 accept\n\t}\n") || !strings.Contains(r, "\t\tct state established ct id @admitted update @admitted { ct id } accept\n"+
+		"\t\tct state established tcp flags & (fin | syn | rst) == rst accept\n\t\tct state established tcp flags & (fin | syn | rst) == fin jump fin_alone\n\t\tmeta l4proto { icmp, ipv6-icmp } goto admit\n") {
+		t.Errorf("a flow's end passes to_apps, and nowhere else:\n%s", r)
+	}
+	for _, name := range []string{"input", "forward", "to_apps"} {
+		_, after, _ := strings.Cut(r, "\tchain "+name+" {\n")
+		body, _, _ := strings.Cut(after, "\t}\n")
+		if !strings.HasPrefix(strings.TrimPrefix(body, "\t\ttype filter hook "+name+" priority filter - 5; policy drop;\n"),
+			"\t\tct state related ct status expected goto admit\n\t\tct state related accept\n\t\tct state established ct direction reply accept\n") ||
+			!strings.Contains(body, "\t\tct state established ct id @admitted update @admitted { ct id } accept\n") {
+			t.Errorf("%s doesn't ask again the flows an earlier table admitted:\n%s", name, body)
+		}
+	}
+	if !strings.Contains(r, "\tset admitted {\n\t\ttypeof ct id\n\t\tsize 65535\n\t\tflags dynamic,timeout\n\t\ttimeout 30s\n\t}\n") ||
+		!strings.Contains(r, "\tchain admit {\n\t\tupdate @admitted { ct id }\n\t\taccept\n\t}\n") {
+		t.Errorf("the set of admitted flows, or admit:\n%s", r)
+	}
+}
+
+// The flows a table admitted are no drift (#285): the check lists the table without the set admitted's elements, and
+// without nft's count of them; any other set's elements still count (#286's review).
+func TestTheFlowsATableAdmittedAreNoDrift(t *testing.T) {
+	testenv.Isolate(t)
+	n, other := 1, "1.2.3.4"
+	fw := &firewall.Firewall{Run: func(_ context.Context, c host.Cmd) ([]byte, error) {
+		if c.String() != "nft -s list table inet homerslab" {
+			return nil, nil
+		}
+		n++
+		return []byte("table inet homerslab {\n\tset admitted {\n\t\ttypeof ct id\n\t\tsize 65535\t# count " + strconv.Itoa(n) +
+			"\n\t\tflags dynamic,timeout\n\t\ttimeout 30s\n\t\telements = { " + strconv.Itoa(n) + " expires 29s,\n\t\t\t     " +
+			strconv.Itoa(n+1000) + " expires 3s }\n\t}\n\n\tset other {\n\t\ttype ipv4_addr\n\t\telements = { " + other +
+			" }\n\t}\n}\n"), nil
+	}}
+	ctx := context.Background()
+	if err := fw.Apply(ctx, firewall.State{Mesh: []string{"wt0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := fw.Check(ctx); d != nil || err != nil {
+		t.Errorf("the flows admitted read as drift: %+v, %v", d, err)
+	}
+	other = "5.6.7.8"
+	if d, err := fw.Check(ctx); d == nil || err != nil || d.What != "changed" {
+		t.Errorf("another set's elements changed, and the check found %+v, %v", d, err)
 	}
 }

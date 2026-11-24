@@ -125,7 +125,7 @@ func TestAnLDAPAppBindsAtTheSignInsLDAPSPortFromItsOwnNetworkAlone(t *testing.T)
 
 	// Only the LDAP app's network reaches 636, by its bridge and its subnet together.
 	table, _ := h.Table()
-	want := "\t\tiifname \"" + appunit.Bridge(1, -1) + "\" ip saddr 172.31.240.16/28 ip daddr . tcp dport { 172.31.255.241 . 636 } accept\n"
+	want := "\t\tiifname \"" + appunit.Bridge(1, -1) + "\" ip saddr 172.31.240.16/28 ip daddr . tcp dport { 172.31.255.241 . 636 } goto admit\n"
 	if !strings.Contains(table, want) || strings.Count(table, ". 636 }") != 1 {
 		t.Errorf("the table lacks %q, or opens 636 to another:\n%s", want, table)
 	}
