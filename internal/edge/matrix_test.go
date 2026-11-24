@@ -49,6 +49,8 @@ import (
 	"github.com/ArjunRachithcf/homeward/internal/ldaps"
 	"github.com/ArjunRachithcf/homeward/internal/ldaps/ldaptest"
 	"github.com/ArjunRachithcf/homeward/internal/testenv"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // project is the compose project; HOMEWARD_TEST_EDGE_PROJECT names another (hltest-<ticket>) for a ticket's local
@@ -189,7 +191,19 @@ func helper(mode, arg string) int {
 				}
 			}
 			slices.Sort(named)
+			// The body, read to its end: only then are the request's trailers known (#309). They follow, when any came.
+			_, _ = io.Copy(io.Discard, r.Body)
+			var trailers []string
+			for k, v := range r.Trailer {
+				if len(v) > 0 {
+					trailers = append(trailers, k+"="+strings.Join(v, ","))
+				}
+			}
+			slices.Sort(trailers)
 			fmt.Fprintf(w, "App, at %s, as [%s], cookies [%s]", r.Host, strings.Join(named, " "), r.Header.Get("Cookie"))
+			if len(trailers) > 0 {
+				fmt.Fprintf(w, ", trailers [%s]", strings.Join(trailers, " "))
+			}
 		}))
 	case "outpost": // the sign-in's LDAP outpost, on the sign-in network: one account binds
 		ln, err := net.Listen("tcp", outpostStub)
@@ -415,6 +429,11 @@ type request struct {
 	// Target is a plain HTTP request's target, written on the wire as it is (an absolute-form one, say): Go's client
 	// never sends some of them.
 	Target string
+	// Trailers are sent after a body, as POST: in the chunked body's trailer section over HTTP/1.1, in a trailing
+	// HEADERS frame over HTTP/2 (#309). They are declared in a Trailer header first, as Go's client does, unless
+	// Undeclared: then they are written by hand, with no Trailer header.
+	Trailers   [][2]string
+	Undeclared bool
 }
 
 // bindRequest is one LDAP bind an app's server makes: to an address, over TLS with a server name (checked against the
@@ -453,6 +472,12 @@ func (q request) do(ctx context.Context) string {
 	if q.Target != "" {
 		return q.raw(ctx)
 	}
+	if len(q.Trailers) > 0 && q.Undeclared {
+		if q.H2 {
+			return q.trailersH2(ctx)
+		}
+		return q.trailersH1(ctx)
+	}
 	roots := x509.NewCertPool()
 	roots.AppendCertsFromPEM([]byte(q.CA))
 	tr := &http.Transport{
@@ -470,6 +495,13 @@ func (q request) do(ctx context.Context) string {
 	if q.Method != "" && q.Method != "GET" {
 		req.Body, req.ContentLength = io.NopCloser(strings.NewReader("{}")), 2
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if len(q.Trailers) > 0 { // declared: Go's client names them in a Trailer header, and sends them after the body
+		req.Method, req.ContentLength, req.Trailer = "POST", -1, http.Header{}
+		for _, h := range q.Trailers {
+			req.Trailer[http.CanonicalHeaderKey(h[0])] = nil
+		}
+		req.Body = &trailing{r: strings.NewReader("{}"), trailer: req.Trailer, values: q.Trailers}
 	}
 	if q.Path != "" {
 		req.URL.Opaque = "//" + q.Host + q.Path // sent exactly as written
@@ -875,6 +907,44 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			}
 		})
 	}
+	// A client's request trailers (#309), forging the role and the sign-in time, to the app that asks for it. Caddy 2.11.9
+	// passes on the trailers a client declares in a Trailer header, over HTTP/1.1 and HTTP/2 alike, and its configuration
+	// can neither refuse nor strip them: net/http takes the Trailer header out before any matcher, and nothing in the
+	// configuration reads a request's trailers. Arjun accepted it on 2026-11-24: apps read X-HomersLab-* only from the
+	// request's headers (spec: the identity contract). These rows pin today's behaviour: trailers never declared never
+	// reach the app; declared ones reach it as trailers only, never as its headers, which stay the edge's.
+	forgedTrailers := [][2]string{{"X-HomersLab-Role", "admin"}, {"X-HomersLab-Auth-Time", "9999999999"}}
+	for _, h2 := range []bool{false, true} {
+		for _, row := range []struct {
+			name       string
+			undeclared bool
+		}{{"never declared: none reaches the app", true}, {"declared in a Trailer header: they reach it as trailers only (accepted, #309)", false}} {
+			t.Run(fmt.Sprintf("request trailers forging the role and the sign-in time, %s (HTTP/2 %v)", row.name, h2), func(t *testing.T) {
+				q := timeAs("books.example.test", "ines")
+				q.Trailers, q.Undeclared, q.H2 = forgedTrailers, row.undeclared, h2
+				got, _, _ := strings.Cut(ask("phone", q), "\n") // the app's answer, without the edge's headers
+				if !strings.HasPrefix(got, "200 App, at books.example.test, as "+inesAt+",") {
+					t.Fatalf("%q: the app's headers aren't the edge's", got)
+				}
+				gap := ", trailers [X-Homerslab-Auth-Time=9999999999 X-Homerslab-Role=admin]"
+				if row.undeclared && strings.Contains(got, "trailers [") {
+					t.Errorf("%q: trailers no Trailer header declared reached the app", got)
+				}
+				if !row.undeclared && !strings.HasSuffix(got, gap) {
+					t.Errorf("%q, want it to end %q: Caddy no longer passes declared trailers on as it did when #309 accepted it; "+
+						"make this row say none reaches the app, and update the spec's accepted risk", got, gap)
+				}
+			})
+		}
+		t.Run(fmt.Sprintf("TE: trailers alone is served as ever, and passed on (HTTP/2 %v)", h2), func(t *testing.T) {
+			q := timeAs("books.example.test", "ines", [2]string{"TE", "trailers"})
+			q.H2 = h2
+			want := "200 App, at books.example.test, as [Te=trailers " + strings.TrimPrefix(inesAt, "[") + ", cookies []\n"
+			if got := ask("phone", q); !strings.HasPrefix(got, want) {
+				t.Errorf("%q, want it to start %q", got, want)
+			}
+		})
+	}
 	// Every other site deletes them too: an app that signs people in itself, Admin, and the sign-in.
 	for _, row := range []struct {
 		name string
@@ -1215,6 +1285,134 @@ func (q request) raw(ctx context.Context) string {
 		}
 	}
 	return out
+}
+
+// trailing is a request body that sets its trailers' values when it ends, as a client that computes them does.
+type trailing struct {
+	r       io.Reader
+	trailer http.Header
+	values  [][2]string
+}
+
+func (b *trailing) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err == io.EOF {
+		for _, h := range b.values {
+			b.trailer.Add(h[0], h[1])
+		}
+	}
+	return n, err
+}
+
+func (*trailing) Close() error { return nil }
+
+// tlsTo is a TLS connection to the request's address, its server name and the test's CA, offering one protocol.
+func (q request) tlsTo(ctx context.Context, proto string) (*tls.Conn, error) {
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM([]byte(q.CA))
+	d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 3 * time.Second}, Config: &tls.Config{ServerName: q.SNI, RootCAs: roots, NextProtos: []string{proto}}}
+	c, err := d.DialContext(ctx, "tcp", q.Addr)
+	if err != nil {
+		return nil, err
+	}
+	_ = c.SetDeadline(time.Now().Add(8 * time.Second))
+	return c.(*tls.Conn), nil
+}
+
+// trailersH1 is a POST over HTTP/1.1 with a chunked body whose trailer section holds the request's trailers, and no
+// Trailer header naming them: Go's client always writes one.
+func (q request) trailersH1(ctx context.Context) string {
+	c, err := q.tlsTo(ctx, "http/1.1")
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer c.Close()
+	var b strings.Builder
+	fmt.Fprintf(&b, "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n", cmp.Or(q.Path, "/"), q.Host)
+	for k, v := range q.Headers {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	b.WriteString("\r\n2\r\n{}\r\n0\r\n")
+	for _, h := range q.Trailers {
+		fmt.Fprintf(&b, "%s: %s\r\n", h[0], h[1])
+	}
+	b.WriteString("\r\n")
+	if _, err := io.WriteString(c, b.String()); err != nil {
+		return "error: " + err.Error()
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+	return fmt.Sprintf("%d %s", resp.StatusCode, body)
+}
+
+// trailersH2 is a POST over HTTP/2, framed by hand: its headers, a body, then a HEADERS frame ending the stream with the
+// request's trailers, which no trailer header declared.
+func (q request) trailersH2(ctx context.Context) string {
+	c, err := q.tlsTo(ctx, "h2")
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	defer c.Close()
+	if c.ConnectionState().NegotiatedProtocol != "h2" {
+		return "error: no HTTP/2"
+	}
+	block := func(fields ...[2]string) []byte {
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		for _, f := range fields {
+			_ = enc.WriteField(hpack.HeaderField{Name: strings.ToLower(f[0]), Value: f[1]})
+		}
+		return buf.Bytes()
+	}
+	fields := [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", q.Host}, {":path", cmp.Or(q.Path, "/")}}
+	for k, v := range q.Headers {
+		fields = append(fields, [2]string{k, v})
+	}
+	_, _ = io.WriteString(c, http2.ClientPreface)
+	fr := http2.NewFramer(c, c)
+	if err := errors.Join(fr.WriteSettings(),
+		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block(fields...), EndHeaders: true}),
+		fr.WriteData(1, false, []byte("{}")),
+		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block(q.Trailers...), EndHeaders: true, EndStream: true})); err != nil {
+		return "error: " + err.Error()
+	}
+	dec := hpack.NewDecoder(4096, nil)
+	status, body := "", ""
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				_ = fr.WriteSettingsAck()
+			}
+		case *http2.HeadersFrame:
+			hs, _ := dec.DecodeFull(f.HeaderBlockFragment())
+			for _, h := range hs {
+				if h.Name == ":status" {
+					status = h.Value
+				}
+			}
+			if f.StreamEnded() {
+				return status + " " + body
+			}
+		case *http2.DataFrame:
+			body += string(f.Data())
+			if f.StreamEnded() {
+				return status + " " + body
+			}
+		case *http2.RSTStreamFrame:
+			return "error: stream reset, " + f.ErrCode.String()
+		case *http2.GoAwayFrame:
+			return "error: going away, " + f.ErrCode.String()
+		}
+	}
 }
 
 // secure says whether a Set-Cookie value has the Secure attribute, once.

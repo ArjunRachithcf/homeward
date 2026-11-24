@@ -150,7 +150,9 @@ func KanidmGuard(dial string) *Guard {
 // admin, adult or kid, from the one role group the person is in; a person in none of them, or in more than one, or
 // without an id or any name, is refused, never taken for an adult. Every site deletes every
 // header a client sends under Homeward's prefix, in any case or spelling (OwnHeaders), so only the edge's reach an app.
-// An app's manifest declares that it relies on it (identity.edge).
+// An app's manifest declares that it relies on it (identity.edge). The app reads them from the request's headers only: a
+// client's request trailers, when it declares them, reach the app all the same, which no configuration of Caddy 2.11.9
+// can refuse or strip (#309, accepted; the request matrix pins it).
 //
 // ContractAuthTime, homerslab-v2, is the same contract with one more header, for an app whose manifest asks for it
 // (identity.authTime) and no other (#253): AuthTimeHeader, when the person last signed in, as the identity provider's

@@ -58,6 +58,32 @@ test('a guarded app’s plan says the edge signs people in', async ({ page, prim
   await expect(page.getByText('pdf.ferreira.family').first()).toBeVisible();
 });
 
+test('a guarded app whose manifest asks when someone signed in: its plan says it’s told (#253)', async ({ page, primary }) => {
+  await primary.setUp();
+  // No app in the official catalog asks yet: the manager's plan for BentoPDF, as it is for an app whose manifest says
+  // identity: {edge: homerslab-v2, authTime: true} (manager apps_test.go, plan_test.go check that it says so).
+  // The page's own fetch rewrites it: the browser alone resolves the primary's names.
+  await page.addInitScript(() => {
+    const real = window.fetch;
+    window.fetch = async (...args) => {
+      const response = await real(...args);
+      const url = new URL(args[0] instanceof Request ? args[0].url : String(args[0]), location.href);
+      if (!/^\/api\/v1\/plans(\/[^/]+)?$/.test(url.pathname) || !response.ok) return response;
+      const plan = await response.clone().json();
+      if (plan?.signIn) plan.signIn = { ...plan.signIn, identity: 'homerslab-v2', authTime: true };
+      return new Response(JSON.stringify(plan), { status: response.status, headers: response.headers });
+    };
+  });
+  await page.goto(await primary.adminURL());
+  await page.getByRole('button', { name: 'Get BentoPDF: see its install plan' }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Install BentoPDF');
+  await expect(page.getByText('BentoPDF learns who someone is from the edge alone', { exact: false })).toBeVisible();
+  await expect(page.getByText("It's also told when they last signed in, so it can turn down a change that needs a more recent sign-in."))
+    .toBeVisible();
+  // Step-up an app can send someone through isn't built (#308): the plan doesn't promise it.
+  await expect(page.getByText('sign in again', { exact: false })).toHaveCount(0);
+});
+
 test('a guarded app’s plan installs from its page; before the household account is set up, Install says so', async ({ page, primary }) => {
   await primary.setUp();
   await page.goto(await primary.adminURL());

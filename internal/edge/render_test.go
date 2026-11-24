@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -805,5 +806,37 @@ func TestOnlyAnAppThatAsksIsToldWhenThePersonSignedIn(t *testing.T) {
 	native.Apps = []edge.App{{Name: "recipes.example.test", Dial: "172.31.240.34:9000", SignsIn: true, AuthTime: true}}
 	if _, err := edge.Render(native); err == nil {
 		t.Error("rendered an app that signs people in itself, told when they signed in")
+	}
+}
+
+// UnixSeconds is the one sign-in time the edge passes on (#253, #309): one value of digits, no sign, no leading zero, at
+// most twelve. The request matrix checks it in Caddy; this checks the pattern itself, value by value.
+func TestUnixSecondsTakesOneValueOfDigitsOnly(t *testing.T) {
+	testenv.Isolate(t)
+	re := regexp.MustCompile(edge.UnixSeconds)
+	for v, want := range map[string]bool{
+		"1763990000":             true,
+		"1":                      true,
+		"999999999999":           true,  // twelve digits
+		"1763990000,1763990001":  false, // twice, as Caddy joins a header sent twice
+		"1763990000, 1763990001": false,
+		"17,63":                  false, // twice, short
+		"-1763990000":            false, // a sign
+		"+1763990000":            false,
+		"17639900x0":             false, // a letter
+		"1763990000s":            false,
+		"01763990000":            false, // a leading zero
+		"0":                      false,
+		"1000000000000":          false, // thirteen digits
+		"":                       false,
+		" 1763990000":            false,
+		"1763990000\n":           false,
+		"1763990000\n1":          false,
+		"１７６３９９００００":             false, // full-width digits
+		"1.76399e9":              false,
+	} {
+		if got := re.MatchString(v); got != want {
+			t.Errorf("%q: passed on %v, want %v", v, got, want)
+		}
 	}
 }
