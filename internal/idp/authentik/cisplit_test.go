@@ -104,11 +104,7 @@ func TestTheContractSubtestsRunOnceAcrossTheIdentityRunners(t *testing.T) {
 	// Every alternative of every pattern names a subtest that is there: one renamed away from its alternative would
 	// otherwise fall to another runner unseen (into ", LDAP", which runs what nothing else takes), or stop being skipped.
 	// One alternative may name a subtest still to come, in expectedSoon, until it is there.
-	expectedSoon := map[string]bool{
-		// #300 (#298): its admins'-audience drift goes to ", LDAP drift" rather than to the impostors' runner, which
-		// its other drifts fill. Remove it here once #300 is merged: the check then holds it to the subtest.
-		"drift:_providers_of_the_console's,_or_of_an_older": true,
-	}
+	expectedSoon := map[string]bool{}
 	for _, r := range runners {
 		for _, pat := range []string{r.Run, r.Skip} {
 			if pat == "" {
