@@ -219,6 +219,17 @@ func (e *agentRefused) Error() string {
 	return fmt.Sprintf("the agent answered %d %s: %s", e.Status, e.Code, e.Detail)
 }
 
+// errReadRefused is the agent answering, but refusing a compose read: it couldn't start the read's child (as root, its
+// read user missing, a permission refused, or the check that the child starts not dumpable failing). The network is
+// fine; the primary needs mending (#293).
+var errReadRefused = errors.New("agent-refused-read")
+
+// readRefusal says whether the agent's answer, its status and error code, refuses a compose read: 500 no-reader, from
+// a read or from an install's.
+func readRefusal(status int, code string) bool {
+	return status == http.StatusInternalServerError && code == "no-reader"
+}
+
 // readProject asks the agent to read an app's compose file as the project name, through the Compose SDK.
 func (a *agentClient) readProject(ctx context.Context, name string, compose []byte) (engine.Project, error) {
 	var p engine.Project
@@ -239,7 +250,11 @@ func (a *agentClient) readProject(ctx context.Context, name string, compose []by
 	if resp.StatusCode != http.StatusOK {
 		e := &agentRefused{Status: resp.StatusCode}
 		var b struct{ Error, Detail string }
-		if json.NewDecoder(resp.Body).Decode(&b) != nil || resp.StatusCode/100 != 4 {
+		decoded := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&b) == nil
+		if decoded && readRefusal(resp.StatusCode, b.Error) {
+			return p, fmt.Errorf("%w: the agent answered %s %s", errReadRefused, resp.Status, b.Error)
+		}
+		if !decoded || resp.StatusCode/100 != 4 {
 			return p, fmt.Errorf("the agent answered %s", resp.Status)
 		}
 		e.Code, e.Detail = b.Error, b.Detail

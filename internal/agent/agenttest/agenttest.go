@@ -1072,7 +1072,9 @@ func Executable(t testing.TB) string {
 	// (.github/workflows/ci.yml). Without it every read is refused, and a test would fail far from the cause.
 	if readsReady != nil {
 		t.Fatalf("run as root, an agent's compose reads need the packages' read user: %v. Run the tests as yourself "+
-			"(docker run -u \"$(id -u):$(id -g)\"), or create it first: systemd-sysusers packaging/sysusers.d/homeward.conf", readsReady)
+			"(docker run -u \"$(id -u):$(id -g)\"), or create it first: where there is systemd, systemd-sysusers "+
+			"packaging/sysusers.d/homeward.conf; in a container without it (the golang image), the groupadd and useradd "+
+			"lines of .github/workflows/ci.yml's step \"The reads' own user, as the packages make it\"", readsReady)
 	}
 	copied.Do(func() {
 		dir, err := os.MkdirTemp("", "homeward-test-exe-")

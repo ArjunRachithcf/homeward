@@ -548,6 +548,11 @@ func (a *Agent) putApp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p, err := a.reads.read(ctx, project, []byte(req.Compose))
+	if errors.Is(err, errNoReader) { // the agent refused the read: nothing to say of the file (#293)
+		a.log.Error("starting a compose read", "app", id, "err", err)
+		fail(w, http.StatusInternalServerError, "no-reader")
+		return
+	}
 	if err != nil {
 		a.log.Warn("reading an app's compose file", "app", id, "err", err)
 		code := "invalid-compose"

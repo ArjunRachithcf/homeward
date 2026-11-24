@@ -341,6 +341,23 @@ func TestAnInstallThatFailsHalfwayLeavesNothingServed(t *testing.T) {
 	install(t, sock, "ledger", withSecrets())
 }
 
+// An install whose compose read the agent refuses (it can't start the read's child: as root, its read user missing, a
+// permission refused, the dumpable check failing) says so, as the read itself does (500 no-reader), not that the
+// compose file is invalid; checking or installing, nothing is written (#293).
+func TestAnInstallWhoseReadIsRefusedSaysSo(t *testing.T) {
+	testenv.Isolate(t)
+	sock, h, state := signedIn(t, agent.Config{})
+	agent.NoReadCommand(t)
+	for _, path := range []string{"/v1/apps/ledger?check=true", "/v1/apps/ledger"} {
+		if code, body := call(t, sock, "PUT", path, withSecrets()); code != http.StatusInternalServerError || string(body) != `{"error":"no-reader"}`+"\n" {
+			t.Errorf("PUT %s with its read refused: %d %s, want 500 and only no-reader", path, code, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(state, "apps", "ledger")); err == nil || h.Ran("systemctl enable /"+agent.UnitsDir) >= 0 || len(apps(t, sock).Apps) != 0 {
+		t.Error("something was written for it")
+	}
+}
+
 // An install whose wiring doesn't take (the firewall table won't load) is still an install: the unit runs the app, the
 // answer says what is pending, and the agent keeps it, so the household records it; the upstream stays closed meanwhile.
 func TestAnInstallWhoseWiringDoesntTakeSaysSo(t *testing.T) {
