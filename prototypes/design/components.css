@@ -937,7 +937,7 @@ body.has-wallpaper { background: transparent; --text-2: var(--text-2-on-wall); }
 .owner-mark.is-theirs { color: var(--text-2); }
 .owner-mark.is-refused { color: var(--red-text); font-weight: var(--weight-semibold); }
 /* compact controls stay at 13px on a phone, as iOS's segmented controls and pills: --fs-sub grows to 15px there */
-@media (max-width: 640px) { .segmented button, .segmented button .count, .chip, .btn-sm, .needs-key, .session-pill { font-size: var(--fs-foot); } }
+@media (max-width: 640px) { .segmented button, .segmented button .count, .chip, .btn-sm, .pill, .needs-key, .session-pill { font-size: var(--fs-foot); } }
 
 /* ======================================================================== the setup assistant */
 /* One question per screen, as Apple's Setup Assistant: progress dots, a calm illustration, a big title, one sentence,
