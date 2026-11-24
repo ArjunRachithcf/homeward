@@ -179,6 +179,28 @@ func TestTheEdgeAloneReachesTheApp(t *testing.T) {
 	}
 }
 
+// The edge tells a guarded app when the person signed in only when its plan says the app asks (#253); an app that signs
+// people in itself has no guard to say it, and is refused rather than served without.
+func TestTheEdgeTellsOnlyTheAppThatAsksWhenSomeoneSignedIn(t *testing.T) {
+	testenv.Isolate(t)
+	sock, h, _ := signedIn(t, agent.Config{})
+	install(t, sock, "bentopdf", bentoPDF(t))
+	if cfg := string(h.Edge.Config()); strings.Contains(cfg, "Auth-Time") {
+		t.Errorf("an app that doesn't ask is told when someone signed in:\n%s", cfg)
+	}
+	asks := withSecrets()
+	asks.AuthTime = true
+	install(t, sock, "ledger", asks)
+	if cfg := string(h.Edge.Config()); strings.Count(cfg, `"X-HomersLab-Auth-Time"`) != 1 {
+		t.Errorf("the app that asks isn't told, or another is:\n%s", cfg)
+	}
+	native := mealie(t)
+	native.AuthTime = true
+	if code, body := call(t, sock, "PUT", "/v1/apps/mealie", native); code != 400 || !strings.Contains(string(body), `"bad-app"`) {
+		t.Errorf("an app that signs people in itself, told when they signed in: %d %s, want 400 bad-app", code, body)
+	}
+}
+
 // The sign-in's LDAP outpost (#204): of this machine's processes only the LDAPS port's opens its plain LDAP port, and
 // none its own LDAPS or metrics port, whether an app signs in over LDAP yet or not.
 func TestOnlyTheLDAPSPortsProcessOpensTheOutpost(t *testing.T) {

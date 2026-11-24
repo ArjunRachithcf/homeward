@@ -162,10 +162,12 @@ func TestTheLoaderRefusesADefinitionOutsideTheSchema(t *testing.T) {
 		}, "signIn"},
 		"an unknown sign-in method": {replace(everything, "method: ldap", "method: saml"), "signIn"},
 		// The identity contract an app relies on is one the edge keeps, for a guarded app (#236).
-		"an identity contract the edge doesn't keep": {replace(everything, "edge: homerslab-v1", "edge: homerslab-v2"), "identity.edge"},
-		"an empty identity contract":                 {replace(everything, "edge: homerslab-v1", "edge: \"\""), "identity.edge"},
-		"the identity contract without a guard":      {replace(everything, "  - method: guard\n", ""), "identity.edge"},
-		"a sign-in method twice":                     {replace(everything, "method: ldap", "method: oidc"), "signIn"},
+		"an identity contract the edge doesn't keep": {replace(everything, "edge: homerslab-v1", "edge: homerslab-v3"), "identity.edge"},
+		// The sign-in time is homerslab-v2's (#253): an app on homerslab-v1 can't ask for it.
+		"the sign-in time on homerslab-v1":      {replace(everything, "edge: homerslab-v1", "edge: homerslab-v1\n  authTime: true"), "identity.authTime"},
+		"an empty identity contract":            {replace(everything, "edge: homerslab-v1", "edge: \"\""), "identity.edge"},
+		"the identity contract without a guard": {replace(everything, "  - method: guard\n", ""), "identity.edge"},
+		"a sign-in method twice":                {replace(everything, "method: ldap", "method: oidc"), "signIn"},
 		// The OIDC client's redirect addresses are the app's own URL and its own callback paths, or its own apps'
 		// addresses (#20, adversarial review round 2): never a wildcard, never another site.
 		"a redirect address with a wildcard":    {replace(everything, "[/auth/callback,", "[/auth/*,"), "redirectUris"},
@@ -296,10 +298,35 @@ func TestADefinitionsDigestCoversEveryFileItIsMadeOf(t *testing.T) {
 	}
 }
 
-// The identity contract a manifest may rely on is the one the edge keeps (#236).
+// The identity contract a manifest may rely on is one the edge keeps (#236, #253).
 func TestTheIdentityContractIsTheEdges(t *testing.T) {
 	testenv.Isolate(t)
-	if catalog.EdgeIdentity != edge.Contract {
-		t.Errorf("a manifest relies on %q, the edge keeps %q", catalog.EdgeIdentity, edge.Contract)
+	if catalog.EdgeIdentity != edge.Contract || catalog.EdgeIdentityAuthTime != edge.ContractAuthTime {
+		t.Errorf("a manifest relies on %q and %q, the edge keeps %q and %q", catalog.EdgeIdentity, catalog.EdgeIdentityAuthTime, edge.Contract, edge.ContractAuthTime)
+	}
+}
+
+// An app on homerslab-v2 may ask the edge when the person last signed in (#253); one that doesn't ask, on either
+// contract, is never told.
+func TestAnAppMayAskTheEdgeWhenThePersonSignedIn(t *testing.T) {
+	testenv.Isolate(t)
+	for name, c := range map[string]struct {
+		edit func(fstest.MapFS)
+		want catalog.Identity
+	}{
+		"homerslab-v1":                {func(fstest.MapFS) {}, catalog.Identity{Edge: "homerslab-v1"}},
+		"homerslab-v2, not asking":    {replace(everything, "edge: homerslab-v1", "edge: homerslab-v2"), catalog.Identity{Edge: "homerslab-v2"}},
+		"homerslab-v2, asking":        {replace(everything, "edge: homerslab-v1", "edge: homerslab-v2\n  authTime: true"), catalog.Identity{Edge: "homerslab-v2", AuthTime: true}},
+		"homerslab-v2, saying it not": {replace(everything, "edge: homerslab-v1", "edge: homerslab-v2\n  authTime: false"), catalog.Identity{Edge: "homerslab-v2"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cat, err := catalog.Load(fixture(t, c.edit))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cat.Apps[0].Identity; got == nil || *got != c.want {
+				t.Errorf("identity %+v, want %+v", got, c.want)
+			}
+		})
 	}
 }

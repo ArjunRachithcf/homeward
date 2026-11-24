@@ -74,9 +74,13 @@ type SignIn struct {
 	// RedirectURIs are an OIDC client's redirect addresses, exactly: the app's callbacks on its one URL (ADR 0021), and
 	// its own apps' addresses. Never a wildcard, never another site (#20).
 	RedirectURIs []string `json:"redirectUris,omitempty"`
-	// Identity is the identity contract the edge keeps for the app (#236), homerslab-v1 for a guarded app: who someone
-	// is reaches it only as X-HomersLab-Person, X-HomersLab-Name and X-HomersLab-Role, which the edge sets.
+	// Identity is the identity contract the edge keeps for the app (#236), homerslab-v1 for a guarded app (homerslab-v2
+	// when its manifest names it): who someone is reaches it only as X-HomersLab-Person, X-HomersLab-Name and
+	// X-HomersLab-Role, which the edge sets.
 	Identity string `json:"identity,omitempty"`
+	// AuthTime says the edge also tells the app when the person last signed in, X-HomersLab-Auth-Time (homerslab-v2's
+	// identity.authTime, #253): only a guarded app whose manifest asks.
+	AuthTime bool `json:"authTime,omitempty"`
 	// Wired says Homeward can set the app up with this method today: a guard always; an OIDC client when the app's
 	// manifest says how it takes one (#20); LDAP when it says how it takes its directory (#204). A plan that isn't wired
 	// is shown, and not applied.
@@ -224,6 +228,8 @@ type Provider struct {
 	ID       string                 `json:"id"`
 	Name     string                 `json:"name"`
 	Provides []catalog.SignInMethod `json:"-"`
+	// AuthTime says its guard names when someone signed in (#253): Authentik's does, Kanidm's oauth2-proxy doesn't.
+	AuthTime bool `json:"-"`
 }
 
 // Person is someone in the household and their role: admin, adult or kid.

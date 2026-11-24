@@ -453,6 +453,20 @@ Stories 120–121 are decided in #87.
       dots for dashes too (Caddy 2.11.9 already drops a name with `_` or `.` before the upstream: the edge's deletes
       are a second layer); an app's name also deletes every provider's identity headers (`X-Authentik-*`,
       `X-Auth-Request-*`, `X-Forwarded-User` and the like), and none of them reaches an app.
+  - **The identity contract `homerslab-v2`** (#253) is `homerslab-v1` with the sign-in time, for an app whose manifest
+    asks for it (`identity: {edge: homerslab-v2, authTime: true}`) and no other:
+    - `X-HomersLab-Auth-Time` is when the person last signed in: the identity provider's `auth_time` of their sign-in,
+      in Unix seconds, one value of digits. A refresh of their session without a sign-in doesn't move it; a new
+      sign-in through the app's guard does (the guard's own session keeps the time it was made with, so a sign-in at
+      another name reaches the app only once that session ends). An app that wants a recent sign-in before a risky
+      change compares it with its own clock and refuses when it is too old; a step-up the app can send the person
+      through is still to build (follow-up of #253);
+    - the edge sets it from its guard's answer alone, after deleting the client's (as every `X-HomersLab-*` header);
+      an answer that names it twice, or as anything but digits (no sign, no leading zero, at most twelve), sets none;
+    - with Authentik, Homeward's scope mapping names it from the token's `auth_time`, which Authentik takes from the
+      session's sign-in, so a new token on the same session keeps it; it names none without a role, so a forged
+      attribute fails it closed with the role. Kanidm behind oauth2-proxy names none yet: an app that asks gets a plan
+      that isn't wired there, never a promise the edge can't keep.
   - **Apps are same-site with Admin and the sign-in**, so the edge keeps their cookies apart (#83):
     - it strips the guard's own cookie from the request before proxying to the app;
     - it drops any `Set-Cookie` in an app's response whose `Domain` is a household domain, unless the app's manifest
@@ -608,7 +622,8 @@ One folder per app: a manifest, a plain compose file (none for a host app), icon
 - **versions**: image digests per engine and architecture;
 - **sign-in methods**, in order of preference, with their settings;
 - **the identity contract** the app relies on, `identity: {edge: homerslab-v1}`: only for an app with the guard among
-  its sign-in methods; the install plan of a guarded app shows it (#236);
+  its sign-in methods; the install plan of a guarded app shows it (#236). `edge: homerslab-v2` with `authTime: true`
+  also asks when the person last signed in (#253), which the plan shows too; `authTime` needs `homerslab-v2`;
 - **names and exposure**: the default exposure, whether a public path is allowed, and a cookie for the whole domain
   where the app truly needs one (#83);
 - **audience**: the default audience, and the kid view;
@@ -1466,3 +1481,4 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 189 | The catalog's app waves, and two apps per purpose beyond classic | The catalog's app waves (#118–#122, #123) |
 | 190 | No app password for an admin, enforced with either provider: refused for an admin, the promotion of someone holding one refused, admins' own (Kanidm's, a console's) ended at every pass with a security event (decided by default) | Adapter contracts (#281) |
 | 191 | Nobody in the admins' group binds over LDAP, whatever the credential (a policy on every bind flow, by the group's id, direct membership, guarded by the drift check); an Authentik superuser who isn't Homeward's admin is refused the same way; nobody holding anything but passkeys is made an admin (decided by default) | Adapter contracts (#292) |
+| 192 | The identity contract `homerslab-v2`: the edge tells an app that asks (`identity.authTime`) when the person last signed in, `X-HomersLab-Auth-Time`, the provider's `auth_time`, which a session's refresh doesn't move (decided by default) | Modules → Edge; The app definition (#253) |

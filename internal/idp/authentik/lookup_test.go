@@ -450,7 +450,8 @@ func TestEveryGuardCarriesTheRoleMapping(t *testing.T) {
 	}
 	for _, want := range []string{`"homerslab-admins": "admin"`, `"homerslab-adults": "adult"`, `"homerslab-kids": "kid"`, "user.groups.filter(name__in=",
 		"if len(mine) == 1 and not forged else", `headers["` + RoleHeader + `"] = role`,
-		`.lower().replace("_", "-").startswith(("x-authentik-", "x-homerslab-"))`, `headers = {k: "" for k in forged}`} {
+		`.lower().replace("_", "-").startswith(("x-authentik-", "x-homerslab-"))`, `headers = {k: "" for k in forged}`,
+		`signed_in = str(int(token.auth_time.timestamp())) if role else ""`, `headers["` + AuthTimeHeader + `"] = signed_in`, "except NameError:"} {
 		if !strings.Contains(expr, want) {
 			t.Errorf("its expression lacks %s:\n%s", want, expr)
 		}

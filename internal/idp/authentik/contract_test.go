@@ -316,6 +316,7 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 	})
 
 	t.Run("the role mapping names no role when anything is forged, whatever order the outpost writes in (#244)", roleMappingFailsClosed(w))
+	t.Run("the guard names when the person signed in: Authentik's auth_time, which a refresh of the session doesn't move and a new sign-in does (#253)", signInTime(w))
 	t.Run("drift: a foreign scope mapping on a guard, or Homeward's role mapping changed, shows in the report, and Prepare puts it back (#244)", guardDrift(w, a))
 	t.Run("drift: a guard's header auth, Basic auth, flows, skipped paths, federated tokens, cookie, session or outpost changed show in the report, and Prepare puts them back (#273)", guardSettingsDrift(w, a))
 
@@ -778,6 +779,14 @@ func (w *world) PassGuard(t *testing.T, a *webauthntest.Authenticator, username,
 func (w *world) passGuard(t *testing.T, a *webauthntest.Authenticator, username, host string) (int, http.Header) {
 	t.Helper()
 	jar, _ := cookiejar.New(nil)
+	status, h, _ := w.guardIn(t, jar, a, username, host)
+	return status, h
+}
+
+// guardIn is passGuard in a browser holding jar's cookies, which keeps the ones it is given; it also says how many
+// times the sign-in asked who the person is (none when the sign-in's own session still holds).
+func (w *world) guardIn(t *testing.T, jar http.CookieJar, a *webauthntest.Authenticator, username, host string) (int, http.Header, int) {
+	t.Helper()
 	c := &http.Client{Timeout: 30 * time.Second, Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		// Every name of the household's goes to Authentik, under its own Host, as the edge sends it.
 		Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
@@ -847,7 +856,7 @@ func (w *world) passGuard(t *testing.T, a *webauthntest.Authenticator, username,
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	return resp.StatusCode, resp.Header
+	return resp.StatusCode, resp.Header, b.identified
 }
 
 // errDenied is a flow that ended in Authentik's access-denied stage: a policy refused the person.
@@ -1382,6 +1391,8 @@ type browser struct {
 	a *webauthntest.Authenticator
 	// strict fails the test when a stage turns down a password or code: the harness's factors must be right.
 	strict bool
+	// identified counts the identification stages it answered: the sign-ins it made.
+	identified int
 }
 
 func (b *browser) Enrol(t *testing.T, link idp.Link) (idptest.Enrolment, error) {
@@ -1476,6 +1487,7 @@ func (b *browser) flow(t *testing.T, slug, query, username string, f idptest.Fac
 	for range 10 {
 		switch ch["component"] {
 		case "ak-stage-identification":
+			b.identified++
 			r := map[string]any{"component": "ak-stage-identification", "uid_field": username}
 			if f.Password != "" {
 				r["password"] = f.Password

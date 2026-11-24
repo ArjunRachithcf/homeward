@@ -1468,6 +1468,11 @@ const embeddedOutpost = "goauthentik.io/outposts/embedded"
 // a group may be named "x|homerslab-admins".
 const RoleHeader = "X-Authentik-Homerslab-Role"
 
+// AuthTimeHeader is the header of the guard's answer that says when the person last signed in (#253): the token's
+// auth_time, in Unix seconds, which Authentik takes from the sign-in of the person's session (its login event), so a
+// new token made on the same session, when the outpost's own session ends, keeps it. Empty when there is no token.
+const AuthTimeHeader = "X-Authentik-Homerslab-Auth-Time"
+
 // roleMapping is the scope mapping every guard's provider carries, which computes RoleHeader: from the role groups the
 // person is in directly, by their exact names, one of them or none. A group below a role's group (which its audience
 // counts) gives no role. Its scope sorts after ak_proxy, Authentik's own proxy mapping, which merges the person's and
@@ -1475,6 +1480,10 @@ const RoleHeader = "X-Authentik-Homerslab-Role"
 // stand in for it. An attribute under any other spelling of a header of Authentik's or Homeward's (another case,
 // underscores) would: the outpost sets each, and the last one wins, even over X-Authentik-Uid (review round 2). So when
 // any is there, the mapping fails closed: it empties each of them and the role, and the edge refuses the person.
+//
+// It names the sign-in time too (AuthTimeHeader, #253), from the token it is evaluated for: never the time the token
+// was made, which a refresh of the outpost's session moves. Without a token (Authentik's own test of a mapping) or a
+// role, it names none.
 const roleMapping = "HomersLab: the person's role at the edge"
 
 func roleExpression() string {
@@ -1493,6 +1502,12 @@ func roleExpression() string {
 		`role = roles[mine.pop()] if len(mine) == 1 and not forged else ""`,
 		`headers = {k: "" for k in forged}`,
 		fmt.Sprintf("headers[%q] = role", RoleHeader),
+		"# The sign-in time (#253): the token's auth_time, its session's sign-in, which a new token on that session keeps.",
+		"try:",
+		`    signed_in = str(int(token.auth_time.timestamp())) if role else ""`,
+		"except NameError:  # no token: Authentik's own test of a mapping",
+		`    signed_in = ""`,
+		fmt.Sprintf("headers[%q] = signed_in", AuthTimeHeader),
 		`return {"ak_proxy": {"user_attributes": {"additionalHeaders": headers}}}`,
 	}, "\n") + "\n"
 }

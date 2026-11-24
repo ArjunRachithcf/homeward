@@ -127,6 +127,33 @@ func TestApplyingAPlanDoesWhatItSaysAndNothingMore(t *testing.T) {
 	}
 }
 
+// An app whose manifest asks when the person signed in (homerslab-v2's identity.authTime, #253) is told it at the edge
+// once its plan is applied, and its plan says so; an app that doesn't ask is never told.
+func TestOnlyAnAppThatAsksIsToldWhenSomeoneSignedIn(t *testing.T) {
+	testenv.Isolate(t)
+	for _, asks := range []bool{false, true} {
+		t.Run(fmt.Sprintf("asks %v", asks), func(t *testing.T) {
+			cat := withCatalog(t, map[string]func([]byte) []byte{"apps/bentopdf/app.yaml": func(b []byte) []byte {
+				if !asks {
+					return b
+				}
+				return bytes.Replace(b, []byte("signIn:\n  - method: guard\n"), []byte("signIn:\n  - method: guard\nidentity:\n  edge: homerslab-v2\n  authTime: true\n"), 1)
+			}})
+			p, _ := installable(t, cat)
+			made := planFor(t, p, "bentopdf")
+			if made.SignIn.AuthTime != asks {
+				t.Errorf("the plan says the app is told the sign-in time: %v, want %v", made.SignIn.AuthTime, asks)
+			}
+			if r := p.control("POST", "/api/v1/plans/"+made.ID+"/apply", nil); r.Code != http.StatusAccepted {
+				t.Fatalf("applying: %d %s", r.Code, r.Body)
+			}
+			if told := strings.Contains(string(p.host.Edge.Config()), `"X-HomersLab-Auth-Time"`); told != asks {
+				t.Errorf("the edge tells the app when someone signed in: %v, want %v:\n%s", told, asks, p.host.Edge.Config())
+			}
+		})
+	}
+}
+
 // A plan applies only while it is still the plan the household would get: a changed definition or household makes a
 // new plan, and the old one is refused rather than applied (it would do something its page didn't say).
 func TestAStalePlanIsRefused(t *testing.T) {

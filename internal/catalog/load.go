@@ -285,14 +285,17 @@ func checkLDAP(p *problems, e *LDAPEnv) {
 	}
 }
 
-// checkIdentity checks the identity contract an app relies on: the one the edge keeps, which it keeps for a guarded app
-// only (#236).
+// checkIdentity checks the identity contract an app relies on: one the edge keeps, which it keeps for a guarded app
+// only (#236); the sign-in time only on the contract that has it (#253).
 func checkIdentity(p *problems, id *Identity, methods []SignIn) {
 	if id == nil {
 		return
 	}
-	if id.Edge != EdgeIdentity {
-		p.add("identity.edge %q: %s, the identity contract the edge keeps", id.Edge, EdgeIdentity)
+	if id.Edge != EdgeIdentity && id.Edge != EdgeIdentityAuthTime {
+		p.add("identity.edge %q: %s or %s, the identity contracts the edge keeps", id.Edge, EdgeIdentity, EdgeIdentityAuthTime)
+	}
+	if id.AuthTime && id.Edge != EdgeIdentityAuthTime {
+		p.add("identity.authTime: the sign-in time is %s's, not %q's", EdgeIdentityAuthTime, id.Edge)
 	}
 	if !slices.ContainsFunc(methods, func(m SignIn) bool { return m.Method == Guard }) {
 		p.add("identity.edge: the edge keeps it for a guarded app: signIn needs the guard")

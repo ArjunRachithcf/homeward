@@ -46,6 +46,7 @@ func TestTheEdgesConfigurationIsItsGoldenRender(t *testing.T) {
 		"both-apps":        withBothApps(),
 		"sign-in-listener": withTheSignInListener(),
 		"with-home":        withHome(),
+		"sign-in-time":     withTheSignInTime(),
 		"cloud-port-two":   twoAddresses,
 		"before-the-cert": {AdminSocket: "/run/homeward-edge/admin.sock", Storage: "/var/lib/homeward-edge",
 			Listen: []netip.Addr{netip.MustParseAddr("100.88.7.186")}, Port: 443},
@@ -747,5 +748,62 @@ func TestEverySiteDeletesHomersLabsOwnHeaders(t *testing.T) {
 				t.Errorf("%s doesn't delete %s", app, h)
 			}
 		}
+	}
+}
+
+// withTheSignInTime is the primary with two guarded apps: BentoPDF, which doesn't ask when someone signed in, and
+// Philobiblos at books.example.test, whose manifest asks for it (identity.authTime, homerslab-v2; #253).
+func withTheSignInTime() edge.Config {
+	c := withAGuardedApp()
+	c.Apps = append(c.Apps, edge.App{Name: "books.example.test", Dial: "172.31.240.18:8080", Guard: edge.AuthentikGuard("172.31.250.10:9000"), AuthTime: true})
+	return c
+}
+
+// The sign-in time (#253): only an app that asks is told, and only from the guard's own answer, one value of digits;
+// the client's own X-HomersLab-Auth-Time is deleted first on every name, as every X-HomersLab-* header. A guard that
+// names no sign-in time (oauth2-proxy's answer has none) tells nobody. The request matrix checks it in Caddy itself.
+func TestOnlyAnAppThatAsksIsToldWhenThePersonSignedIn(t *testing.T) {
+	testenv.Isolate(t)
+	b, err := edge.Render(withTheSignInTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := "{http.reverse_proxy.header." + edge.AuthentikGuard("").AuthTime + "}"
+	if edge.AuthentikGuard("").AuthTime == "" || edge.KanidmGuard("").AuthTime != "" {
+		t.Fatalf("Authentik's guard names the sign-in time in %q, Kanidm's in %q", edge.AuthentikGuard("").AuthTime, edge.KanidmGuard("").AuthTime)
+	}
+	books := string(siteOf(t, b, "books.example.test"))
+	set := fmt.Sprintf(`{"handler":"headers","request":{"set":{%q:[%q]}}}`, edge.AuthTimeHeader, from)
+	only := fmt.Sprintf(`"match":[{"vars_regexp":{%q:{"pattern":%q}}}]`, from, edge.UnixSeconds)
+	compact := func(s string) string {
+		var buf bytes.Buffer
+		_ = json.Compact(&buf, []byte(s))
+		return buf.String()
+	}
+	if c := compact(books); strings.Count(c, edge.AuthTimeHeader) != 1 || !strings.Contains(c, `{"handle":[`+set+"],"+only+"}") {
+		t.Errorf("the app that asks: its site sets %s other than from the guard's one value of digits:\n%s", edge.AuthTimeHeader, books)
+	}
+	if pdf := string(siteOf(t, b, "pdf.example.test")); strings.Contains(pdf, "Auth-Time") {
+		t.Errorf("the app that doesn't ask: its site names the sign-in time:\n%s", pdf)
+	}
+	// The client's own: deleted on every name, under Homeward's prefix, before anything else.
+	if !strings.Contains(books, `"X-Homerslab-*"`) || !strings.Contains(string(siteOf(t, b, "pdf.example.test")), `"X-Homerslab-*"`) {
+		t.Error("a site doesn't delete the client's X-HomersLab-* headers")
+	}
+	// Kanidm's guard names none: the app that asks is told nothing, never something else.
+	kanidm := withTheSignInTime()
+	kanidm.Apps[1].Guard = edge.KanidmGuard("172.31.250.10:9000")
+	kb, err := edge.Render(kanidm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site := string(siteOf(t, kb, "books.example.test")); strings.Contains(site, "Auth-Time") {
+		t.Errorf("behind a guard that names no sign-in time, the app is told one:\n%s", site)
+	}
+	// Only a guarded app is told: an app that signs people in itself has no guard to say it.
+	native := withSignIn()
+	native.Apps = []edge.App{{Name: "recipes.example.test", Dial: "172.31.240.34:9000", SignsIn: true, AuthTime: true}}
+	if _, err := edge.Render(native); err == nil {
+		t.Error("rendered an app that signs people in itself, told when they signed in")
 	}
 }
