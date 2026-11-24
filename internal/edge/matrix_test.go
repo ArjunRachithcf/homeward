@@ -431,9 +431,10 @@ type request struct {
 	Target string
 	// Trailers are sent after a body, as POST: in the chunked body's trailer section over HTTP/1.1, in a trailing
 	// HEADERS frame over HTTP/2 (#309). They are declared in a Trailer header first, as Go's client does, unless
-	// Undeclared: then they are written by hand, with no Trailer header.
+	// Undeclared: then they are written by hand, with a Trailer header naming only Declare (none when it's empty).
 	Trailers   [][2]string
 	Undeclared bool
+	Declare    []string
 }
 
 // bindRequest is one LDAP bind an app's server makes: to an address, over TLS with a server name (checked against the
@@ -907,12 +908,13 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			}
 		})
 	}
-	// A client's request trailers (#309), forging the role and the sign-in time, to the app that asks for it. Caddy 2.11.9
-	// passes on the trailers a client declares in a Trailer header, over HTTP/1.1 and HTTP/2 alike, and its configuration
-	// can neither refuse nor strip them: net/http takes the Trailer header out before any matcher, and nothing in the
-	// configuration reads a request's trailers. Arjun accepted it on 2026-11-24: apps read X-HomersLab-* only from the
-	// request's headers (spec: the identity contract). These rows pin today's behaviour: trailers never declared never
-	// reach the app; declared ones reach it as trailers only, never as its headers, which stay the edge's.
+	// A client's request trailers (#309), forging the role and the sign-in time. Caddy 2.11.9 passes on a request's
+	// trailers, and its configuration can neither refuse nor strip them: net/http takes the Trailer header out before
+	// any matcher, and nothing in the configuration reads a request's trailers. Which ones reach the app depends on the
+	// protocol: over HTTP/1.1, a Trailer header naming anything at all lets every trailer of the chunked body through,
+	// named or not; over HTTP/2, only the trailers the header names. With no Trailer header, none reaches the app over
+	// either. Arjun accepted it on 2026-11-24: apps read X-HomersLab-* only from the request's headers (spec: the
+	// identity contract). These rows pin today's behaviour; the app's headers stay the edge's in every one.
 	forgedTrailers := [][2]string{{"X-HomersLab-Role", "admin"}, {"X-HomersLab-Auth-Time", "9999999999"}}
 	headersOf := map[string]string{"books.example.test": inesAt, // homerslab-v2, told the sign-in time
 		"pdf.example.test": "[X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"} // homerslab-v1
@@ -921,7 +923,7 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			for _, row := range []struct {
 				name       string
 				undeclared bool
-			}{{"never declared: none reaches the app", true}, {"declared in a Trailer header: they reach it as trailers only (accepted, #309)", false}} {
+			}{{"never declared: none reaches the app", true}, {"named in a Trailer header: they reach it as trailers only (accepted, #309)", false}} {
 				t.Run(fmt.Sprintf("request trailers forging the role and the sign-in time, at %s, %s (HTTP/2 %v)", host, row.name, h2), func(t *testing.T) {
 					q := timeAs(host, "ines")
 					q.Trailers, q.Undeclared, q.H2 = forgedTrailers, row.undeclared, h2
@@ -945,6 +947,19 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 				want := "200 App, at " + host + ", as [Te=trailers " + strings.TrimPrefix(headersOf[host], "[") + ", cookies []\n"
 				if got := ask("phone", q); !strings.HasPrefix(got, want) {
 					t.Errorf("%q, want it to start %q", got, want)
+				}
+			})
+			t.Run(fmt.Sprintf("request trailers forging the role and the sign-in time, with only an unrelated one declared, at %s (HTTP/2 %v)", host, h2), func(t *testing.T) {
+				q := timeAs(host, "ines")
+				q.Trailers = append([][2]string{{"X-Checksum", "1"}}, forgedTrailers...)
+				q.Undeclared, q.Declare, q.H2 = true, []string{"X-Checksum"}, h2
+				got, _, _ := strings.Cut(ask("phone", q), "\n")
+				// HTTP/1.1: every trailer, the undeclared forged ones too (accepted, #309); HTTP/2: the declared one alone.
+				want := map[bool]string{false: ", trailers [X-Checksum=1 X-Homerslab-Auth-Time=9999999999 X-Homerslab-Role=admin]",
+					true: ", trailers [X-Checksum=1]"}[h2]
+				if !strings.HasPrefix(got, "200 App, at "+host+", as "+headersOf[host]+",") || !strings.HasSuffix(got, want) {
+					t.Errorf("%q, want the edge's headers and it to end %q: if Caddy changed which trailers it passes on, update "+
+						"this row and the spec's accepted risk", got, want)
 				}
 			})
 		}
@@ -1336,6 +1351,9 @@ func (q request) trailersH1(ctx context.Context) string {
 	defer c.Close()
 	var b strings.Builder
 	fmt.Fprintf(&b, "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n", cmp.Or(q.Path, "/"), q.Host)
+	if len(q.Declare) > 0 {
+		fmt.Fprintf(&b, "Trailer: %s\r\n", strings.Join(q.Declare, ", "))
+	}
 	for k, v := range q.Headers {
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
 	}
@@ -1379,6 +1397,9 @@ func (q request) trailersH2(ctx context.Context) string {
 		return buf.Bytes()
 	}
 	fields := [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", q.Host}, {":path", cmp.Or(q.Path, "/")}}
+	if len(q.Declare) > 0 {
+		fields = append(fields, [2]string{"trailer", strings.Join(q.Declare, ", ")})
+	}
 	for k, v := range q.Headers {
 		fields = append(fields, [2]string{k, v})
 	}

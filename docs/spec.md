@@ -454,16 +454,17 @@ Stories 120–121 are decided in #87.
       are a second layer); an app's name also deletes every provider's identity headers (`X-Authentik-*`,
       `X-Auth-Request-*`, `X-Forwarded-User` and the like), and none of them reaches an app.
     - an app reads `X-HomersLab-*` only from the request's headers, never from its trailers (#309). Caddy 2.11.9 passes
-      on the trailers a client declares in a `Trailer` header, over HTTP/1.1 (after a chunked body) and HTTP/2 alike,
-      and its configuration can neither refuse nor strip them: net/http takes the `Trailer` header out before any
-      matcher sees it, and nothing in the configuration reads a request's trailers. So the edge's deletes don't reach
-      them, and a client can send `X-HomersLab-Role: admin` as a trailer. Trailers no `Trailer` header declared never
-      reach an app; `TE: trailers` alone is served and passed on as ever. **Accepted by the threat model** (Arjun,
-      2026-11-24): the common servers apps run on keep a request's trailers apart from its headers, a custom Caddy build
-      would go against [ADR 0001](adr/0001-build-only-the-glue.md), and refusing every chunked HTTP/1.1 body would
-      break streaming uploads (WebDAV clients among them) and still leave HTTP/2 open. The request matrix pins
-      today's behaviour, so a Caddy that changes it fails a row; asking Caddy upstream for a way to drop or refuse
-      request trailers is for later. An app that merges trailers into headers can't keep this contract.
+      a request's trailers on to the app, and its configuration can neither refuse nor strip them: net/http takes the
+      `Trailer` header out before any matcher sees it, and nothing in the configuration reads a request's trailers. So
+      the edge's deletes don't reach them, and a client can send `X-HomersLab-Role: admin` as a trailer. Which ones
+      reach the app depends on the protocol: over HTTP/1.1 (after a chunked body), a `Trailer` header naming anything
+      at all, `X-Checksum` say, lets every trailer through, named or not; over HTTP/2, only the trailers it names. With
+      no `Trailer` header none reaches an app, over either; `TE: trailers` alone is served and passed on as ever.
+      **Accepted by the threat model** (Arjun, 2026-11-24): the common servers apps run on keep a request's trailers
+      apart from its headers, a custom Caddy build would go against [ADR 0001](adr/0001-build-only-the-glue.md), and
+      refusing every chunked HTTP/1.1 body would break streaming uploads (WebDAV clients among them) and still leave
+      HTTP/2 open. The request matrix pins today's behaviour, so a Caddy that changes it fails a row; asking Caddy
+      upstream for a way to drop or refuse request trailers is for later. An app that merges trailers into headers can't keep this contract.
   - **The identity contract `homerslab-v2`** (#253) is `homerslab-v1` with the sign-in time, for an app whose manifest
     asks for it (`identity: {edge: homerslab-v2, authTime: true}`) and no other:
     - `X-HomersLab-Auth-Time` is when the person last signed in: the identity provider's `auth_time` of their sign-in,
@@ -1495,4 +1496,4 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 190 | No app password for an admin, enforced with either provider: refused for an admin, the promotion of someone holding one refused, admins' own (Kanidm's, a console's) ended at every pass with a security event (decided by default) | Adapter contracts (#281) |
 | 191 | Nobody in the admins' group binds over LDAP, whatever the credential (a policy on every bind flow, by the group's id, direct membership, guarded by the drift check); an Authentik superuser who isn't Homeward's admin is refused the same way; nobody holding anything but passkeys is made an admin (decided by default) | Adapter contracts (#292) |
 | 192 | The identity contract `homerslab-v2`: the edge tells an app that asks (`identity.authTime`) when the person last signed in, `X-HomersLab-Auth-Time`, the provider's `auth_time`, which a session's refresh doesn't move (decided by default) | Modules → Edge; The app definition (#253) |
-| 193 | Apps read `X-HomersLab-*` only from headers; request trailers a client declares reach an app (Caddy 2.11.9 can't refuse or strip them in its configuration), accepted (Arjun, 2026-11-24), pinned by the request matrix; an app refuses a sign-in time in the future | Modules → Edge (#309) |
+| 193 | Apps read `X-HomersLab-*` only from headers; a client's request trailers reach an app (over HTTP/1.1 all of them once a `Trailer` header names any, over HTTP/2 the named ones; Caddy 2.11.9 can't refuse or strip them in its configuration), accepted (Arjun, 2026-11-24), pinned by the request matrix; an app refuses a sign-in time in the future | Modules → Edge (#309) |
