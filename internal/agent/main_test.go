@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("HOMEWARD_TEST_PEEK") != "" && (len(os.Args) < 2 || os.Args[1] != "agent") {
 		os.Exit(peek())
 	}
-	// Read children that misbehave, confined as the real one is: one burns CPU, one allocates until it can't.
+	// Read children that misbehave, confined as the real one is: one burns CPU, one allocates until it can't, one panics.
 	if len(os.Args) > 2 && os.Args[1] == "agent" {
 		switch os.Args[2] {
 		case "read-project-burn":
@@ -45,6 +45,10 @@ func TestMain(m *testing.M) {
 				fmt.Fprintln(os.Stderr, "reading")
 				time.Sleep(time.Hour)
 				return engine.Project{}, nil
+			}))
+		case "read-project-panic": // a reader with a bug that panics on this file (#295)
+			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
+				panic("the reader fell over on line 7")
 			}))
 		case "read-project-hog":
 			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {

@@ -199,9 +199,7 @@ func (m *Manager) newPlan(w http.ResponseWriter, r *http.Request) {
 		m.log.Error("the agent can't read an app's compose file", "app", a.ID, "err", err)
 		fail(w, http.StatusUnprocessableEntity, refused.Code)
 		return
-	case errors.Is(err, errReadRefused):
-		m.log.Error("the agent refused to read an app's compose file; its log says why", "app", a.ID, "err", err)
-		fail(w, http.StatusInternalServerError, errReadRefused.Error())
+	case m.failRead(w, err, "to plan it", "app", a.ID):
 		return
 	case err != nil:
 		m.log.Warn("asking the agent to read a compose file", "err", err)

@@ -130,6 +130,10 @@ const cantPlan: Partial<Record<string, Key>> = {
   'storage-location-needed': 'store.needsStorage',
   'agent-unreachable': 'store.cantPlan.agent-unreachable',
   'agent-refused-read': 'store.cantPlan.agent-refused-read',
+  // The primary busy with another app's read, or the app's definition too slow or too large to read (#295).
+  'agent-busy': 'store.cantPlan.agent-busy',
+  'read-timeout': 'store.cantPlan.read-timeout',
+  'read-too-big': 'store.cantPlan.read-too-big',
 };
 
 /** Get: makes the app's install plan, and opens it. */
@@ -461,7 +465,8 @@ function Installed({ p, app }: { p: Plan; app: InstalledApp }) {
 
 function refusal(p: Plan, e: unknown): string {
   const code = e instanceof Refused ? e.code : 'unknown';
-  const known = ['sign-in-not-ready', 'stale-plan', 'not-ours', 'agent-unreachable', 'agent-refused-read', 'client-failed', 'step-up-required'].includes(code);
+  const known = ['sign-in-not-ready', 'stale-plan', 'not-ours', 'agent-unreachable', 'agent-refused-read', 'agent-busy', 'read-timeout', 'read-too-big', 'client-failed',
+    'step-up-required'].includes(code);
   return known ? t(`plan.install.refused.${code}` as Key, { node: p.placement.node, app: p.app.name }) : t('plan.install.refused', { why: code });
 }
 

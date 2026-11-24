@@ -1,0 +1,117 @@
+package agent_test
+
+import (
+	"bytes"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ArjunRachithcf/homeward/internal/agent"
+	"github.com/ArjunRachithcf/homeward/internal/agent/agenttest"
+	"github.com/ArjunRachithcf/homeward/internal/testenv"
+)
+
+// An install's compose read that ends for its own reasons says so, as the plan's read does (TestAReadsEndingIsSaid),
+// not that the file is invalid: out of time is 504 read-timeout, out of memory 422 read-too-big; checking or
+// installing, nothing is written (#295).
+func TestAnInstallsReadSaysWhyItEnded(t *testing.T) {
+	testenv.Isolate(t)
+	for name, c := range map[string]struct {
+		script string
+		status int
+		code   string
+	}{
+		"its CPU limit":     {"cat >/dev/null; kill -XCPU $$", http.StatusGatewayTimeout, "read-timeout"},
+		"its own deadline":  {`cat >/dev/null; echo '{"error":"deadline"}'; exit 1`, http.StatusGatewayTimeout, "read-timeout"},
+		"the kernel's kill": {"cat >/dev/null; kill -KILL $$", http.StatusUnprocessableEntity, "read-too-big"},
+		"Go out of memory":  {"cat >/dev/null; echo 'fatal error: runtime: out of memory' >&2; exit 2", http.StatusUnprocessableEntity, "read-too-big"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testenv.Isolate(t)
+			sock, h, state := signedIn(t, agent.Config{})
+			agent.ShellReads(t, 5*time.Second, c.script)
+			for _, path := range []string{"/v1/apps/ledger?check=true", "/v1/apps/ledger"} {
+				if code, body := call(t, sock, "PUT", path, withSecrets()); code != c.status || string(body) != `{"error":"`+c.code+`"}`+"\n" {
+					t.Errorf("PUT %s: %d %s, want %d and only %s", path, code, body, c.status, c.code)
+				}
+			}
+			nothingFor(t, sock, h, state)
+		})
+	}
+}
+
+// An install whose read waits out its deadline for the one read slot, another read holding it, is busy (503): try
+// again, not a bad file (#295). The read holding it leaves its output open in a process of its own, so the agent waits
+// the child's WaitDelay past its deadline before it gives the slot back.
+func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
+	testenv.Isolate(t)
+	sock, h, state := signedIn(t, agent.Config{})
+	started := filepath.Join(t.TempDir(), "started")
+	agent.ShellReads(t, 2*time.Second, "cat >/dev/null; touch "+started+"; sleep 4 & sleep 4")
+	held := make(chan int, 1)
+	go func() {
+		resp, _ := post(t, sock, "/v1/projects/read", map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"})
+		held <- resp.StatusCode
+	}()
+	for range 100 {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if code, body := call(t, sock, "PUT", "/v1/apps/ledger?check=true", withSecrets()); code != http.StatusServiceUnavailable || string(body) != `{"error":"busy"}`+"\n" {
+		t.Errorf("an install while another read holds the slot: %d %s, want 503 and only busy", code, body)
+	}
+	if code := <-held; code != http.StatusGatewayTimeout {
+		t.Errorf("the read that held the slot: %d, want 504", code)
+	}
+	nothingFor(t, sock, h, state)
+}
+
+func nothingFor(t *testing.T, sock string, h *agenttest.Host, state string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(state, "apps", "ledger")); err == nil || h.Ran("systemctl enable /"+agent.UnitsDir) >= 0 || len(apps(t, sock).Apps) != 0 {
+		t.Error("something was written for it")
+	}
+}
+
+// A reader that panics on a file is the file's trouble to the household, invalid-compose, as any read that fails, not a
+// reader that didn't start (no-reader, which points at the machine). The child says so itself, and the panic and its
+// stack go to the agent's log, the journal, never into the answer (#295).
+func TestAReaderThatPanicsIsAnInvalidFile(t *testing.T) {
+	testenv.Isolate(t)
+	// The child itself answers.
+	child := exec.Command(os.Args[0], "agent", "read-project-panic", "--", "homerslab-web")
+	child.Stdin = strings.NewReader("services: {web: {image: x}}\n")
+	child.Dir = t.TempDir()
+	child.Env = []string{"PATH=/usr/bin:/bin"}
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	said, err := child.Output()
+	if err != nil || !strings.Contains(string(said), `"error":"invalid-compose"`) || !strings.Contains(string(said), "the reader fell over on line 7") {
+		t.Errorf("a child whose reader panics: %v, said %q; want it to answer invalid-compose with the panic", err, said)
+	}
+
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	sock, _, _ := signedIn(t, agent.Config{Log: log})
+	agent.ChildReads(t, agenttest.Executable(t), "read-project-panic", 20*time.Second, 10)
+	resp, out := post(t, sock, "/v1/projects/read", map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"})
+	if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(out), `"error":"invalid-compose"`) {
+		t.Errorf("a read whose reader panics: %d %s, want 422 invalid-compose", resp.StatusCode, out)
+	}
+	if strings.Contains(string(out), "fell over") || strings.Contains(string(out), "goroutine") {
+		t.Errorf("the answer carries the panic: %s", out)
+	}
+	if code, body := call(t, sock, "PUT", "/v1/apps/ledger?check=true", withSecrets()); code != http.StatusUnprocessableEntity || string(body) != `{"error":"invalid-compose"}`+"\n" {
+		t.Errorf("an install whose reader panics: %d %s, want 422 and only invalid-compose", code, body)
+	}
+	if got := logs.String(); strings.Count(got, "the reader fell over on line 7") < 2 || !strings.Contains(got, "goroutine") {
+		t.Errorf("the agent's log doesn't keep each panic with its stack:\n%s", got)
+	}
+}

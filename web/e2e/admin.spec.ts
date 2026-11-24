@@ -103,15 +103,24 @@ test('before first-time setup, Get says what’s missing', async ({ page, primar
   await expect(page).toHaveURL(store);
 });
 
-// The manager's two answers when the primary can't read an app (its tests make them with a real agent: manager
-// refusedread_test.go), stood in for here, since a real agent refuses its reads only as root (#293).
+// The manager's answers when the primary can't read an app (its tests make them: manager refusedread_test.go with a
+// real agent, readtrouble_test.go with the agent's own answers), stood in for here: a real agent refuses its reads only
+// as root (#293), and is busy, out of time or out of memory only with a file made to be (#295).
 const cantRead = {
-  'agent-unreachable': { status: 503, says: 'the primary didn’t answer. Try again in a moment.' },
-  'agent-refused-read': { status: 500, says: 'the primary answered, but wouldn’t read the app’s definition. The network is fine: the primary needs mending' },
+  'agent-unreachable': { status: 503, says: 'the primary didn’t answer. Try again in a moment.',
+    install: 'Not installed: study-pc didn’t answer.' },
+  'agent-refused-read': { status: 500, says: 'the primary answered, but wouldn’t read the app’s definition. The network is fine: the primary needs mending',
+    install: 'Not installed: study-pc answered, but wouldn’t read BentoPDF’s definition. The network is fine' },
+  'agent-busy': { status: 503, says: 'the primary was busy reading another app’s definition. Try again in a moment.',
+    install: 'Not installed: study-pc was busy reading another app’s definition. Try again in a moment.' },
+  'read-timeout': { status: 422, says: 'its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog’s publisher.',
+    install: 'Not installed: BentoPDF’s definition took too long to read, so study-pc stopped. Try again later' },
+  'read-too-big': { status: 422, says: 'its definition is too large to read, so the primary stopped. Trying again won’t help: tell the catalog’s publisher.',
+    install: 'Not installed: BentoPDF’s definition is too large to read, so study-pc stopped. Trying again won’t help' },
 } as const;
 
-for (const [code, { status, says }] of Object.entries(cantRead)) {
-  test(`Get says why the primary can’t plan an app: ${code} (#293)`, async ({ page, primary }) => {
+for (const [code, { status, says, install: installSays }] of Object.entries(cantRead)) {
+  test(`Get says why the primary can’t plan an app: ${code} (#293, #295)`, async ({ page, primary }) => {
     await primary.setUp();
     await page.route('**/api/v1/plans', (route) =>
       route.request().method() === 'POST' ? route.fulfill({ status, json: { error: code } }) : route.continue());
@@ -123,7 +132,7 @@ for (const [code, { status, says }] of Object.entries(cantRead)) {
     await expect(page.getByRole('heading', { level: 1 })).toHaveText('Store');
   });
 
-  test(`Install says why the primary can’t install an app: ${code} (#293)`, async ({ page, primary }) => {
+  test(`Install says why the primary can’t install an app: ${code} (#293, #295)`, async ({ page, primary }) => {
     await primary.setUp();
     await page.route('**/api/v1/plans/*/apply', (route) => route.fulfill({ status, json: { error: code } }));
     await page.goto(await primary.adminURL());
@@ -132,8 +141,7 @@ for (const [code, { status, says }] of Object.entries(cantRead)) {
     const install = page.getByRole('button', { name: 'Install', exact: true });
     await install.click();
     const alert = page.getByRole('alert');
-    await expect(alert).toContainText(code === 'agent-unreachable' ? 'Not installed: study-pc didn’t answer.'
-      : 'Not installed: study-pc answered, but wouldn’t read BentoPDF’s definition. The network is fine');
+    await expect(alert).toContainText(installSays);
     await expect(alert).not.toContainText(code);
     await expect(install).toBeEnabled();
   });

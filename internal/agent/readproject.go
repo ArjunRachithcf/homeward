@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,6 +148,8 @@ type readResult struct {
 	Project *engine.Project `json:"project,omitempty"`
 	Error   string          `json:"error,omitempty"` // not-ours, not-plain, off-floor, invalid-compose, cpu-limit or deadline
 	Detail  string          `json:"detail,omitempty"`
+	// Panic is, with invalid-compose, the reader's panic on this file and its stack, for the agent's log alone (#295).
+	Panic string `json:"panic,omitempty"`
 	// Confined is how the read ran, as the child read it back from the kernel: its user and groups, its limits and
 	// its OOM score, and the deadline and control pipe it was handed, for the tests.
 	Confined Confined `json:"confined"`
@@ -266,12 +269,14 @@ func readProjectMain(args []string, stdin io.Reader, stdout io.Writer, read func
 	file, err := io.ReadAll(io.LimitReader(stdin, 64<<10+1))
 	if err == nil {
 		var p engine.Project
-		if p, err = read(context.Background(), fs.Arg(0), file); err == nil {
+		if p, res.Panic, err = readSafely(read, fs.Arg(0), file); err == nil {
 			res.Project = &p
 		}
 	}
 	switch {
 	case err == nil:
+	case res.Panic != "":
+		res.Error, res.Detail = "invalid-compose", errReaderPanicked.Error()
 	case errors.Is(err, compose.ErrNotOurs):
 		res.Error = "not-ours"
 	case errors.Is(err, compose.ErrNotPlain):
@@ -285,6 +290,30 @@ func readProjectMain(args []string, stdin io.Reader, stdout io.Writer, read func
 		return 1
 	}
 	return 0
+}
+
+// errReaderPanicked is a read whose reader panicked on the file: to the household, a file Homeward can't read.
+var errReaderPanicked = errors.New("the compose reader failed on this file")
+
+// maxPanic is how much of a reader's panic and stack the child answers: the stack of the one goroutine that panicked,
+// whose frames are the reader's.
+const maxPanic = 16 << 10
+
+// readSafely reads the file with read, and recovers a panic in it: a reader's bug on one file is that file's
+// invalid-compose, not a child that ended without an answer, which the agent would take for a reader that didn't start
+// (no-reader). It returns the panic and its stack (at most maxPanic bytes), for the agent's log.
+func readSafely(read func(ctx context.Context, name string, file []byte) (engine.Project, error), name string, file []byte) (p engine.Project, panicked string, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			panicked = fmt.Sprintf("panic: %v\n\n%s", v, debug.Stack())
+			if len(panicked) > maxPanic {
+				panicked = panicked[:maxPanic]
+			}
+			p, err = engine.Project{}, errReaderPanicked
+		}
+	}()
+	p, err = read(context.Background(), name, file)
+	return p, "", err
 }
 
 // controlPipe checks that f is the read end of a pipe: anything else could stay open after the agent is gone.

@@ -117,6 +117,9 @@ func showPlan(ctx context.Context, env Env, socket string, asJSON bool, method, 
 		case "household-not-set-up":
 			return errors.New("the household isn't set up yet: first-time setup comes first (sudo homeward setup link)")
 		}
+		if why, ok := cantRead[ae.Code]; ok {
+			return errors.New("Homeward can't plan this app: " + why)
+		}
 	}
 	if err != nil {
 		return err
@@ -127,6 +130,15 @@ func showPlan(ctx context.Context, env Env, socket string, asJSON bool, method, 
 	}
 	planWords(env.Stdout, p)
 	return nil
+}
+
+// cantRead is why the primary can't read an app's definition, by the manager's code, in Admin's words (#293, #295).
+var cantRead = map[string]string{
+	"agent-unreachable":  "the primary didn't answer. Try again in a moment",
+	"agent-refused-read": "the primary answered, but wouldn't read the app's definition. The network is fine: the primary needs mending, and sudo journalctl -u homeward-agent there says why (most often a missing read user or permission)",
+	"agent-busy":         "the primary was busy reading another app's definition. Try again in a moment",
+	"read-timeout":       "its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher",
+	"read-too-big":       "its definition is too large to read, so the primary stopped. Trying again won't help: tell the catalog's publisher",
 }
 
 // planWords says a plan in plain words, as Admin's plan page does.

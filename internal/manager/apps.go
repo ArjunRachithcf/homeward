@@ -166,9 +166,7 @@ func (m *Manager) apply(w http.ResponseWriter, r *http.Request, terminal bool) {
 	case errors.As(err, &refused):
 		fail(w, http.StatusUnprocessableEntity, refused.Code)
 		return
-	case errors.Is(err, errReadRefused):
-		m.log.Error("the agent refused to read an app's compose file, to apply its plan; its log says why", "plan", p.ID, "err", err)
-		fail(w, http.StatusInternalServerError, errReadRefused.Error())
+	case m.failRead(w, err, "to apply its plan", "plan", p.ID):
 		return
 	case err != nil:
 		m.log.Warn("making the plan again, to apply it", "plan", p.ID, "err", err)
@@ -251,14 +249,12 @@ func (m *Manager) apply(w http.ResponseWriter, r *http.Request, terminal bool) {
 	// the edge serves the app's name; then the app.
 	agentFailed := func(err error) {
 		var e *agentError
+		if errors.As(err, &e) && m.failRead(w, readTrouble(e.Status, e.Code), "to install it", "app", a.ID, "plan", p.ID, "answered", err.Error()) {
+			return
+		}
 		if errors.As(err, &e) && e.Status/100 == 4 {
 			m.log.Error("the agent refused an app", "app", a.ID, "plan", p.ID, "code", e.Code)
 			fail(w, http.StatusUnprocessableEntity, e.Code)
-			return
-		}
-		if errors.As(err, &e) && readRefusal(e.Status, e.Code) {
-			m.log.Error("the agent refused to read an app's compose file, to install it; its log says why", "app", a.ID, "plan", p.ID, "err", err)
-			fail(w, http.StatusInternalServerError, errReadRefused.Error())
 			return
 		}
 		m.log.Error("installing an app", "app", a.ID, "err", err)

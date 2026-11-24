@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os/exec"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func SuidDumpableFrom(t *testing.T, file string) {
 // ReadWithEveryChildAlive reads with as many children alive as reads may have, and says whether it was refused as busy
 // and whether it went on to make its child's command.
 func ReadWithEveryChildAlive(t *testing.T) (busy, made bool) {
-	rs := newReads("")
+	rs := newReads("", slog.New(slog.DiscardHandler))
 	for range maxLiveReads {
 		rs.live <- struct{}{}
 	}

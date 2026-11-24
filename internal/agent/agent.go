@@ -311,7 +311,7 @@ func New(ctx context.Context, c Config) (*Agent, error) {
 			return !errors.Is(err, fs.ErrNotExist)
 		}
 	}
-	a := &Agent{cfg: c, log: c.Log, fw: &firewall.Firewall{Run: c.Run, Now: c.Now}, refused: map[string]bool{}, reads: newReads(c.Executable)}
+	a := &Agent{cfg: c, log: c.Log, fw: &firewall.Firewall{Run: c.Run, Now: c.Now}, refused: map[string]bool{}, reads: newReads(c.Executable, c.Log)}
 	if c.StateDir != "" {
 		a.fw.SavePath = filepath.Join(c.StateDir, "firewall.nft")
 	}
@@ -788,17 +788,7 @@ func (a *Agent) readProject(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, p)
-	case errors.Is(err, errBusy):
-		fail(w, http.StatusServiceUnavailable, "busy")
-	case errors.Is(err, errReadTimeout):
-		a.log.Warn("a compose read ran out of time", "project", req.Project)
-		fail(w, http.StatusGatewayTimeout, "read-timeout")
-	case errors.Is(err, errReadTooBig):
-		a.log.Warn("a compose read ran out of memory", "project", req.Project)
-		fail(w, http.StatusUnprocessableEntity, "read-too-big")
-	case errors.Is(err, errNoReader):
-		a.log.Error("starting a compose read", "err", err)
-		fail(w, http.StatusInternalServerError, "no-reader")
+	case a.readTrouble(w, err, req.Project):
 	case errors.Is(err, compose.ErrNotOurs):
 		fail(w, http.StatusBadRequest, "not-ours")
 	case errors.Is(err, compose.ErrNotPlain):
@@ -808,6 +798,30 @@ func (a *Agent) readProject(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "invalid-compose", "detail": err.Error()})
 	}
+}
+
+// readTrouble answers a compose read that ended for a reason other than the file's contents, and says whether it did:
+// another read held the slot (503 busy, try again), the read ran out of time (504 read-timeout) or memory (422
+// read-too-big), or the agent couldn't start it (500 no-reader, the machine's to mend). A plan's read and an install's
+// answer them alike (#293, #295).
+func (a *Agent) readTrouble(w http.ResponseWriter, err error, project string) bool {
+	switch {
+	case errors.Is(err, errBusy):
+		a.log.Warn("a compose read waited for another to end", "project", project)
+		fail(w, http.StatusServiceUnavailable, "busy")
+	case errors.Is(err, errReadTimeout):
+		a.log.Warn("a compose read ran out of time", "project", project)
+		fail(w, http.StatusGatewayTimeout, "read-timeout")
+	case errors.Is(err, errReadTooBig):
+		a.log.Warn("a compose read ran out of memory", "project", project)
+		fail(w, http.StatusUnprocessableEntity, "read-too-big")
+	case errors.Is(err, errNoReader):
+		a.log.Error("starting a compose read", "project", project, "err", err)
+		fail(w, http.StatusInternalServerError, "no-reader")
+	default:
+		return false
+	}
+	return true
 }
 
 // ReadDeadline is how long a compose read may take before the agent stops it. The manager waits longer, so that it
@@ -1014,13 +1028,14 @@ type reads struct {
 	slot chan struct{}
 	live chan struct{}
 	exe  string
+	log  *slog.Logger // where a reader's panic goes: the agent's log, the journal
 }
 
 // maxLiveReads is how many read children may be alive at once: the one reading, and those left behind stopped.
 const maxLiveReads = 4
 
-func newReads(exe string) *reads {
-	return &reads{slot: make(chan struct{}, 1), live: make(chan struct{}, maxLiveReads), exe: exe}
+func newReads(exe string, log *slog.Logger) *reads {
+	return &reads{slot: make(chan struct{}, 1), live: make(chan struct{}, maxLiveReads), exe: exe, log: log}
 }
 
 // readCredential is who a read's child runs as: when the agent is root, homeward-read (readUser) with no groups, or
@@ -1196,6 +1211,9 @@ func (rs *reads) read(ctx context.Context, name string, file []byte) (engine.Pro
 			return engine.Project{}, errReadTooBig
 		}
 		return engine.Project{}, fmt.Errorf("%w: %v (%v) %s", errNoReader, err, runErr, strings.TrimSpace(said))
+	}
+	if res.Panic != "" { // invalid-compose to the household; the reader's bug, for whoever mends it (#295)
+		rs.log.Error("the compose reader panicked on an app's compose file", "project", name, "panic", res.Panic)
 	}
 	switch res.Error {
 	case "cpu-limit", "deadline":

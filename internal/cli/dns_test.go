@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ func routedControl(t *testing.T, answers map[string][2]string) (string, *[]strin
 		}
 		code := http.StatusOK
 		if a[0] != "" {
-			code = map[string]int{"400": 400, "409": 409, "502": 502}[a[0]]
+			code, _ = strconv.Atoi(a[0])
 		}
 		w.WriteHeader(code)
 		_, _ = w.Write([]byte(a[1]))

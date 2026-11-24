@@ -219,15 +219,65 @@ func (e *agentRefused) Error() string {
 	return fmt.Sprintf("the agent answered %d %s: %s", e.Status, e.Code, e.Detail)
 }
 
-// errReadRefused is the agent answering, but refusing a compose read: it couldn't start the read's child (as root, its
-// read user missing, a permission refused, or the check that the child starts not dumpable failing). The network is
-// fine; the primary needs mending (#293).
-var errReadRefused = errors.New("agent-refused-read")
+// The agent's compose read ending for a reason other than the file's contents, as the manager says each (#293, #295):
+//   - errReadRefused: the agent answered, but couldn't start the read's child (as root, its read user missing, a
+//     permission refused, or the check that the child starts not dumpable failing). The network is fine; the primary
+//     needs mending;
+//   - errReadBusy: another read held the agent's one read slot until this one's deadline. Try again;
+//   - errReadTimeout, errReadTooBig: the read ran out of time or memory, within the bounds the agent sets every read.
+//     The app's definition is too slow or too large to read.
+var (
+	errReadRefused = errors.New("agent-refused-read")
+	errReadBusy    = errors.New("agent-busy")
+	errReadTimeout = errors.New("read-timeout")
+	errReadTooBig  = errors.New("read-too-big")
+)
 
-// readRefusal says whether the agent's answer, its status and error code, refuses a compose read: 500 no-reader, from
-// a read or from an install's.
-func readRefusal(status int, code string) bool {
-	return status == http.StatusInternalServerError && code == "no-reader"
+// readTrouble is the manager's error for the agent's answer, its status and error code, to a compose read, from a
+// read or from an install's: one of the errors above, or nil for any other answer.
+func readTrouble(status int, code string) error {
+	switch {
+	case status == http.StatusInternalServerError && code == "no-reader":
+		return errReadRefused
+	case status == http.StatusServiceUnavailable && code == "busy":
+		return errReadBusy
+	case status == http.StatusGatewayTimeout && code == "read-timeout":
+		return errReadTimeout
+	case status == http.StatusUnprocessableEntity && code == "read-too-big":
+		return errReadTooBig
+	}
+	return nil
+}
+
+// readTroubleStatus is the manager's status for a readTrouble error: the primary's trouble is 500 or 503, the app
+// definition's 422.
+func readTroubleStatus(err error) int {
+	switch {
+	case errors.Is(err, errReadRefused):
+		return http.StatusInternalServerError
+	case errors.Is(err, errReadBusy):
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusUnprocessableEntity
+}
+
+// failRead answers a compose read's trouble (readTrouble) with its code alone, and logs it with where it came from,
+// as an error when the primary needs mending; it says whether err was one.
+func (m *Manager) failRead(w http.ResponseWriter, err error, where string, args ...any) bool {
+	for _, trouble := range []error{errReadRefused, errReadBusy, errReadTimeout, errReadTooBig} {
+		if !errors.Is(err, trouble) {
+			continue
+		}
+		args = append(args, "err", err)
+		if trouble == errReadRefused {
+			m.log.Error("the agent refused to read an app's compose file, "+where+"; its log says why", args...)
+		} else {
+			m.log.Warn("the agent's read of an app's compose file, "+where+", ended", args...)
+		}
+		fail(w, readTroubleStatus(trouble), trouble.Error())
+		return true
+	}
+	return false
 }
 
 // readProject asks the agent to read an app's compose file as the project name, through the Compose SDK.
@@ -251,8 +301,8 @@ func (a *agentClient) readProject(ctx context.Context, name string, compose []by
 		e := &agentRefused{Status: resp.StatusCode}
 		var b struct{ Error, Detail string }
 		decoded := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&b) == nil
-		if decoded && readRefusal(resp.StatusCode, b.Error) {
-			return p, fmt.Errorf("%w: the agent answered %s %s", errReadRefused, resp.Status, b.Error)
+		if trouble := readTrouble(resp.StatusCode, b.Error); decoded && trouble != nil {
+			return p, fmt.Errorf("%w: the agent answered %s %s", trouble, resp.Status, b.Error)
 		}
 		if !decoded || resp.StatusCode/100 != 4 {
 			return p, fmt.Errorf("the agent answered %s", resp.Status)

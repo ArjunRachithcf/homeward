@@ -122,6 +122,23 @@ func TestApplyingSaysWhetherTheAgentIsUnreachableOrRefusedItsRead(t *testing.T) 
 // whose compose read it refuses (agent: TestAnInstallWhoseReadIsRefusedSaysSo). It counts them.
 func refuseInstalls(t *testing.T, p *primary, check bool) *atomic.Int32 {
 	t.Helper()
+	return answerInstead(t, p, installs(check), http.StatusInternalServerError, "no-reader")
+}
+
+// installs matches the agent's installs: with check, only the check that comes first; without, only the install after.
+func installs(check bool) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		return r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/apps/") && (r.URL.Query().Get("check") == "true") == check
+	}
+}
+
+// reads matches the agent's compose reads.
+func reads(r *http.Request) bool { return r.Method == http.MethodPost && r.URL.Path == "/v1/projects/read" }
+
+// answerInstead puts a socket in front of p's agent that passes everything to it but the requests match picks, which it
+// answers status with only the error code, as the agent does. It counts them.
+func answerInstead(t *testing.T, p *primary, match func(*http.Request) bool, status int, code string) *atomic.Int32 {
+	t.Helper()
 	real := p.agent
 	sock := filepath.Join(t.TempDir(), "front.sock")
 	ln, err := net.Listen("unix", sock)
@@ -134,12 +151,12 @@ func refuseInstalls(t *testing.T, p *primary, check bool) *atomic.Int32 {
 	}}
 	var n atomic.Int32
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/apps/") && (r.URL.Query().Get("check") == "true") == check {
+		if match(r) {
 			n.Add(1)
 			_, _ = io.Copy(io.Discard, r.Body)
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"no-reader"}` + "\n"))
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"` + code + `"}` + "\n"))
 			return
 		}
 		proxy.ServeHTTP(w, r)
