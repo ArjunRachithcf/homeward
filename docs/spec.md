@@ -545,8 +545,9 @@ Stories 120–121 are decided in #87.
       remove them first (or keep them on a separate account). Refusing locks nobody out: whoever asks is an admin
       already, the first admin is a new account, and `homeward admin recover` enrols a passkey without changing a role;
     - with Kanidm, a person makes their own app passwords in Kanidm's settings, an admin too, and Homeward can't stop
-      it there; Authentik's settings and console allow the same. So every pass of the manager's schedule reads every
-      admin's app passwords and ends them, with a security event per admin that says the way;
+      it there; Authentik's settings and console allow the same. So every pass of the manager's schedule reads the app passwords of
+      every member of the admins' group (an account the console made or put there included, inactive ones too) and
+      ends them, with a security event per admin that says the way, or that they couldn't be ended;
 - optional SSH sign-in on nodes: SSSD with Authentik, kanidm-unixd with Kanidm;
 - a report of what it can do.
 

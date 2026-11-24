@@ -413,38 +413,37 @@ func (a *Authentik) RevokeAppPasswords(ctx context.Context, username string) err
 }
 
 // EndAdminAppPasswords deletes the app passwords of every admin who holds one that still binds, and says whose they
-// were (#281). Authentik's own settings let anyone make themselves an app password, an admin too. One admin's failure
-// spares no other.
-func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]string, error) {
-	admins, err := a.People(ctx, idp.Admin)
+// were (#281). Authentik's own settings let anyone make themselves an app password, an admin too. The admins are every
+// member of the admins' group, checked by the group's pk: an internal account the console made (on another path, or
+// inactive, which can be made active again) is an admin as much as Homeward's own, since Admin reads only the groups.
+// One admin's failure spares no other.
+func (a *Authentik) EndAdminAppPasswords(ctx context.Context) ([]idp.AdminAppPasswords, error) {
+	g, err := a.adminGroup(ctx)
 	if err != nil {
 		return nil, err
 	}
-	ended := []string{}
+	us, err := list[user](ctx, a.api, "/core/users/?groups_by_pk="+q(g))
+	if err != nil {
+		return nil, err
+	}
+	found := []idp.AdminAppPasswords{}
 	var errs []error
-	for _, p := range admins {
-		u, err := a.person(ctx, p.Username)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+	for _, u := range us {
+		if u.Type != "internal" || !slices.Contains(u.Groups, g) { // the filter is checked, never trusted (#219)
 			continue
 		}
-		ts, err := a.appPasswords(ctx, u)
+		ts, err := a.appPasswords(ctx, &u)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", p.Username, err))
+			errs = append(errs, fmt.Errorf("%s's app passwords: %w", u.Username, err))
 			continue
 		}
 		if liveAppPasswords(ts) == 0 {
 			continue
 		}
-		if err := a.revokeAppPasswords(ctx, ts); err != nil {
-			// Not ended: the error names them, and the next pass tries again.
-			errs = append(errs, fmt.Errorf("%s holds app passwords still: %w", p.Username, err))
-			continue
-		}
-		ended = append(ended, p.Username)
+		found = append(found, idp.AdminAppPasswords{Username: u.Username, Err: a.revokeAppPasswords(ctx, ts)})
 	}
-	slices.Sort(ended)
-	return ended, errors.Join(errs...)
+	slices.SortFunc(found, func(x, y idp.AdminAppPasswords) int { return strings.Compare(x.Username, y.Username) })
+	return found, errors.Join(errs...)
 }
 
 type ldapProviderObj struct {

@@ -241,6 +241,12 @@ type LDAPCredentials struct {
 	Created bool
 }
 
+// AdminAppPasswords is an admin found holding app passwords. Err says why they couldn't be ended; nil, they were.
+type AdminAppPasswords struct {
+	Username string
+	Err      error
+}
+
 // LDAP is a provider that serves apps over LDAP through an outpost of its own: the sign-in listener's port 636 leads to
 // it (ADR 0020). People bind with an app password, never their passkey (LDAP can't carry one).
 type LDAP interface {
@@ -266,7 +272,8 @@ type LDAP interface {
 	// returns, none of them binds anywhere.
 	RevokeAppPasswords(ctx context.Context, username string) error
 	// EndAdminAppPasswords finds every admin holding an app password, whoever made it (with Kanidm, a person makes
-	// their own, an admin too), ends those passwords, and says whose they were, so the manager raises a security
-	// event for each (#281).
-	EndAdminAppPasswords(ctx context.Context) ([]string, error)
+	// their own, an admin too), and whoever made the admin (the provider's console included: every member of the
+	// admins' group, inactive ones too), ends those passwords, and says whose they were and where it failed, so the
+	// manager raises a security event for each (#281). Its error says what it couldn't read.
+	EndAdminAppPasswords(ctx context.Context) ([]AdminAppPasswords, error)
 }

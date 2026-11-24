@@ -222,11 +222,33 @@ func TestEveryPassEndsAnAdminsAppPasswordsAsASecurityEvent(t *testing.T) {
 		}
 		return out
 	}
-	if w := warnings(); len(w) != 1 || !strings.HasPrefix(w[0], "security:app-passwords:ines ") || !strings.Contains(w[0], "separate account") {
+	if w := warnings(); len(w) != 1 || !strings.HasPrefix(w[0], "security:app-passwords:ines ") || !strings.Contains(w[0], "ended them") ||
+		!strings.Contains(w[0], "separate account") {
 		t.Errorf("the security events: %q, want one for ines saying the way", w)
 	}
 	p.m.RunDue(context.Background())
 	if w := warnings(); len(w) != 1 {
 		t.Errorf("after a second pass: %q, want the one event still", w)
+	}
+}
+
+// An admin's app passwords that couldn't be ended are a security event too, which says so (#281's review).
+func TestAnAdminsAppPasswordsThatCouldntEndAreASecurityEvent(t *testing.T) {
+	testenv.Isolate(t)
+	p, fs := installable(t, nil)
+	fs.mu.Lock()
+	fs.appPasswords["ines"], fs.endFails = 1, errors.New("the household account refused the delete")
+	fs.mu.Unlock()
+	p.m.RunDue(context.Background())
+	var w []struct{ Source, What, Resolved string }
+	_ = json.Unmarshal(p.control("GET", "/api/v1/warnings", nil).Body, &w)
+	var got []string
+	for _, x := range w {
+		if x.Source == "security:app-passwords:ines" && x.Resolved == "" {
+			got = append(got, x.What)
+		}
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "couldn't end them") || strings.Contains(got[0], "ended them") {
+		t.Errorf("the security events: %q, want one saying Homeward couldn't end them", got)
 	}
 }

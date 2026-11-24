@@ -980,7 +980,7 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 			return err
 		}
 		if n := liveAppPasswords(ts); n > 0 {
-			return fmt.Errorf("authentik: %s holds %d app passwords for LDAP apps; remove them first, or keep them on a separate account: %w",
+			return fmt.Errorf("authentik: %s holds %d app passwords; remove them first, or keep them on a separate account that isn't an admin: %w",
 				p.Username, n, idp.ErrAdminAppPassword)
 		}
 	}

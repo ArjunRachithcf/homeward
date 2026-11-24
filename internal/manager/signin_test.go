@@ -73,6 +73,7 @@ type fakeSignIn struct {
 	// appPasswords counts each person's app passwords (#281); ended lists the admins whose EndAdminAppPasswords ended.
 	appPasswords map[string]int
 	ended        []string
+	endFails     error // when set, every admin's app passwords fail to end
 }
 
 func newFakeSignIn(t *testing.T) *fakeSignIn {
@@ -367,18 +368,23 @@ func (f *fakeSignIn) RevokeAppPasswords(_ context.Context, u string) error {
 	return nil
 }
 
-func (f *fakeSignIn) EndAdminAppPasswords(context.Context) ([]string, error) {
+func (f *fakeSignIn) EndAdminAppPasswords(context.Context) ([]idp.AdminAppPasswords, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := []string{}
+	out := []idp.AdminAppPasswords{}
 	for u, n := range f.appPasswords {
-		if n > 0 && f.people[u].Role == idp.Admin {
-			out = append(out, u)
-			delete(f.appPasswords, u)
+		if n == 0 || f.people[u].Role != idp.Admin {
+			continue
 		}
+		if f.endFails != nil {
+			out = append(out, idp.AdminAppPasswords{Username: u, Err: f.endFails})
+			continue
+		}
+		out = append(out, idp.AdminAppPasswords{Username: u})
+		f.ended = append(f.ended, u)
+		delete(f.appPasswords, u)
 	}
-	slices.Sort(out)
-	f.ended = append(f.ended, out...)
+	slices.SortFunc(out, func(x, y idp.AdminAppPasswords) int { return strings.Compare(x.Username, y.Username) })
 	return out, nil
 }
 

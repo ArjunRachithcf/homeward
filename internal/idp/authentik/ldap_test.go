@@ -85,6 +85,24 @@ func (w *world) OwnAppPassword(t *testing.T, slug, username string) string {
 	return k.Key
 }
 
+// ConsoleAdmin makes an internal account as Authentik's console does, at its default path, and adds it to the admins'
+// group by hand.
+func (w *world) ConsoleAdmin(t *testing.T, username string) {
+	t.Helper()
+	var gs struct {
+		Results []struct {
+			PK   string `json:"pk"`
+			Name string `json:"name"`
+		}
+	}
+	w.raw(t, w.own, "GET", "/api/v3/core/groups/?name="+idp.RoleGroup(idp.Admin), nil, &gs)
+	if len(gs.Results) != 1 || gs.Results[0].Name != idp.RoleGroup(idp.Admin) {
+		t.Fatalf("the admins' group: %+v", gs.Results)
+	}
+	w.raw(t, w.own, "POST", "/api/v3/core/users/", map[string]any{"username": username, "name": username, "path": "users",
+		"type": "internal", "is_active": true, "groups": []string{gs.Results[0].PK}}, nil)
+}
+
 func (w *world) Search(t *testing.T, dn, password, base string) ([]ldaptest.Entry, error) {
 	t.Helper()
 	c, err := net.DialTimeout("tcp", outpostLDAP, 5*time.Second)

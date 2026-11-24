@@ -86,12 +86,18 @@ func (m *Manager) endAdminAppPasswords(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	ended, err := directory.EndAdminAppPasswords(ctx)
-	for _, who := range ended {
-		m.log.Error("ended an admin's app passwords", "username", who)
-		m.warnOnce(ctx, warnAppPasswords+who, "security: "+who+" held app passwords for LDAP apps, which an admin never does, so "+
-			"Homeward ended them. An admin uses LDAP apps with a separate account that isn't an admin; if "+who+" didn't make them, "+
-			"check what else changed on their account.")
+	found, err := directory.EndAdminAppPasswords(ctx)
+	for _, f := range found {
+		what := "security: " + f.Username + " held app passwords, which an admin never does, so Homeward ended them."
+		if f.Err != nil {
+			m.log.Error("couldn't end an admin's app passwords", "username", f.Username, "err", f.Err)
+			what = "security: " + f.Username + " holds app passwords, which an admin never does, and Homeward couldn't end " +
+				"them; it tries again at every pass."
+		} else {
+			m.log.Error("ended an admin's app passwords", "username", f.Username)
+		}
+		m.warnOnce(ctx, warnAppPasswords+f.Username, what+" An admin uses LDAP apps with a separate account that isn't an "+
+			"admin; if "+f.Username+" didn't make them, check what else changed on their account.")
 	}
 	return err
 }

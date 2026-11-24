@@ -133,45 +133,65 @@ func TestAnAppPasswordMadeAsItsPersonIsPromotedEnds(t *testing.T) {
 	}
 }
 
+// names are the admins found, each "name" or "name (failed)".
+func names(found []idp.AdminAppPasswords) []string {
+	out := []string{}
+	for _, f := range found {
+		if f.Err != nil {
+			out = append(out, f.Username+" (failed)")
+		} else {
+			out = append(out, f.Username)
+		}
+	}
+	return out
+}
+
 func TestTheAdminsAppPasswordsEnd(t *testing.T) {
 	testenv.Isolate(t)
 	f := withPeople()
 	a := f.open(t)
 	past := time.Now().Add(-time.Hour)
 	f.objs["/core/users/"] = append(f.objs["/core/users/"],
-		map[string]any{"pk": 3, "username": "bea", "type": "internal", "path": userPath, "is_active": true, "groups": []any{"group-admin"}})
+		map[string]any{"pk": 3, "username": "bea", "type": "internal", "path": userPath, "is_active": true, "groups": []any{"group-admin"}},
+		// Admins the console made, outside Homeward's path, one inactive (it can be made active again); a service account
+		// in the group, which signs in to nothing; someone of the console's in another group only.
+		map[string]any{"pk": 4, "username": "carla", "type": "internal", "path": "users", "is_active": true, "groups": []any{"group-admin"}},
+		map[string]any{"pk": 5, "username": "dora", "type": "internal", "path": "users", "is_active": false, "groups": []any{"group-admin"}},
+		map[string]any{"pk": 6, "username": "svc", "type": "service_account", "path": "users", "is_active": true, "groups": []any{"group-admin"}},
+		map[string]any{"pk": 7, "username": "eva", "type": "internal", "path": "users", "is_active": true, "groups": []any{"group-authentik-admins"}})
 	f.objs["/core/tokens/"] = []map[string]any{token("lenas", 1, nil), token("olgas", 2, nil), token("olgas-2", 2, nil),
-		token("beas-old", 3, &past), {"pk": "olgas-api", "identifier": "olgas-api", "intent": "api", "user": 2}}
+		token("beas-old", 3, &past), {"pk": "olgas-api", "identifier": "olgas-api", "intent": "api", "user": 2},
+		token("carlas", 4, nil), token("doras", 5, nil), token("svcs", 6, nil), token("evas", 7, nil)}
 	got, err := a.EndAdminAppPasswords(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got, []string{"olga"}) {
-		t.Errorf("ended: %v, want olga's alone (bea's is expired, lena isn't an admin)", got)
+	if n := names(got); !slices.Equal(n, []string{"carla", "dora", "olga"}) {
+		t.Errorf("ended: %v, want the admins' (the console's on any path, inactive included; bea's is expired, lena isn't one)", n)
 	}
-	if ts := f.tokens(); !slices.Equal(ts, []string{"lenas", "beas-old", "olgas-api"}) {
-		t.Errorf("left: %v, want the adult's, the expired one and the API token", ts)
+	if ts := f.tokens(); !slices.Equal(ts, []string{"lenas", "beas-old", "olgas-api", "svcs", "evas"}) {
+		t.Errorf("left: %v, want the adult's, the expired one, the API token, the service account's and the non-admin's", ts)
 	}
 	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || len(got) != 0 {
 		t.Errorf("again: %v %v, want nobody", got, err)
 	}
 }
 
-// An admin whose app passwords couldn't be deleted isn't said to be ended: the error names them, and the next pass
-// tries again.
-func TestAnAdminsAppPasswordsThatDidntEndArentSaidToHave(t *testing.T) {
+// An admin whose app passwords couldn't be deleted is found all the same, with the failure: the manager says so, and
+// the next pass tries again.
+func TestAnAdminsAppPasswordsThatDidntEndAreSaidSo(t *testing.T) {
 	testenv.Isolate(t)
 	f := withPeople()
 	a := f.open(t)
 	f.objs["/core/tokens/"] = []map[string]any{token("olgas", 2, nil)}
 	f.refuse = "DELETE /core/tokens/"
 	got, err := a.EndAdminAppPasswords(context.Background())
-	if err == nil || len(got) != 0 {
-		t.Errorf("with the delete refused: %v %v, want nobody ended and an error", got, err)
+	if n := names(got); err != nil || !slices.Equal(n, []string{"olga (failed)"}) {
+		t.Errorf("with the delete refused: %v %v, want olga, failed", n, err)
 	}
 	f.refuse = ""
-	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || !slices.Equal(got, []string{"olga"}) {
-		t.Errorf("the next pass: %v %v, want olga's ended", got, err)
+	if got, err := a.EndAdminAppPasswords(context.Background()); err != nil || !slices.Equal(names(got), []string{"olga"}) {
+		t.Errorf("the next pass: %v %v, want olga's ended", names(got), err)
 	}
 }
 

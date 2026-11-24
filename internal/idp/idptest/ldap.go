@@ -29,6 +29,9 @@ type LDAPWorld interface {
 	// settings, and returns it: Kanidm has everyone make their own, and Authentik's settings let anyone. Homeward's
 	// refusals aren't in the way there, so an admin can make one too (#281).
 	OwnAppPassword(t *testing.T, slug, username string) string
+	// ConsoleAdmin makes an account in the provider's own console, outside Homeward, and puts it straight into the
+	// admins' group, as an admin of the provider could: Admin takes it for an admin, as it reads only the groups.
+	ConsoleAdmin(t *testing.T, username string)
 }
 
 // RunLDAP runs the LDAP contract: an app's provider opens to its roles only, a person sees nobody but themselves, and
@@ -402,15 +405,24 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 		if shared.BaseDN == "" {
 			t.Skip("no app for it")
 		}
+		w.ConsoleAdmin(t, "carla")
 		bea, olga, maria := w.OwnAppPassword(t, notes.Slug, "bea"), w.OwnAppPassword(t, notes.Slug, "olga"), password(notes, "maria")
+		carla := w.OwnAppPassword(t, notes.Slug, "carla")
 		if err := ready(shared, "bea", bea); err != nil {
 			t.Fatalf("an admin, with the app password she made herself: %v", err)
 		}
-		ended, err := l.EndAdminAppPasswords(ctx)
+		found, err := l.EndAdminAppPasswords(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, who := range []string{"bea", "olga"} {
+		var ended []string
+		for _, f := range found {
+			if f.Err != nil {
+				t.Errorf("%s's app passwords didn't end: %v", f.Username, f.Err)
+			}
+			ended = append(ended, f.Username)
+		}
+		for _, who := range []string{"bea", "olga", "carla"} {
 			if !slices.Contains(ended, who) {
 				t.Errorf("ended %v: no %s", ended, who)
 			}
@@ -420,9 +432,12 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 				t.Errorf("ended %v: %s isn't an admin", ended, who)
 			}
 		}
-		for who, pw := range map[string]string{"bea": bea, "olga": olga} {
+		for who, pw := range map[string]string{"bea": bea, "olga": olga, "carla": carla} {
 			if err := w.Bind(t, dn(shared, who), pw); err == nil {
 				t.Errorf("%s's app password, ended, still bound", who)
+			}
+			if who == "carla" {
+				continue // not one of the household's people: Credentials doesn't know her
 			}
 			if c, err := p.Credentials(ctx, who); err != nil || slices.Contains(c.Others, idp.CredToken) {
 				t.Errorf("%s's credentials once ended: %+v %v", who, c, err)
