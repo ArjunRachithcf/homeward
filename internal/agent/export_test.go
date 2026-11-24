@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,6 +51,9 @@ func ChildDir() (string, error) {
 	}
 	return childDir(cred)
 }
+
+// ReadingMarker is what a read's child writes to its standard error just before its reader reads the file.
+const ReadingMarker = readingMarker
 
 // RaceDetector says whether the tests run under the race detector, which the child's memory limit leaves alone.
 const RaceDetector = raceDetector
@@ -108,7 +113,7 @@ func SuidDumpableFrom(t *testing.T, file string) {
 // ReadWithEveryChildAlive reads with as many children alive as reads may have, and says whether it was refused as busy
 // and whether it went on to make its child's command.
 func ReadWithEveryChildAlive(t *testing.T) (busy, made bool) {
-	rs := newReads("")
+	rs := newReads("", slog.New(slog.DiscardHandler))
 	for range maxLiveReads {
 		rs.live <- struct{}{}
 	}
@@ -117,6 +122,26 @@ func ReadWithEveryChildAlive(t *testing.T) (busy, made bool) {
 	t.Cleanup(func() { readCommand = old })
 	_, err := rs.read(context.Background(), "homerslab-web", []byte("services: {web: {image: x}}\n"))
 	return errors.Is(err, errBusy), made
+}
+
+// HeldReads gives reads d, and makes every read, once it holds the read slot, say so on started and wait for release
+// before it goes on, to fail without a child (no-reader). The slot is the agent's until then, deterministically.
+func HeldReads(t *testing.T, d time.Duration) (started <-chan struct{}, release func()) {
+	oldDeadline, oldCommand := readDeadline, readCommand
+	in, out := make(chan struct{}, 1), make(chan struct{})
+	readDeadline = d
+	readCommand = func(string) ([]string, error) { // called with the slot taken (reads.read, readArgv)
+		select {
+		case in <- struct{}{}:
+		default:
+		}
+		<-out
+		return nil, errors.New("held, then let go, in this test")
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(out) }) }
+	t.Cleanup(func() { release(); readDeadline, readCommand = oldDeadline, oldCommand })
+	return in, release
 }
 
 // NoReadCommand makes every read fail before its child starts: the agent finds no command for it. It returns a

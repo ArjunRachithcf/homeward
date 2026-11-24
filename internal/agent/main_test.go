@@ -31,7 +31,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("HOMEWARD_TEST_PEEK") != "" && (len(os.Args) < 2 || os.Args[1] != "agent") {
 		os.Exit(peek())
 	}
-	// Read children that misbehave, confined as the real one is: one burns CPU, one allocates until it can't.
+	// Read children that misbehave, confined as the real one is: one burns CPU, one allocates until it can't, one panics.
 	if len(os.Args) > 2 && os.Args[1] == "agent" {
 		switch os.Args[2] {
 		case "read-project-burn":
@@ -46,6 +46,18 @@ func TestMain(m *testing.M) {
 				time.Sleep(time.Hour)
 				return engine.Project{}, nil
 			}))
+		case "read-project-panic": // a reader with a bug that panics on this file (#295)
+			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
+				panic("the reader fell over on line 7")
+			}))
+		case "read-project-panic-elsewhere": // its panic in a goroutine of the reader's own, which no recover reaches
+			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
+				go panic("the reader's helper fell over on line 9")
+				time.Sleep(time.Hour)
+				return engine.Project{}, nil
+			}))
+		case "read-project-panic-early": // a panic before the child reads, as one in confine would be
+			panic("confining fell over")
 		case "read-project-hog":
 			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
 				for {
@@ -102,7 +114,12 @@ func peek() int {
 		return 1
 	}
 	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
-	if line, err := bufio.NewReader(stderr).ReadString('\n'); err != nil || line != "reading\n" {
+	childSaid := bufio.NewReader(stderr)
+	line, err := childSaid.ReadString('\n')
+	if line == agent.ReadingMarker { // the child's own, just before its reader
+		line, err = childSaid.ReadString('\n')
+	}
+	if err != nil || line != "reading\n" {
 		fmt.Fprintf(os.Stderr, "the child didn't read: %q %v\n", line, err)
 		return 1
 	}

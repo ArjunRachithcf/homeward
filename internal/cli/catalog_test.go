@@ -74,3 +74,23 @@ func TestTheCLISaysWhyThereIsNoPlan(t *testing.T) {
 		t.Errorf("plan with no app: %d, want 2", code)
 	}
 }
+
+// When the primary can't read the app's definition, the CLI says why in the words Admin uses, not the manager's code
+// (#293, #295).
+func TestTheCLISaysWhyThePrimaryCantReadAnApp(t *testing.T) {
+	testenv.Isolate(t)
+	for code, c := range map[string]struct{ status, want string }{
+		"agent-unreachable":  {"503", "the primary didn't answer. Try again in a moment"},
+		"agent-refused-read": {"500", "the primary answered, but wouldn't read the app's definition. The network is fine: the primary needs mending, and sudo journalctl -u homeward-agent there says why"},
+		"agent-busy":         {"503", "the primary was busy: it was reading another app's definition, or too many reads were running at once. Try again in a moment"},
+		"agent-read-crashed": {"500", "the primary's reader crashed before it read the app's definition, so the definition isn't the cause. The primary needs mending, and sudo journalctl -u homeward-agent there says why (most often too many processes or too little memory)"},
+		"read-timeout":       {"422", "its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher"},
+		"read-too-big":       {"422", "its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher"},
+	} {
+		sock, _ := routedControl(t, map[string][2]string{"POST /api/v1/plans": {c.status, `{"error":"` + code + `"}`}})
+		exit, _, errOut := run(t, "plan", "immich", "--control-socket", sock)
+		if exit != 1 || !strings.Contains(errOut, "Homeward can't plan this app: "+c.want) || strings.Contains(errOut, code) {
+			t.Errorf("%s: exit %d, %q", code, exit, errOut)
+		}
+	}
+}
