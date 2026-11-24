@@ -253,5 +253,7 @@ type LDAP interface {
 	// AppPassword makes a person a new app password for one LDAP app, by the app's slug: it binds at that app's base
 	// DN and at no other app's, so an app that is handed it can't replay it elsewhere. It is shown only here. The app's
 	// directory must be there; whether the person is in its audience is the bind's to say, as for every other password.
+	// Credentials counts it, so an admin who holds one passes no step-up: Homeward makes none for an admin, who uses
+	// LDAP apps with a separate account that isn't an admin (#274).
 	AppPassword(ctx context.Context, slug, username string) (Secret, error)
 }
