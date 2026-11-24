@@ -91,6 +91,52 @@ func TestTheContractSubtestsRunOnceAcrossTheIdentityRunners(t *testing.T) {
 			t.Errorf("%s: on the runners %v, want exactly one", strings.Join(p, "/"), on)
 		}
 	}
+	// A runner that runs the LDAP setup runs something of the section's beside it: a subtest renamed out of its
+	// runner's pattern would otherwise leave that runner running the setup alone.
+	for i, r := range runners {
+		for _, p := range paths {
+			if ldapNeeds(p) && r.selects(p) && !runsLDAP[i] {
+				t.Errorf("the runner %q runs the LDAP setup and nothing of the section beside it", r.Label)
+				break
+			}
+		}
+	}
+	// Every alternative of every pattern names a subtest that is there: one renamed away from its alternative would
+	// otherwise fall to another runner unseen (into ", LDAP", which runs what nothing else takes), or stop being skipped.
+	// One alternative may name a subtest still to come, in expectedSoon, until it is there.
+	expectedSoon := map[string]bool{
+		// #300 (#298): its admins'-audience drift goes to ", LDAP drift" rather than to the impostors' runner, which
+		// its other drifts fill. Remove it here once #300 is merged: the check then holds it to the subtest.
+		"drift:_providers_of_the_console's,_or_of_an_older": true,
+	}
+	for _, r := range runners {
+		for _, pat := range []string{r.Run, r.Skip} {
+			if pat == "" {
+				continue
+			}
+			for _, levels := range splitPattern(pat) {
+				for depth, elem := range levels {
+					for _, alt := range groupAlternatives(elem) {
+						found := false
+						for _, p := range paths {
+							if len(p) > depth {
+								if m, err := regexp.MatchString(alt, p[depth]); err == nil && m {
+									found = true
+									break
+								}
+							}
+						}
+						switch {
+						case !found && !expectedSoon[alt]:
+							t.Errorf("the runner %q: %q in %q names no subtest of the suite", r.Label, alt, pat)
+						case found && expectedSoon[alt]:
+							t.Errorf("the runner %q: %q names a subtest now: take it out of expectedSoon", r.Label, alt)
+						}
+					}
+				}
+			}
+		}
+	}
 	// The patterns themselves, against names they must tell apart (the go test matching itself).
 	if !(runner{Run: "A/(b|c)", Skip: "A/c/d"}).selects([]string{"A", "c", "e"}) ||
 		(runner{Run: "A/(b|c)", Skip: "A/c/d"}).selects([]string{"A", "c", "d_x"}) ||
@@ -197,6 +243,34 @@ func splitPattern(s string) alternatives {
 		i++
 	}
 	return append(out, append(a, s))
+}
+
+// groupAlternatives are the alternatives of one level's regexp written as one group, (a|b|c), or the regexp itself.
+func groupAlternatives(elem string) []string {
+	if !strings.HasPrefix(elem, "(") || !strings.HasSuffix(elem, ")") {
+		return []string{elem}
+	}
+	inner := elem[1 : len(elem)-1]
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '\\':
+			i++
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth < 0 {
+				return []string{elem} // the first ( closes before the last ): not one group
+			}
+		case '|':
+			if depth == 0 {
+				out = append(out, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, inner[start:])
 }
 
 // matches is go test's: one alternative matches every level it has a regexp for; partial when the name is shorter.
