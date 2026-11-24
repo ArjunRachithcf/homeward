@@ -24,7 +24,7 @@ Read at: cmintey/wishlist `main` 0be4f4e (2026-11-17) and tag v0.69.0; aunefyren
 | Claims hidden from the owner | **On screen only.** The owner's list page data (`toItemOnListDTO`) and the live updates (`/lists/<id>/events`) carry every claim: who claimed it and whether it was bought. `?filter=` works on claims too. | **On the server.** Claim details are purged for the owner (`controllers/wish_test.go`: "claim details purged for the wishlist owner"); the owner can't claim their own wishes. |
 | Public links | Per list, when the admin allows public lists; "registry" groups are always public | Any wishlist can be shared publicly |
 | Kid view | None | None |
-| Runs as | root (no `USER`); writes caches under HOME at start | drops to `PUID`/`PGID` at start (`su-exec`) |
+| Runs as | root (no `USER`); writes caches under HOME at start; runs read-only as a non-root UID with HOME=/tmp | drops to `PUID`/`PGID` at start (`su-exec`) |
 | Data | `/usr/src/app/data` (`prod.db`), `/usr/src/app/uploads` (pictures) | `/app/files` (config, log, `data.db`), `/app/images` |
 | Health | No endpoint; a static file (`/favicon.ico`) answers through the app | No endpoint; `/api/open/...` routes answer without sign-in |
 | Outbound | Fetches product pages for "add from URL" (`/api/product`, with an SSRF guard in `safeurl.ts`) | None needed |
@@ -145,8 +145,8 @@ volumes:
 ```
 
 Open for the definition: the `people` section (Wishlist has no API to end one person's sessions), a real health
-check (offer upstream), the `groups` scope question above, and whether it runs read-only as a non-root UID (classic's
-draft does; not yet run).
+check (offer upstream) and the `groups` scope question above. Read-only as a non-root UID works: classic's service
+(HOME=/tmp, the volumes handed to that UID) ran migrations, seed and patches in a throwaway project (2026-11-24).
 
 ## Sources
 
