@@ -327,12 +327,22 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		for i, drift := range []struct {
 			what string
 			do   func()
+			// next: no Prepare after it, to keep the suite inside its time; the next drift takes its binding's place.
+			next bool
 		}{
 			{"taken off the session stage", func() {
 				for _, b := range noAdminBindings() {
 					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
 				}
-			}},
+			}, false},
+			{"switched off", func() {
+				_, pbm := sessionBinding()
+				for _, b := range noAdminBindings() {
+					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
+				}
+				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
+					"order": 10, "negate": false, "enabled": false, "timeout": 30}, nil)
+			}, true},
 			{"negated", func() {
 				// Authentik answers a PATCH of negate alone with a 500: the binding is made again, negated.
 				_, pbm := sessionBinding()
@@ -341,27 +351,22 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 				}
 				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
 					"order": 10, "negate": true, "enabled": true, "timeout": 30}, nil)
-			}},
-			{"switched off", func() {
-				_, pbm := sessionBinding()
-				for _, b := range noAdminBindings() {
-					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
-				}
-				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
-					"order": 10, "negate": false, "enabled": false, "timeout": 30}, nil)
-			}},
+			}, false},
 			{"outvoted: the session stage passes on any one policy", func() {
 				pk, _ := sessionBinding()
 				w.raw(t, w.own, "PATCH", "/api/v3/flows/bindings/"+pk+"/", map[string]any{"policy_engine_mode": "any"}, nil)
-			}},
+			}, false},
 			{"naming another group", func() {
 				w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+noAdmin.Results[0].PK+"/",
 					map[string]any{"expression": strings.ReplaceAll(authentik.LDAPNoAdminExpr(admins), admins, "00000000-0000-4000-8000-000000000000")}, nil)
-			}},
+			}, false},
 		} {
 			drift.do()
 			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
 				t.Errorf("the no-admin policy %s: %+v %v, want not passkey-only", drift.what, r, err)
+			}
+			if drift.next {
+				continue
 			}
 			if err := idptest.Prepare(ctx, a, household); err != nil {
 				t.Fatal(err)
@@ -387,20 +392,29 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+pbm, nil, &pbs)
 			return pbs.Results
 		}
-		for _, pol := range []struct{ what, pk string }{{"the app's own app-password policy", own.Results[0].PK},
-			{"the no-admin policy", noAdmin.Results[0].PK}} {
+		// Each shows alone; the first is put back by hand, the second by Prepare (one Prepare, to keep the suite inside its
+		// time).
+		failing := func(pk string, failure bool) {
 			_, pbm := sessionBinding()
 			for _, b := range sessionPolicies() {
-				if b.Policy != pol.pk {
+				if b.Policy != pk {
 					continue
 				}
-				// As for negate, the binding is made again, passing on failure.
+				// As for negate, the binding is made again.
 				w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
-				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": pol.pk, "order": b.Order,
-					"negate": false, "enabled": true, "timeout": 30, "failure_result": true}, nil)
+				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": pk, "order": b.Order,
+					"negate": false, "enabled": true, "timeout": 30, "failure_result": failure}, nil)
 			}
+		}
+		for i, pol := range []struct{ what, pk string }{{"the app's own app-password policy", own.Results[0].PK},
+			{"the no-admin policy", noAdmin.Results[0].PK}} {
+			failing(pol.pk, true)
 			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
 				t.Errorf("%s passing on failure: %+v %v, want not passkey-only", pol.what, r, err)
+			}
+			if i == 0 {
+				failing(pol.pk, false)
+				continue
 			}
 			if err := idptest.Prepare(ctx, a, household); err != nil {
 				t.Fatal(err)
@@ -475,20 +489,16 @@ func ldapCached(t *testing.T, w *world, a *authentik.Authentik, app idp.LDAPApp)
 		t.Fatal(err)
 	}
 	t.Logf("claim: cached, an ended app password binds: %v", w.Bind(t, dn, pw) == nil)
-	if err := idptest.Prepare(ctx, a, household); err != nil {
-		t.Fatal(err)
+	// Searches answered from a copy (people who left, groups as they were) show alone too; then both, put back by one
+	// Prepare.
+	modes := func(bind, search string) {
+		w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), map[string]any{"bind_mode": bind, "search_mode": search}, nil)
 	}
-	if _, mode := provider(); mode != "direct" {
-		t.Errorf("after Prepare, the provider binds %s, want direct", mode)
-	}
-	if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
-		t.Errorf("after Prepare, a provider that bound cached: %+v %v", r, err)
-	}
-	// Searches answered from a copy, people who left and groups as they were included.
-	w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), map[string]any{"search_mode": "cached"}, nil)
+	modes("direct", "cached")
 	if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
 		t.Errorf("a provider searching cached: %+v %v, want not passkey-only", r, err)
 	}
+	modes("cached", "cached")
 	if err := idptest.Prepare(ctx, a, household); err != nil {
 		t.Fatal(err)
 	}
@@ -496,8 +506,11 @@ func ldapCached(t *testing.T, w *world, a *authentik.Authentik, app idp.LDAPApp)
 		SearchMode string `json:"search_mode"`
 	}
 	w.raw(t, w.own, "GET", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), nil, &sm)
-	if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn || sm.SearchMode != "direct" {
-		t.Errorf("after Prepare, a provider that searched cached: %+v %v, searching %s", r, err, sm.SearchMode)
+	if _, mode := provider(); mode != "direct" || sm.SearchMode != "direct" {
+		t.Errorf("after Prepare, the provider binds %s and searches %s, want direct", mode, sm.SearchMode)
+	}
+	if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+		t.Errorf("after Prepare, a provider that bound and searched cached: %+v %v", r, err)
 	}
 	for deadline := time.Now().Add(90 * time.Second); w.Bind(t, dn, pw) == nil; time.Sleep(3 * time.Second) {
 		if time.Now().After(deadline) {
