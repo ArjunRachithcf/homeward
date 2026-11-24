@@ -323,6 +323,38 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 			}
 			return out
 		}
+		// Either of the session stage's policies bound to pass when it fails (an exception, a timeout), as the console
+		// allows (#298): a failing policy would let anyone through. Each shows; the app's own is put back by hand, the
+		// no-admin policy's by the Prepare after the last drift below (Prepares are kept few, for the suite's time).
+		type sessionPB struct {
+			PK      string `json:"pk"`
+			Policy  string `json:"policy"`
+			Order   int    `json:"order"`
+			Failure bool   `json:"failure_result"`
+		}
+		sessionPolicies := func() []sessionPB {
+			_, pbm := sessionBinding()
+			var pbs struct{ Results []sessionPB }
+			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+pbm, nil, &pbs)
+			return pbs.Results
+		}
+		failing := func(pk string, failure bool) {
+			_, pbm := sessionBinding()
+			for _, b := range sessionPolicies() {
+				if b.Policy != pk {
+					continue
+				}
+				// As for negate, the binding is made again.
+				w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
+				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": pk, "order": b.Order,
+					"negate": false, "enabled": true, "timeout": 30, "failure_result": failure}, nil)
+			}
+		}
+		failing(own.Results[0].PK, true)
+		if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+			t.Errorf("the app's own app-password policy passing on failure: %+v %v, want not passkey-only", r, err)
+		}
+		failing(own.Results[0].PK, false)
 		admins := w.groupPK(t, idp.RoleGroup(idp.Admin))
 		for i, drift := range []struct {
 			what string
@@ -356,6 +388,7 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 				pk, _ := sessionBinding()
 				w.raw(t, w.own, "PATCH", "/api/v3/flows/bindings/"+pk+"/", map[string]any{"policy_engine_mode": "any"}, nil)
 			}, false},
+			{"passing on failure", func() { failing(noAdmin.Results[0].PK, true) }, true},
 			{"naming another group", func() {
 				w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+noAdmin.Results[0].PK+"/",
 					map[string]any{"expression": strings.ReplaceAll(authentik.LDAPNoAdminExpr(admins), admins, "00000000-0000-4000-8000-000000000000")}, nil)
@@ -378,74 +411,34 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		if bs := noAdminBindings(); len(bs) != 1 {
 			t.Errorf("the no-admin policy's bindings on the session stage, put back: %v, want one", bs)
 		}
-		// Either of the session stage's policies bound to pass when it fails (an exception, a timeout), as the console
-		// allows (#298): a failing policy would let anyone through. Each shows, and Prepare puts it back.
-		type sessionPB struct {
-			PK      string `json:"pk"`
-			Policy  string `json:"policy"`
-			Order   int    `json:"order"`
-			Failure bool   `json:"failure_result"`
-		}
-		sessionPolicies := func() []sessionPB {
-			_, pbm := sessionBinding()
-			var pbs struct{ Results []sessionPB }
-			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+pbm, nil, &pbs)
-			return pbs.Results
-		}
-		// Each shows alone; the first is put back by hand, the second by Prepare (one Prepare, to keep the suite inside its
-		// time).
-		failing := func(pk string, failure bool) {
-			_, pbm := sessionBinding()
-			for _, b := range sessionPolicies() {
-				if b.Policy != pk {
-					continue
-				}
-				// As for negate, the binding is made again.
-				w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
-				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": pk, "order": b.Order,
-					"negate": false, "enabled": true, "timeout": 30, "failure_result": failure}, nil)
+		for _, b := range sessionPolicies() {
+			if b.Policy == noAdmin.Results[0].PK && b.Failure {
+				t.Error("the no-admin policy, put back: still passing on failure")
 			}
 		}
-		for i, pol := range []struct{ what, pk string }{{"the app's own app-password policy", own.Results[0].PK},
-			{"the no-admin policy", noAdmin.Results[0].PK}} {
-			failing(pol.pk, true)
-			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
-				t.Errorf("%s passing on failure: %+v %v, want not passkey-only", pol.what, r, err)
-			}
-			if i == 0 {
-				failing(pol.pk, false)
-				continue
-			}
-			if err := idptest.Prepare(ctx, a, household); err != nil {
-				t.Fatal(err)
-			}
-			if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
-				t.Errorf("after Prepare, %s passing on failure: %+v %v", pol.what, r, err)
-			}
-			n := 0
-			for _, b := range sessionPolicies() {
-				if b.Policy == pol.pk {
-					n++
-					if b.Failure {
-						t.Errorf("%s, put back: still passing on failure", pol.what)
-					}
-				}
-			}
-			if n != 1 {
-				t.Errorf("%s's bindings on the session stage, put back: %d, want one", pol.what, n)
-			}
-		}
-		t.Run("the provider's bind mode cached shows, and Prepare puts direct back at once (#298)", func(t *testing.T) { ldapCached(t, w, a, app) })
 		t.Run("a session stage left refusing by a failure halfway is put back by the next pass", func(t *testing.T) { ldapHalfDone(t, w, a, app) })
 		t.Run("one app's bind flow that can't be put back keeps Prepare from nothing else, the first part's bind flow going among it", func(t *testing.T) { ldapOneStuck(t, w, a) })
 	}
 }
 
-// ldapCached sets an app's provider to cached binds, as the console allows (#298): the outpost would keep taking a bind
-// that once passed, after its app password ended. The report says so, and Prepare puts direct binds back at once, after
-// which the ended app password binds no more.
-func ldapCached(t *testing.T, w *world, a *authentik.Authentik, app idp.LDAPApp) {
+// ldapCached sets an app's provider to cached binds and searches, as the console allows (#298): the outpost would keep
+// taking a bind that once passed, after its app password ended, and answer searches from a copy. The report says so, and
+// Prepare puts both back at once, after which the ended app password binds no more.
+func ldapCached(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) { ldapCachedIn(t, w, a) }
+}
+
+func ldapCachedIn(t *testing.T, w *world, a *authentik.Authentik) {
 	ctx := context.Background()
+	app := idp.LDAPApp{Slug: "homerslab-cache", Name: "Cache", Roles: []idp.Role{idp.Adult}}
+	if _, err := a.EnsureLDAP(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+			t.Error(err)
+		}
+	}()
 	var ps struct {
 		Results []struct {
 			PK       int    `json:"pk"`

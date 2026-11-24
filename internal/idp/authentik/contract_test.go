@@ -230,7 +230,9 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 		t.Run("an LDAP-only app binds from its own container through the LDAPS port, and reads only its own person", ldapAppInItsContainer(w, a))
 		t.Run("drift: a bind flow that takes passwords, or another app's, shows in the report, and Prepare puts it back", ldapDrift(w, a))
 		t.Run("nobody in the admins' group, nor a superuser, binds, whatever they hold; the policy guarded (#292)", ldapRefusesAdmins(w, a))
-		// Named as the console's drift, so it runs on the runner of the console's impostors, inside its time.
+		// These two are named as the console's drift, so they run on the runner of the console's impostors, inside its time.
+		t.Run("drift: providers of the console's settings, cached binds or searches, show, and Prepare puts direct back at once (#298)",
+			ldapCached(w, a))
 		t.Run("drift: providers of the console's, or of an older Homeward, open to the admins' group lose it; an LDAP app's audience never has the Admin role (#298)",
 			ldapAdminAudience(w, a))
 		t.Run("an app's directory keeps apart from the app's own application", ldapBesideTheAppsOwn(w, a))
