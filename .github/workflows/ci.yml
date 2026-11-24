@@ -341,8 +341,8 @@ jobs:
     # Authentik 2026.8, most of it Authentik's own query for the flow's policies), once for each change a drift test
     # makes and puts back (#303). It runs on three runners of its own, each against an Authentik of its own, after the
     # bootstrap every section needs, and each with the outpost and the first app's provider, which the rest need: the
-    # console's impostors with its session policies and settings (#298) on one; the bind flow's drift with the admins'
-    # audience (#298) on another; the rest of the section on the third. Everything else, with the browser, on a fourth.
+    # console's impostors on one; the bind flow's drift with #298's (the admins' audience, the console's session
+    # policies and settings) on another; the rest of the section on the third. Everything else, with the browser, on a fourth.
     # TestTheContractSubtestsRunOnceAcrossTheIdentityRunners holds these patterns to that: every subtest on exactly one
     # runner, the ones the others need on every runner they are needed on. The names are anchored (^bootstrap:): a bare
     # "bootstrap" also took the restart's subtest, whose name has the word, onto every runner. Quoted: a pattern ending
@@ -360,12 +360,12 @@ jobs:
             skip: "TestTheIdentityProviderContractOnAuthentik/^LDAP:/(drift:_providers_of_the_console's|drift:_a_bind_flow)"
             browser: ""
           - label: ", LDAP drift"
-            run: "TestTheIdentityProviderContractOnAuthentik/(^bootstrap:|^LDAP:)/(the_LDAP_outpost|an_app's_LDAP_provider|drift:_a_bind_flow|drift:_providers_of_the_console's,_or_of_an_older)"
+            run: "TestTheIdentityProviderContractOnAuthentik/(^bootstrap:|^LDAP:)/(the_LDAP_outpost|an_app's_LDAP_provider|drift:_a_bind_flow|drift:_providers_of_the_console's,_or_of_an_older|drift:_providers_of_the_console's_session_policies|drift:_providers_of_the_console's_settings)"
             skip: ""
             browser: ""
           - label: ", LDAP impostors"
             run: "TestTheIdentityProviderContractOnAuthentik/(^bootstrap:|^LDAP:)/(the_LDAP_outpost|an_app's_LDAP_provider|drift:_providers_of_the_console's)"
-            skip: "TestTheIdentityProviderContractOnAuthentik/^LDAP:/drift:_providers_of_the_console's,_or_of_an_older"
+            skip: "TestTheIdentityProviderContractOnAuthentik/^LDAP:/(drift:_providers_of_the_console's,_or_of_an_older|drift:_providers_of_the_console's_session_policies|drift:_providers_of_the_console's_settings)"
             browser: ""
     # 20 browser runs by hand take about ten minutes more than the one of a pull request.
     timeout-minutes: 50
