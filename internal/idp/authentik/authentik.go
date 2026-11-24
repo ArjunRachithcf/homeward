@@ -406,6 +406,8 @@ func (a *Authentik) bindPolicies(ctx context.Context, t target, want []binding) 
 		Negate bool   `json:"negate"`
 		Order  int    `json:"order"`
 		On     bool   `json:"enabled"`
+		// Failure passes the binding when its policy fails: never so (#298).
+		Failure bool `json:"failure_result"`
 	}
 	have, err := where[pb](ctx, a.api, "/policies/bindings/?target="+q(t.PBM), "target", t.PK)
 	if err != nil {
@@ -417,7 +419,7 @@ func (a *Authentik) bindPolicies(ctx context.Context, t target, want []binding) 
 	kept, gone := make([]bool, len(want)), make([]bool, len(have))
 	for j, h := range have {
 		i := slices.IndexFunc(want, func(w binding) bool { return w.Policy == h.Policy && w.Group == h.Group && w.Negate == h.Negate })
-		if i >= 0 && !kept[i] && h.On && h.Order == i*10 {
+		if i >= 0 && !kept[i] && h.On && !h.Failure && h.Order == i*10 {
 			kept[i], gone[j] = true, true
 		}
 	}
@@ -425,7 +427,8 @@ func (a *Authentik) bindPolicies(ctx context.Context, t target, want []binding) 
 		if kept[i] {
 			continue
 		}
-		body := map[string]any{"target": t.PBM, "order": i * 10, "enabled": true, "negate": w.Negate, "timeout": 30, "policy": nil, "group": nil}
+		body := map[string]any{"target": t.PBM, "order": i * 10, "enabled": true, "negate": w.Negate, "failure_result": false, "timeout": 30,
+			"policy": nil, "group": nil}
 		if w.Policy != "" {
 			body["policy"] = w.Policy
 		}
@@ -1111,7 +1114,9 @@ func (a *Authentik) credentialsOf(ctx context.Context, u *user) (idp.Credentials
 		}
 	}
 	// A password: Authentik stamps password_change_date at every password set, and at the account's making, which
-	// sets none (Homeward's people get an unusable one).
+	// sets none (Homeward's people get an unusable one). A set within a second of the making is told by its event
+	// (#298): every set of a password or a hash on an account that exists records one under the account. The stamps still count
+	// a set whose event has expired or was deleted.
 	var self struct {
 		Joined  time.Time `json:"date_joined"`
 		Changed time.Time `json:"password_change_date"`
@@ -1121,6 +1126,21 @@ func (a *Authentik) credentialsOf(ctx context.Context, u *user) (idp.Credentials
 	}
 	if self.Changed.Sub(self.Joined) > time.Second {
 		add(idp.CredPassword)
+	} else {
+		type event struct {
+			Action string `json:"action"`
+			User   struct {
+				PK int `json:"pk"`
+			} `json:"user"`
+		}
+		// Narrowed by the name, then checked by the account's pk: an earlier account of the same name isn't this one.
+		es, err := list[event](ctx, a.api, "/events/events/?actions=password_set&username="+q(username))
+		if err != nil {
+			return idp.Credentials{}, err
+		}
+		if slices.ContainsFunc(es, func(e event) bool { return e.Action == "password_set" && e.User.PK == u.PK }) {
+			add(idp.CredPassword)
+		}
 	}
 	type token struct {
 		Intent   string     `json:"intent"`

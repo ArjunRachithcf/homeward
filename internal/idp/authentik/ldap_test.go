@@ -370,6 +370,345 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 	}
 }
 
+// ldapFailClosed binds the session stage's policies of an app's bind flow to pass when they fail (an exception, a
+// timeout), or switches the one refusing admins off, as the console allows (#298): a failing policy would let anyone
+// through. Each shows alone in the report, and Prepare puts them back, each bound once, on and failing closed.
+func ldapFailClosed(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		app := idp.LDAPApp{Slug: "homerslab-closed", Name: "Closed", Roles: []idp.Role{idp.Adult}}
+		if _, err := a.EnsureLDAP(ctx, app); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+				t.Error(err)
+			}
+		}()
+		policy := func(name string) string {
+			var ps struct {
+				Results []struct {
+					PK   string `json:"pk"`
+					Name string `json:"name"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name="+url.QueryEscape(name), nil, &ps)
+			if len(ps.Results) != 1 || ps.Results[0].Name != name {
+				t.Fatalf("the policy %s: %+v", name, ps.Results)
+			}
+			return ps.Results[0].PK
+		}
+		own, noAdmin := policy(app.Slug+"-ldap-app-password"), policy("homerslab-ldap-no-admin")
+		type pb struct {
+			PK      string `json:"pk"`
+			Policy  string `json:"policy"`
+			Order   int    `json:"order"`
+			On      bool   `json:"enabled"`
+			Failure bool   `json:"failure_result"`
+		}
+		// The session stage's binding (its policy binding model) and the policies bound to it.
+		session := func() (string, []pb) {
+			var fsb struct {
+				Results []struct {
+					PBM   string `json:"policybindingmodel_ptr_id"`
+					Order int    `json:"order"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/flows/bindings/?target="+flowPK(t, w, authentik.LDAPBindFlow(app.Slug)), nil, &fsb)
+			for _, b := range fsb.Results {
+				if b.Order == 30 {
+					var pbs struct{ Results []pb }
+					w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+b.PBM, nil, &pbs)
+					return b.PBM, pbs.Results
+				}
+			}
+			t.Fatalf("no session stage: %+v", fsb.Results)
+			return "", nil
+		}
+		// As for negate, a binding is made again rather than patched.
+		rebind := func(policy string, on, failure bool) {
+			pbm, bs := session()
+			for _, b := range bs {
+				if b.Policy == policy {
+					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b.PK+"/", nil, nil)
+					w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": policy, "order": b.Order,
+						"negate": false, "enabled": on, "timeout": 30, "failure_result": failure}, nil)
+				}
+			}
+		}
+		drifted := func(what string) {
+			t.Helper()
+			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+				t.Errorf("%s: %+v %v, want not passkey-only", what, r, err)
+			}
+		}
+		// Each alone, the first two put back by hand, the last by Prepare (Prepares are few, for the suite's time).
+		rebind(own, true, true)
+		drifted("the app's own app-password policy passing on failure")
+		rebind(own, true, false)
+		rebind(noAdmin, false, false)
+		drifted("the no-admin policy switched off")
+		rebind(noAdmin, true, false)
+		rebind(noAdmin, true, true)
+		drifted("the no-admin policy passing on failure")
+		if err := idptest.Prepare(ctx, a, household); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+			t.Errorf("after Prepare: %+v %v", r, err)
+		}
+		_, bs := session()
+		n := 0
+		for _, b := range bs {
+			if b.Policy == noAdmin {
+				n++
+			}
+			if b.Failure || !b.On {
+				t.Errorf("after Prepare, a session policy's binding %+v: want on and failing closed", b)
+			}
+		}
+		if n != 1 {
+			t.Errorf("after Prepare, the no-admin policy's bindings: %d, want one", n)
+		}
+	}
+}
+
+// ldapCached sets an app's provider to cached binds and searches, as the console allows (#298): the outpost would keep
+// taking a bind that once passed, after its app password ended, and answer searches from a copy. The report says so, and
+// Prepare puts both back at once, after which the ended app password binds no more.
+func ldapCached(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) { ldapCachedIn(t, w, a) }
+}
+
+func ldapCachedIn(t *testing.T, w *world, a *authentik.Authentik) {
+	ctx := context.Background()
+	app := idp.LDAPApp{Slug: "homerslab-cache", Name: "Cache", Roles: []idp.Role{idp.Adult}}
+	if _, err := a.EnsureLDAP(ctx, app); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+			t.Error(err)
+		}
+	}()
+	var ps struct {
+		Results []struct {
+			PK       int    `json:"pk"`
+			Name     string `json:"name"`
+			BindMode string `json:"bind_mode"`
+		}
+	}
+	provider := func() (int, string) {
+		t.Helper()
+		w.raw(t, w.own, "GET", "/api/v3/providers/ldap/?name__iexact="+url.QueryEscape(app.Slug+"-ldap"), nil, &ps)
+		if len(ps.Results) != 1 || ps.Results[0].Name != app.Slug+"-ldap" {
+			t.Fatalf("the app's provider: %+v", ps.Results)
+		}
+		return ps.Results[0].PK, ps.Results[0].BindMode
+	}
+	pk, mode := provider()
+	if mode != "direct" {
+		t.Fatalf("the app's provider, as made: %s binds, want direct", mode)
+	}
+	if err := a.EnsurePerson(ctx, idp.Person{Username: "pita", Name: "Pita", Mail: "pita@ferreira.family", Role: idp.Adult}); err != nil {
+		t.Fatal(err)
+	}
+	creds, err := a.EnsureLDAP(ctx, app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dn, pw := fmt.Sprintf(creds.UserDN, "pita"), appPassword(t, a, app.Slug, "pita")
+	for deadline := time.Now().Add(90 * time.Second); w.Bind(t, dn, pw) != nil; time.Sleep(3 * time.Second) {
+		if time.Now().After(deadline) {
+			t.Fatal("an adult never bound")
+		}
+	}
+	w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), map[string]any{"bind_mode": "cached"}, nil)
+	if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+		t.Errorf("a provider binding cached: %+v %v, want not passkey-only", r, err)
+	}
+	// Reported, not verified: whether the cached outpost still takes the ended app password, once it has bound it.
+	time.Sleep(5 * time.Second)
+	_ = w.Bind(t, dn, pw)
+	if err := a.RevokeAppPasswords(ctx, "pita"); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("claim: cached, an ended app password binds: %v", w.Bind(t, dn, pw) == nil)
+	// Searches answered from a copy (people who left, groups as they were) show alone too; then both, put back by one
+	// Prepare.
+	modes := func(bind, search string) {
+		w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), map[string]any{"bind_mode": bind, "search_mode": search}, nil)
+	}
+	modes("direct", "cached")
+	if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+		t.Errorf("a provider searching cached: %+v %v, want not passkey-only", r, err)
+	}
+	modes("cached", "cached")
+	if err := idptest.Prepare(ctx, a, household); err != nil {
+		t.Fatal(err)
+	}
+	var sm struct {
+		SearchMode string `json:"search_mode"`
+	}
+	w.raw(t, w.own, "GET", fmt.Sprintf("/api/v3/providers/ldap/%d/", pk), nil, &sm)
+	if _, mode := provider(); mode != "direct" || sm.SearchMode != "direct" {
+		t.Errorf("after Prepare, the provider binds %s and searches %s, want direct", mode, sm.SearchMode)
+	}
+	if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+		t.Errorf("after Prepare, a provider that bound and searched cached: %+v %v", r, err)
+	}
+	for deadline := time.Now().Add(90 * time.Second); w.Bind(t, dn, pw) == nil; time.Sleep(3 * time.Second) {
+		if time.Now().After(deadline) {
+			t.Error("after Prepare, an ended app password still binds")
+			break
+		}
+	}
+}
+
+// ldapAdminAudience checks that an LDAP app's audience never has the Admin role (#298): a group binding lets in the
+// groups under it too, so a person the role claim takes for no admin would bind where only admins should, while the
+// admins themselves bind nowhere (#292). EnsureLDAP refuses it, making nothing. An application opened to the admins'
+// group, as Homeward made it before, shows in the report, and Prepare takes the group out of its audience, the rest
+// kept, or closes it to everyone when the admins' group alone opened it.
+func ldapAdminAudience(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		for _, roles := range [][]idp.Role{{idp.Admin}, {idp.Adult, idp.Admin}} {
+			if _, err := a.EnsureLDAP(ctx, idp.LDAPApp{Slug: "homerslab-board", Name: "Board", Roles: roles}); !errors.Is(err, idp.ErrLDAPAdminAudience) {
+				t.Errorf("an LDAP app for %v: %v, want ErrLDAPAdminAudience", roles, err)
+			}
+		}
+		var made struct {
+			Results []struct {
+				Name string `json:"name"`
+			}
+		}
+		w.raw(t, w.own, "GET", "/api/v3/providers/ldap/?name__iexact=homerslab-board-ldap", nil, &made)
+		if code := w.status(t, w.own, "/api/v3/core/applications/homerslab-board-ldap/"); len(made.Results) != 0 || code != http.StatusNotFound {
+			t.Errorf("refused, yet made: providers %+v, application %d", made.Results, code)
+		}
+
+		app := idp.LDAPApp{Slug: "homerslab-ledger", Name: "Ledger", Roles: []idp.Role{idp.Adult}}
+		creds, err := a.EnsureLDAP(ctx, app)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+				t.Error(err)
+			}
+		}()
+		dn := func(username string) string { return fmt.Sprintf(creds.UserDN, username) }
+		admins, adults := w.groupPK(t, idp.RoleGroup(idp.Admin)), w.groupPK(t, idp.RoleGroup(idp.Adult))
+		if err := a.EnsurePerson(ctx, idp.Person{Username: "ulla", Name: "Ulla", Mail: "ulla@ferreira.family", Role: idp.Adult}); err != nil {
+			t.Fatal(err)
+		}
+		ulla := appPassword(t, a, app.Slug, "ulla")
+		// Ravi, in a group under the admins' only: no admin to the role claim, nor to the bind's policy.
+		under := w.consoleGroup(t, "hltest-under-admins-298", false, admins)
+		w.consoleUser(t, "ravi", "internal", authentik.UserPath, under)
+		ravi := w.OwnAppPassword(t, app.Slug, "ravi")
+		eventually := func(who, pw string, bind bool, what string) {
+			t.Helper()
+			for deadline := time.Now().Add(90 * time.Second); (w.Bind(t, dn(who), pw) == nil) != bind; time.Sleep(3 * time.Second) {
+				if time.Now().After(deadline) {
+					t.Errorf("%s: %s bound %v, want %v", what, who, !bind, bind)
+					return
+				}
+			}
+		}
+		eventually("ulla", ulla, true, "an adult, in an app for adults")
+		eventually("ravi", ravi, false, "outside the audience")
+
+		var self struct {
+			PBM string `json:"pbm_uuid"`
+		}
+		w.raw(t, w.own, "GET", "/api/v3/core/applications/"+app.Slug+"-ldap/", nil, &self)
+		type appPB struct {
+			PK     string  `json:"pk"`
+			Group  *string `json:"group"`
+			Policy *string `json:"policy"`
+		}
+		bindings := func() (groups, policies []string, pks []string) {
+			var pbs struct{ Results []appPB }
+			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+self.PBM, nil, &pbs)
+			for _, b := range pbs.Results {
+				pks = append(pks, b.PK)
+				if b.Group != nil {
+					groups = append(groups, *b.Group)
+				}
+				if b.Policy != nil {
+					policies = append(policies, *b.Policy)
+				}
+			}
+			return groups, policies, pks
+		}
+		// As Homeward made an app open to adults before #298: the admins' group in its audience too.
+		w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": self.PBM, "group": admins, "order": 10,
+			"enabled": true, "negate": false, "timeout": 30}, nil)
+		eventually("ravi", ravi, true, "the admins' group in the audience, a group under it")
+		if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+			t.Errorf("an LDAP application open to the admins' group: %+v %v, want not passkey-only", r, err)
+		}
+		if err := idptest.Prepare(ctx, a, household); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+			t.Errorf("after Prepare, the admins' group taken out: %+v %v", r, err)
+		}
+		if groups, policies, _ := bindings(); !slices.Equal(groups, []string{adults}) || len(policies) != 0 {
+			t.Errorf("after Prepare, the audience: groups %v, policies %v, want the adults' alone", groups, policies)
+		}
+		eventually("ravi", ravi, false, "the admins' group taken out")
+		eventually("ulla", ulla, true, "the rest of the audience kept")
+
+		// The admins' group alone in the audience, as an app for admins was made before #298.
+		_, _, pks := bindings()
+		w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": self.PBM, "group": admins, "order": 10,
+			"enabled": true, "negate": false, "timeout": 30}, nil)
+		for _, pk := range pks {
+			w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+pk+"/", nil, nil)
+		}
+		eventually("ravi", ravi, true, "the admins' group alone, a group under it")
+		if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+			t.Errorf("an LDAP application open to the admins' group alone: %+v %v, want not passkey-only", r, err)
+		}
+		if err := idptest.Prepare(ctx, a, household); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+			t.Errorf("after Prepare, the admins' group alone taken out: %+v %v", r, err)
+		}
+		var never struct {
+			Results []struct {
+				PK string `json:"pk"`
+			}
+		}
+		w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name=homerslab-never", nil, &never)
+		if groups, policies, _ := bindings(); len(groups) != 0 || len(never.Results) != 1 || !slices.Equal(policies, []string{never.Results[0].PK}) {
+			t.Errorf("after Prepare, the audience: groups %v, policies %v, want the policy that refuses everyone alone", groups, policies)
+		}
+		// Closed in place: still on the outpost, so it keeps its app passwords for when its audience comes back.
+		var o struct {
+			Results []struct {
+				Providers []int `json:"providers"`
+			}
+		}
+		var p struct {
+			Results []struct {
+				PK int `json:"pk"`
+			}
+		}
+		w.raw(t, w.own, "GET", "/api/v3/outposts/instances/?name__iexact="+url.QueryEscape(authentik.LDAPOutpostName), nil, &o)
+		w.raw(t, w.own, "GET", "/api/v3/providers/ldap/?name__iexact="+url.QueryEscape(app.Slug+"-ldap"), nil, &p)
+		if len(o.Results) != 1 || len(p.Results) != 1 || !slices.Contains(o.Results[0].Providers, p.Results[0].PK) {
+			t.Errorf("after Prepare, the outpost's providers %+v, want the app's %+v among them", o.Results, p.Results)
+		}
+		eventually("ravi", ravi, false, "closed to everyone")
+		eventually("ulla", ulla, false, "closed to everyone")
+	}
+}
+
 // ldapHalfDone leaves an app's session stage as a failure (a 503, a restart) between the two halves of making its
 // binding leaves it (#246's review): the binding there, at the session's order, holding the stage that refuses. The
 // app binds nobody then; the next pass takes that binding up, and the app binds again.
@@ -986,7 +1325,9 @@ func (w *world) consoleUser(t *testing.T, username, typ, path string, groups ...
 func ldapRefusesAdmins(w *world, a *authentik.Authentik) func(*testing.T) {
 	return func(t *testing.T) {
 		ctx := context.Background()
-		app := idp.LDAPApp{Slug: "homerslab-staff", Name: "Staff", Roles: []idp.Role{idp.Adult, idp.Admin}}
+		// Open to adults (an LDAP app's audience never has the Admin role, #298); the admins' accounts below are in the
+		// adults' group too, so only the bind's policy refuses them.
+		app := idp.LDAPApp{Slug: "homerslab-staff", Name: "Staff", Roles: []idp.Role{idp.Adult}}
 		creds, err := a.EnsureLDAP(ctx, app)
 		if err != nil {
 			t.Fatal(err)
@@ -1011,7 +1352,7 @@ func ldapRefusesAdmins(w *world, a *authentik.Authentik) func(*testing.T) {
 		var inAdmins []account
 		for _, x := range []struct{ name, typ, path string }{{"ivo", "internal", "users"}, {"jon", "external", "users"},
 			{"kai", "service_account", "users"}, {"luz", "internal", authentik.UserPath}} {
-			pw := w.consoleUser(t, x.name, x.typ, x.path, admins)
+			pw := w.consoleUser(t, x.name, x.typ, x.path, adults, admins)
 			inAdmins = append(inAdmins, account{x.name, pw, w.OwnAppPassword(t, app.Slug, x.name)})
 		}
 		refused := func(when string) {

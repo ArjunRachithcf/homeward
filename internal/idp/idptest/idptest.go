@@ -682,6 +682,10 @@ func Run(t *testing.T, w World, version string) {
 			if err != nil || len(before.Others) == 0 {
 				t.Fatalf("%s's credentials: %+v %v, want something besides passkeys", c.who.Username, before, err)
 			}
+			// Dora's password, set at once after her account was made, counts (#298).
+			if c.who.Username == "dora" && !slices.Contains(before.Others, idp.CredPassword) {
+				t.Errorf("dora's credentials: %+v, want her password among them (#298)", before)
+			}
 			c.who.Role = idp.Admin
 			if err := p.EnsurePerson(ctx, c.who); !errors.Is(err, idp.ErrAdminCredentials) {
 				t.Errorf("%s, holding %v, made an admin: %v, want ErrAdminCredentials", c.who.Username, before.Others, err)

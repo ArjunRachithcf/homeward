@@ -554,7 +554,16 @@ Stories 120–121 are decided in #87.
       carries a policy that refuses them, by the group's id, so an app password that outlived its admin until the next
       pass, or a password a drifted flow would take, opens nothing (#292). Membership is direct, whatever the account's
       type or path, as the role claim reads it: someone in a group under the admins' isn't an admin there either. The
-      drift check reads that policy and its binding, and Prepare puts them back;
+      drift check reads that policy and its binding, and Prepare puts them back. It also reads that neither of the
+      session's policies passes when it fails (an exception, a timeout), and that each provider binds and searches
+      directly, never cached (a cached bind keeps binding after its app password ended, a cached search answers from a
+      copy); Prepare puts both back at once (#298);
+    - so an LDAP app's audience never has the Admin role: the adapter refuses it (#298), and the manager gives an LDAP
+      app its audience's roles but Admin. Authentik's group binding counts the groups under the admins' too, so it
+      would let in people the role claim takes for no admin. An application that has the admins' group in its audience
+      (as Homeward made them before) shows in the drift check, and Prepare takes the group out, keeping the rest, or,
+      when the admins' group alone opened it, has it refuse everyone, still on the outpost. The manager refuses to
+      apply an LDAP app for admins alone the same way;
     - an Authentik superuser who isn't Homeward's admin (a group of the console's that makes superusers) is refused the
       same way: Homeward makes them no app password, and they bind nowhere, by whatever group (#292). They hold every
       power of the provider, as an admin does; the role claim gives them no role, so the edge already lets them into
@@ -1466,3 +1475,4 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 189 | The catalog's app waves, and two apps per purpose beyond classic | The catalog's app waves (#118–#122, #123) |
 | 190 | No app password for an admin, enforced with either provider: refused for an admin, the promotion of someone holding one refused, admins' own (Kanidm's, a console's) ended at every pass with a security event (decided by default) | Adapter contracts (#281) |
 | 191 | Nobody in the admins' group binds over LDAP, whatever the credential (a policy on every bind flow, by the group's id, direct membership, guarded by the drift check); an Authentik superuser who isn't Homeward's admin is refused the same way; nobody holding anything but passkeys is made an admin (decided by default) | Adapter contracts (#292) |
+| 192 | An LDAP app's audience never has the Admin role (refused; an application that has it loses it at Prepare); the drift check reads each LDAP provider's bind mode and the session policies' failure result, and Prepare puts them back (decided by default) | Adapter contracts (#298) |

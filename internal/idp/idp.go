@@ -221,6 +221,9 @@ var (
 	ErrAdminAppPassword = errors.New("an admin holds no app password: LDAP apps take a separate account that isn't an admin")
 	// ErrAdminCredentials refuses making an admin of someone who holds anything but passkeys (#292).
 	ErrAdminCredentials = errors.New("an admin holds passkeys only")
+	// ErrLDAPAdminAudience refuses the Admin role in an LDAP app's audience (#298): admins bind nowhere (#292), and the
+	// provider would let in people the role claim takes for no admin.
+	ErrLDAPAdminAudience = errors.New("an LDAP app's audience never has the Admin role: admins bind over LDAP nowhere")
 )
 
 // LDAPApp is an app that signs people in over LDAP (#204): an LDAP provider of its own at the sign-in's LDAP outpost,
@@ -231,7 +234,7 @@ type LDAPApp struct {
 	// Slug names the app in the provider, homerslab-<app>; Name is what the provider's console shows.
 	Slug string
 	Name string
-	// Roles may bind; nobody else.
+	// Roles may bind; nobody else. Never Admin (ErrLDAPAdminAudience, #298): admins bind over LDAP nowhere (#292).
 	Roles []Role
 }
 
