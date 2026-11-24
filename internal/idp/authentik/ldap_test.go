@@ -1024,7 +1024,7 @@ func ldapRefusesAdmins(w *world, a *authentik.Authentik) func(*testing.T) {
 		}
 		refused("as made")
 
-		t.Run("whatever the credential: a bind flow drifted to take passwords still refuses them", func(t *testing.T) {
+		t.Run("whatever the credential: a bind flow drifted to take any password still refuses them", func(t *testing.T) {
 			var st struct {
 				Results []struct {
 					PK string `json:"pk"`
@@ -1041,6 +1041,17 @@ func ldapRefusesAdmins(w *world, a *authentik.Authentik) func(*testing.T) {
 			}()
 			w.raw(t, w.own, "PATCH", "/api/v3/stages/password/"+st.Results[0].PK+"/",
 				map[string]any{"backends": []string{"authentik.core.auth.InbuiltBackend", "authentik.core.auth.TokenBackend"}}, nil)
+			// And the app's own app-password policy letting anything through: only the no-admin policy is left.
+			var own struct {
+				Results []struct {
+					PK string `json:"pk"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name="+app.Slug+"-ldap-app-password", nil, &own)
+			if len(own.Results) != 1 {
+				t.Fatalf("the app's own app-password policy: %+v", own.Results)
+			}
+			w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+own.Results[0].PK+"/", map[string]any{"expression": "return True"}, nil)
 			f := w.GiveFactors(t, "hugo")
 			if err := w.Bind(t, dn("hugo"), f.Password); err != nil {
 				t.Fatalf("an adult's password, at a flow drifted to take passwords: %v; the drift isn't one", err)
