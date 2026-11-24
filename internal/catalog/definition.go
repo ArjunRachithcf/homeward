@@ -172,18 +172,27 @@ const (
 	Guard SignInMethod = "guard" // the edge signs people in for the app
 )
 
-// Identity is the identity contract an app relies on (#236). Edge names it: homerslab-v1, which the edge keeps for
-// every guarded app. The app learns who someone is from X-HomersLab-Person (a stable id that a rename doesn't change, and
-// the only one to key people on), X-HomersLab-Name (text the person may change, never to split or authorise on) and
-// X-HomersLab-Role (admin, adult or kid), which only the edge sets: it deletes every X-HomersLab-*
+// Identity is the identity contract an app relies on (#236). Edge names it: homerslab-v1 or homerslab-v2, which the
+// edge keeps for every guarded app. The app learns who someone is from X-HomersLab-Person (a stable id that a rename
+// doesn't change, and the only one to key people on), X-HomersLab-Name (text the person may change, never to split or
+// authorise on) and X-HomersLab-Role (admin, adult or kid), which only the edge sets: it deletes every X-HomersLab-*
 // header a client sends, on every name it serves, and refuses a person with no id or not exactly one role. No identity
 // provider's own headers reach the app, so it works the same with Authentik and with Kanidm.
+//
+// AuthTime, homerslab-v2's alone (#253), asks the edge for X-HomersLab-Auth-Time too: when the person last signed in
+// (authenticated, not when their session was last refreshed), as the identity provider's auth_time, in Unix seconds,
+// so the app can ask for a recent sign-in before a risky change. An app that doesn't ask is never told.
 type Identity struct {
-	Edge string `yaml:"edge" json:"edge"`
+	Edge     string `yaml:"edge" json:"edge"`
+	AuthTime bool   `yaml:"authTime" json:"authTime,omitempty"`
 }
 
-// EdgeIdentity is the identity contract the edge keeps (edge.Contract).
-const EdgeIdentity = "homerslab-v1"
+// EdgeIdentity and EdgeIdentityAuthTime are the identity contracts the edge keeps (edge.Contract,
+// edge.ContractAuthTime): homerslab-v2 is homerslab-v1 with the sign-in time an app may ask for.
+const (
+	EdgeIdentity         = "homerslab-v1"
+	EdgeIdentityAuthTime = "homerslab-v2"
+)
 
 // Names are the app's name on the household's domains, the service and port the edge sends it to, and its exposure.
 type Names struct {

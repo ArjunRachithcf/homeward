@@ -175,6 +175,7 @@ type madePlan struct {
 	ID       string
 	Name     struct{ Host string }
 	Audience struct{ People []struct{ Name string } }
+	SignIn   struct{ AuthTime bool }
 }
 
 // A plan is immutable and known by its id: the same household gets the same plan, a change in it gives a new plan,

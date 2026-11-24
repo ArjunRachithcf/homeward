@@ -212,6 +212,8 @@ func (m *Manager) apply(w http.ResponseWriter, r *http.Request, terminal bool) {
 	}
 	req := agent.AppRequest{Plan: p.ID, Product: p.App.Name, Compose: string(a.Compose), Name: p.Name.Host, Service: a.Names.Service,
 		Port: a.Names.Port, Guard: native == nil && ldap == nil, Secrets: []appunit.Secret{}, Health: []agent.AppHealth{}, Backups: []agent.AppData{}}
+	// Told when the person signed in, as the plan says (#253); the agent refuses it for an app that isn't guarded.
+	req.AuthTime = p.SignIn.AuthTime
 	if ldap != nil {
 		// The app's base DN and DN template come once the identity provider has made its directory, below.
 		req.LDAP = &agent.AppLDAP{Env: *ldap.LDAP, RefusePaths: ldap.RefusePaths}

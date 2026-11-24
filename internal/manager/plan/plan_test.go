@@ -60,7 +60,7 @@ func project() engine.Project {
 }
 
 func authentik() plan.Provider {
-	return plan.Provider{ID: "authentik", Name: "Authentik", Provides: []catalog.SignInMethod{catalog.OIDC, catalog.LDAP, catalog.Guard}}
+	return plan.Provider{ID: "authentik", Name: "Authentik", Provides: []catalog.SignInMethod{catalog.OIDC, catalog.LDAP, catalog.Guard}, AuthTime: true}
 }
 
 // household is the Ferreiras' household: an admin, an adult and a kid, on a primary with 32 GB of memory and an
@@ -174,6 +174,28 @@ func TestThePlanUsesTheFirstSignInMethodTheProviderProvides(t *testing.T) {
 	d.SignIn = []catalog.SignIn{{Method: catalog.Guard}}
 	if got := make_(t, d, h).SignIn; !got.Wired || got.Identity != catalog.EdgeIdentity {
 		t.Errorf("an app relying on the identity contract, guarded: %+v", got)
+	}
+	// The sign-in time (#253): the plan names homerslab-v2, and says the app is told when the person signed in, only for
+	// an app whose manifest asks; homerslab-v2 alone tells it nothing more.
+	for _, c := range []struct {
+		id       catalog.Identity
+		authTime bool
+	}{{catalog.Identity{Edge: catalog.EdgeIdentityAuthTime, AuthTime: true}, true}, {catalog.Identity{Edge: catalog.EdgeIdentityAuthTime}, false}} {
+		d.Identity = &c.id
+		if got := make_(t, d, h).SignIn; !got.Wired || got.Identity != catalog.EdgeIdentityAuthTime || got.AuthTime != c.authTime {
+			t.Errorf("an app on %+v, guarded: %+v, want homerslab-v2, told the sign-in time %v", c.id, got, c.authTime)
+		}
+	}
+	// A provider whose guard names no sign-in time (Kanidm's oauth2-proxy): the plan isn't wired, rather than promise it.
+	d.Identity = &catalog.Identity{Edge: catalog.EdgeIdentityAuthTime, AuthTime: true}
+	kanidm := household()
+	kanidm.Provider = plan.Provider{ID: "kanidm", Name: "Kanidm", Provides: kanidm.Provider.Provides}
+	if got := make_(t, d, kanidm).SignIn; got.Wired || got.AuthTime {
+		t.Errorf("an app asking the sign-in time, behind a guard that names none: %+v, want it not wired, told nothing", got)
+	}
+	d.SignIn, d.Identity = []catalog.SignIn{{Method: catalog.LDAP}, {Method: catalog.Guard}}, &catalog.Identity{Edge: catalog.EdgeIdentityAuthTime, AuthTime: true}
+	if got := make_(t, d, h).SignIn; got.Wired || got.AuthTime || got.Identity != "" {
+		t.Errorf("an app asking the sign-in time, by LDAP: %+v, want it not wired, told nothing", got)
 	}
 
 	d, h = definition(), household()

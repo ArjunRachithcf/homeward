@@ -92,6 +92,9 @@ type App struct {
 	// default admin's) or change who someone is to it: the edge answers them 403, and the app never sees them. Each is a
 	// path, for every method, or a method and a path ("PUT /api/users"); a path is refused with everything below it.
 	Refused []string
+	// AuthTime: a guarded app whose manifest asks when the person signed in (homerslab-v2's identity.authTime, #253) is
+	// told it in AuthTimeHeader, from its guard's answer. No other app is.
+	AuthTime bool
 }
 
 // Guard is an identity provider's forward-auth, as the edge asks it (spec: Modules → Edge).
@@ -109,6 +112,10 @@ type Guard struct {
 	// groups separated by GroupSep, which no group's name may hold. The edge turns them into the identity contract
 	// (Contract); none of them reaches the app.
 	Person, Name, Username, Role, Groups, GroupSep string
+	// AuthTime is the header of the provider's answer that says when the person last signed in: the identity provider's
+	// auth_time of their sign-in, in Unix seconds, which a refresh of their session doesn't move (#253). Empty when the
+	// provider's guard names none: the edge then tells no app.
+	AuthTime string
 	// Cookie is the prefix of the provider's own cookies on the app's name, which the app never sees (#83).
 	Cookie string
 }
@@ -116,11 +123,12 @@ type Guard struct {
 // AuthentikGuard is Authentik's embedded outpost, on its server, as the guard of an app with its own proxy provider in
 // forward_single mode (#83: never one for the whole domain). X-Authentik-Uid is the person's uid, a hash of their
 // primary key that a rename doesn't change. The role is Homeward's own header, which the guard's provider computes
-// (authentik.RoleHeader): X-Authentik-Groups joins names with |, which a group's own name may hold.
+// (authentik.RoleHeader): X-Authentik-Groups joins names with |, which a group's own name may hold. So is the sign-in
+// time (authentik.AuthTimeHeader), from the token's auth_time, which Authentik takes from the session's sign-in.
 func AuthentikGuard(dial string) *Guard {
 	return &Guard{Dial: dial, AuthURI: "/outpost.goauthentik.io/auth/caddy", Paths: []string{"/outpost.goauthentik.io/*"},
 		Person: "X-Authentik-Uid", Name: "X-Authentik-Name", Username: "X-Authentik-Username", Role: "X-Authentik-Homerslab-Role",
-		Cookie: "authentik_proxy_"}
+		AuthTime: "X-Authentik-Homerslab-Auth-Time", Cookie: "authentik_proxy_"}
 }
 
 // KanidmGuard is oauth2-proxy in front of Kanidm, one per app, answering with --set-xauthrequest (research:
@@ -128,6 +136,7 @@ func AuthentikGuard(dial string) *Guard {
 // names no display name, so the name is their preferred username; X-Auth-Request-Groups joins their groups with commas,
 // by their short names (scope groups_name), and Kanidm refuses a comma in a name (TestKanidmsGroupNamesHoldNoComma).
 // oauth2-proxy must never run with --skip-jwt-bearer-tokens: a bearer token would stand in for the session cookie.
+// Its answer names no sign-in time, so no app behind it is told one (#253).
 func KanidmGuard(dial string) *Guard {
 	return &Guard{Dial: dial, AuthURI: "/oauth2/auth", Paths: []string{"/oauth2/*"},
 		Person: "X-Auth-Request-User", Name: "X-Auth-Request-Preferred-Username", Username: "X-Auth-Request-Preferred-Username", Groups: "X-Auth-Request-Groups", GroupSep: ",",
@@ -142,11 +151,19 @@ func KanidmGuard(dial string) *Guard {
 // without an id or any name, is refused, never taken for an adult. Every site deletes every
 // header a client sends under Homeward's prefix, in any case or spelling (OwnHeaders), so only the edge's reach an app.
 // An app's manifest declares that it relies on it (identity.edge).
+//
+// ContractAuthTime, homerslab-v2, is the same contract with one more header, for an app whose manifest asks for it
+// (identity.authTime) and no other (#253): AuthTimeHeader, when the person last signed in, as the identity provider's
+// auth_time of their sign-in in Unix seconds, which a refresh of their session doesn't move. The edge sets it from its
+// guard's answer only, one value of digits only; a guard that names no such time, or names another, sets none, so an
+// app that wants a recent sign-in refuses rather than guess.
 const (
-	Contract     = "homerslab-v1"
-	PersonHeader = "X-HomersLab-Person"
-	NameHeader   = "X-HomersLab-Name"
-	RoleHeader   = "X-HomersLab-Role"
+	Contract         = "homerslab-v1"
+	ContractAuthTime = "homerslab-v2"
+	PersonHeader     = "X-HomersLab-Person"
+	NameHeader       = "X-HomersLab-Name"
+	RoleHeader       = "X-HomersLab-Role"
+	AuthTimeHeader   = "X-HomersLab-Auth-Time"
 )
 
 // OwnHeaders are the request headers under Homeward's prefix, which only the edge sets.
@@ -433,7 +450,7 @@ func appRoute(a App, domains []string) (obj, error) {
 		(g.Role == "") == (g.Groups == "") || g.Groups != "" && len(g.GroupSep) != 1 {
 		return nil, fmt.Errorf("an app's site needs its name, its upstream and its guard: %+v", a)
 	}
-	copied := slices.Concat([]obj{{"handle": []obj{{"handler": "vars"}}}}, identity(g))
+	copied := slices.Concat([]obj{{"handle": []obj{{"handler": "vars"}}}}, identity(g, a.AuthTime))
 	// The provider's refreshed cookies, each its own header: a placeholder would join them into one with commas.
 	copied = append(copied, obj{"handle": []obj{{"handler": "copy_response_headers", "include": []string{"Set-Cookie"}}}})
 	guard := toGuard(g.Dial)
@@ -478,8 +495,8 @@ var standardMethods = []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", 
 // deleted first all the same (an app may read one), and no cookie of the app's for a whole household domain (#83). Like
 // appRoute's, it is the site's handler, which Render serves with HSTS and Secure cookies.
 func nativeRoute(a App, domains []string) (obj, error) {
-	if a.Name == "" || !validDial(a.Dial) || a.Guard != nil {
-		return nil, fmt.Errorf("an app's site needs its name and its upstream, and a guard or its own sign-in, not both: %+v", a)
+	if a.Name == "" || !validDial(a.Dial) || a.Guard != nil || a.AuthTime {
+		return nil, fmt.Errorf("an app's site needs its name and its upstream, and a guard or its own sign-in, not both (and only a guard tells it when someone signed in): %+v", a)
 	}
 	app := obj{"handler": "headers"}
 	if ownDomain := ownDomainCookies(domains); ownDomain != nil {
@@ -528,7 +545,9 @@ func nativeRoute(a App, domains []string) (obj, error) {
 // identity are the routes of a guard's 2xx answer that keep the identity contract (Contract): the person's id, name
 // (their username when the provider has no name for them) and role, set on the request the app gets; or 403, when the
 // answer names no id, no name at all, or no role: not exactly one role group, or no role the provider names exactly.
-func identity(g *Guard) []obj {
+// For an app that asks (authTime, ContractAuthTime), the sign-in time too, when the answer names it as one value of
+// digits (a header sent twice reads as two joined by a comma): anything else sets none.
+func identity(g *Guard, authTime bool) []obj {
 	ph := func(h string) string { return "{http.reverse_proxy.header." + h + "}" }
 	empty := func(h string) obj { return obj{"vars": obj{ph(h): []string{""}}} }
 	sep := regexp.QuoteMeta(g.GroupSep)
@@ -555,12 +574,19 @@ func identity(g *Guard) []obj {
 	}
 	refused := obj{"match": []obj{empty(g.Person), {"not": []obj{{"not": []obj{empty(g.Name)}}, {"not": []obj{empty(g.Username)}}}}, {"not": onlyOne}},
 		"handle": []obj{{"handler": "static_response", "status_code": 403}}}
-	return slices.Concat([]obj{refused}, roles, []obj{
+	routes := slices.Concat([]obj{refused}, roles, []obj{
 		{"handle": set(PersonHeader, ph(g.Person))},
 		{"match": []obj{empty(g.Name)}, "handle": set(NameHeader, ph(g.Username))},
 		{"match": []obj{{"not": []obj{empty(g.Name)}}}, "handle": set(NameHeader, ph(g.Name))},
 	})
+	if authTime && g.AuthTime != "" {
+		routes = append(routes, obj{"match": []obj{{"vars_regexp": obj{ph(g.AuthTime): obj{"pattern": UnixSeconds}}}}, "handle": set(AuthTimeHeader, ph(g.AuthTime))})
+	}
+	return routes
 }
+
+// UnixSeconds is a sign-in time the edge passes on: digits only, no sign, no leading zero, at most twelve of them.
+const UnixSeconds = `^[1-9][0-9]{0,11}$`
 
 // parents are the household's domains and every domain above them, quoted for a regular expression, in order.
 func parents(domains []string) []string {

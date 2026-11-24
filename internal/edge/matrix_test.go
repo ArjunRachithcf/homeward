@@ -269,7 +269,21 @@ var people = map[string]person{
 	// No name: their username stands in; with neither, nobody to show.
 	"nameless": {"ak-uid-4a4a", "nameless", "", []string{"homerslab-adults"}},
 	"blank":    {"ak-uid-4b4b", "", "", []string{"homerslab-adults"}},
+	// The sign-in time the guard names wrongly (#253): twice, with a sign, with a letter, a leading zero, too long.
+	"twice-signed": {"ak-uid-5a01", "twice-signed", "Twice Signed", []string{"homerslab-adults"}},
+	"minus":        {"ak-uid-5a02", "minus", "Minus", []string{"homerslab-adults"}},
+	"lettered":     {"ak-uid-5a03", "lettered", "Lettered", []string{"homerslab-adults"}},
+	"zeroed":       {"ak-uid-5a04", "zeroed", "Zeroed", []string{"homerslab-adults"}},
+	"long":         {"ak-uid-5a05", "long", "Long", []string{"homerslab-adults"}},
+	"untimed":      {"ak-uid-5a06", "untimed", "Untimed", []string{"homerslab-adults"}},
 }
+
+// signedIn is when the stub guard says each person last signed in (#253), as Homeward's mapping names it: Unix seconds,
+// as Authentik's auth_time; each value is one header line. Anyone not listed signed in at signedInAt.
+const signedInAt = "1763990000"
+
+var signedIn = map[string][]string{"twice-signed": {"1763990000", "1763990001"}, "minus": {"-1763990000"}, "lettered": {"17639900x0"},
+	"zeroed": {"01763990000"}, "long": {"1763990000000"}, "untimed": nil}
 
 // guard is the stub of Authentik's embedded outpost: a request with the guard's cookie for someone it knows, at a
 // guarded app's name, is let on as them; any other goes to the sign-in.
@@ -282,7 +296,7 @@ func guard(w http.ResponseWriter, r *http.Request) {
 	} else if who, known = byCredentials(r); known {
 		c = &http.Cookie{Value: who.username + "-session"} // the outpost saves the session it made from them
 	}
-	if known && r.Header.Get("X-Forwarded-Host") == "pdf.example.test" {
+	if host := r.Header.Get("X-Forwarded-Host"); known && (host == "pdf.example.test" || host == "books.example.test") {
 		if who.id != "" {
 			w.Header().Set("X-Authentik-Uid", who.id)
 		}
@@ -298,6 +312,14 @@ func guard(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		w.Header().Set("X-Authentik-Homerslab-Role", map[bool]string{true: strings.Join(roles, "")}[len(roles) == 1])
+		// And when they signed in (authentik.AuthTimeHeader), for every app: the edge tells only the app that asks.
+		times, listed := signedIn[who.username]
+		if !listed {
+			times = []string{signedInAt}
+		}
+		for _, v := range times {
+			w.Header().Add("X-Authentik-Homerslab-Auth-Time", v)
+		}
 		// The session, refreshed (an expiry has a comma in it), and a second cookie: each reaches the browser whole.
 		w.Header().Add("Set-Cookie", "authentik_proxy_7f3a="+c.Value+"; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT; HttpOnly; Secure")
 		w.Header().Add("Set-Cookie", "authentik_proxy_7f3a_csrf=c; Path=/; HttpOnly; Secure")
@@ -493,6 +515,7 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 		Admin: &edge.Site{Name: "admin.example.test", Upstream: adminSock}, SignIn: &edge.Site{Name: "auth.example.test", Dial: signInStub},
 		Home: &edge.Site{Name: "home.example.test", Upstream: homeSock},
 		Apps: []edge.App{{Name: "pdf.example.test", Dial: appStub, Guard: edge.AuthentikGuard(signInStub)},
+			{Name: "books.example.test", Dial: appStub, Guard: edge.AuthentikGuard(signInStub), AuthTime: true},
 			{Name: "chores.example.test", Dial: appStub, Guard: edge.KanidmGuard(signInStub)},
 			{Name: "recipes.example.test", Dial: appStub, SignsIn: true,
 				Refused: []string{"/api/auth/token", "PUT /api/users", "POST /api/users/register"}}},
@@ -810,6 +833,47 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 				}
 			})
 		}
+	}
+	// The sign-in time (#253): books.example.test's manifest asks for it (homerslab-v2), pdf.example.test's doesn't. The
+	// edge sets X-HomersLab-Auth-Time from the guard's answer, one value of digits, for the app that asks alone; a
+	// client's own, in any spelling, never reaches either, and a value the guard names wrongly is none.
+	timeAs := func(host, who string, raw ...[2]string) request {
+		return request{Addr: edgeMesh + ":443", SNI: host, Host: host, Headers: map[string]string{"Cookie": "authentik_proxy_7f3a=" + who + "-session"}, Raw: raw}
+	}
+	forgedTime := [][2]string{{"X-HomersLab-Auth-Time", "9999999999"}, {"x-homerslab-auth-time", "9999999999"}, {"X-HOMERSLAB-AUTH-TIME", "9999999999"},
+		{"X_HomersLab_Auth_Time", "9999999999"}, {"X.HomersLab.Auth.Time", "9999999999"}, {"X-Authentik-Homerslab-Auth-Time", "9999999999"}}
+	inesAt := "[X-Homerslab-Auth-Time=" + signedInAt + " X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"
+	untold := func(name, id string) string {
+		return "200 App, at books.example.test, as [X-Homerslab-Name=" + name + " X-Homerslab-Person=" + id + " X-Homerslab-Role=adult]"
+	}
+	for _, row := range []struct {
+		name string
+		q    request
+		want string
+	}{
+		{"the app that asks: told when the person signed in, from the guard", timeAs("books.example.test", "ines"), "200 App, at books.example.test, as " + inesAt},
+		{"the app that asks, with a forged sign-in time in every spelling: only the guard's", timeAs("books.example.test", "ines", forgedTime...),
+			"200 App, at books.example.test, as " + inesAt},
+		{"the same over HTTP/2", func() request { q := timeAs("books.example.test", "ines", forgedTime...); q.H2 = true; return q }(),
+			"200 App, at books.example.test, as " + inesAt},
+		{"the app that doesn't ask: never told", timeAs("pdf.example.test", "ines"),
+			"200 App, at pdf.example.test, as [X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"},
+		{"the app that doesn't ask, with a forged sign-in time in every spelling: none reaches it", timeAs("pdf.example.test", "ines", forgedTime...),
+			"200 App, at pdf.example.test, as [X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"},
+		{"the guard names it twice: none", timeAs("books.example.test", "twice-signed"), untold("Twice Signed", "ak-uid-5a01")},
+		{"the guard names it with a sign: none", timeAs("books.example.test", "minus"), untold("Minus", "ak-uid-5a02")},
+		{"the guard names it with a letter: none", timeAs("books.example.test", "lettered"), untold("Lettered", "ak-uid-5a03")},
+		{"the guard names it with a leading zero: none", timeAs("books.example.test", "zeroed"), untold("Zeroed", "ak-uid-5a04")},
+		{"the guard names one too long: none", timeAs("books.example.test", "long"), untold("Long", "ak-uid-5a05")},
+		{"the guard names none, and the client sends one: none", timeAs("books.example.test", "untimed", forgedTime...), untold("Untimed", "ak-uid-5a06")},
+		{"no role, claiming a sign-in time: refused", timeAs("books.example.test", "none", forgedTime...), "403 "},
+	} {
+		t.Run("the sign-in time, "+row.name, func(t *testing.T) {
+			got := ask("phone", row.q)
+			if !strings.HasPrefix(got, row.want) || strings.Contains(got, "9999999999") {
+				t.Errorf("%q, want %q", got, row.want)
+			}
+		})
 	}
 	// Every other site deletes them too: an app that signs people in itself, Admin, and the sign-in.
 	for _, row := range []struct {

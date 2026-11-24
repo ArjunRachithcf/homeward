@@ -119,11 +119,14 @@ type AppRequest struct {
 	Port    int    `json:"port"`
 	// Guard: people sign in to it at the edge (its sign-in method is the guard). OIDC: it signs them in itself, with
 	// this client (#20). LDAP: it signs them in itself, over LDAP, at its own directory (#204). One of the three.
-	Guard   bool             `json:"guard"`
-	OIDC    *AppOIDC         `json:"oidc,omitempty"`
-	LDAP    *AppLDAP         `json:"ldap,omitempty"`
-	Secrets []appunit.Secret `json:"secrets"`
-	Health  []AppHealth      `json:"health"`
+	Guard bool     `json:"guard"`
+	OIDC  *AppOIDC `json:"oidc,omitempty"`
+	LDAP  *AppLDAP `json:"ldap,omitempty"`
+	// AuthTime: the edge tells the guarded app when the person signed in (X-HomersLab-Auth-Time, #253), as its plan
+	// says. Only with Guard.
+	AuthTime bool             `json:"authTime,omitempty"`
+	Secrets  []appunit.Secret `json:"secrets"`
+	Health   []AppHealth      `json:"health"`
 	// Backups are the app's data its plan backs up, and nothing else (#22).
 	Backups []AppData `json:"backups"`
 	// Storage are the storage locations the plan gives the app (#28).
@@ -169,9 +172,10 @@ type appState struct {
 	Subnet   netip.Prefix     `json:"subnet"`
 	Level    string           `json:"level"`
 	Guard    bool             `json:"guard"`
-	OIDC     *appunit.OIDC    `json:"oidc,omitempty"`    // its client's settings; never its secret
-	LDAP     *appunit.LDAP    `json:"ldap,omitempty"`    // its directory's settings (#204)
-	Refused  []string         `json:"refused,omitempty"` // its own other ways to sign in, which the edge refuses
+	AuthTime bool             `json:"authTime,omitempty"` // the edge tells it when the person signed in (#253)
+	OIDC     *appunit.OIDC    `json:"oidc,omitempty"`     // its client's settings; never its secret
+	LDAP     *appunit.LDAP    `json:"ldap,omitempty"`     // its directory's settings (#204)
+	Refused  []string         `json:"refused,omitempty"`  // its own other ways to sign in, which the edge refuses
 	Secrets  []appunit.Secret `json:"secrets"`
 	Health   []AppHealth      `json:"health"`
 	Backups  []AppData        `json:"backups,omitempty"`
@@ -379,6 +383,8 @@ func validApp(id string, r AppRequest) string {
 		return "bad-app" // one way to sign in
 	case ways == 0:
 		return "sign-in-not-built"
+	case r.AuthTime && !r.Guard:
+		return "bad-app" // only the guard knows when someone signed in
 	}
 	seen := map[string]bool{}
 	for _, s := range r.Secrets {
@@ -602,6 +608,7 @@ func (a *Agent) putApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next.Product, next.Plan, next.Name, next.Service, next.Guard, next.OIDC, next.LDAP = req.Product, req.Plan, req.Name, req.Service, req.Guard, oidc, ldap
+	next.AuthTime = req.AuthTime
 	next.Refused = nil
 	switch {
 	case req.OIDC != nil:
@@ -1090,7 +1097,7 @@ func (a *Agent) edgeApps() []edge.App {
 	for _, s := range a.state.Apps {
 		switch {
 		case s.Guard:
-			out = append(out, edge.App{Name: s.Name, Dial: s.Upstream.String(), Guard: edge.AuthentikGuard(a.upstream())})
+			out = append(out, edge.App{Name: s.Name, Dial: s.Upstream.String(), Guard: edge.AuthentikGuard(a.upstream()), AuthTime: s.AuthTime})
 		case s.OIDC != nil, s.LDAP != nil:
 			out = append(out, edge.App{Name: s.Name, Dial: s.Upstream.String(), SignsIn: true, Refused: s.Refused})
 		}

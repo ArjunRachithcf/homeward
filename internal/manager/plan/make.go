@@ -88,6 +88,13 @@ func MakeWith(d catalog.App, from From, p engine.Project, h Household, made time
 	pl.SignIn.Wired = wired(method)
 	if method.Method == catalog.Guard {
 		pl.SignIn.Identity = catalog.EdgeIdentity
+		if d.Identity != nil {
+			pl.SignIn.Identity, pl.SignIn.AuthTime = d.Identity.Edge, d.Identity.AuthTime
+		}
+		if pl.SignIn.AuthTime && !h.Provider.AuthTime {
+			// Its guard names no sign-in time: the plan isn't wired, rather than promise one the app would never get.
+			pl.SignIn.AuthTime, pl.SignIn.Wired = false, false
+		}
 	} else if d.Identity != nil {
 		pl.SignIn.Wired = false // the app relies on the edge's identity contract, which it keeps only behind the guard (#236)
 	}

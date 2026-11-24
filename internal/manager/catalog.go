@@ -114,7 +114,7 @@ var (
 
 // providers are the identity providers' reports of the sign-in methods they provide (spec: Adapter contracts).
 var providers = map[string]plan.Provider{
-	"authentik": {ID: "authentik", Name: "Authentik", Provides: []catalog.SignInMethod{catalog.OIDC, catalog.LDAP, catalog.Guard}},
+	"authentik": {ID: "authentik", Name: "Authentik", Provides: []catalog.SignInMethod{catalog.OIDC, catalog.LDAP, catalog.Guard}, AuthTime: true},
 	"kanidm":    {ID: "kanidm", Name: "Kanidm", Provides: []catalog.SignInMethod{catalog.OIDC, catalog.LDAP, catalog.Guard}},
 }
 

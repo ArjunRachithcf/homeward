@@ -52,6 +52,8 @@ test('a guarded app’s plan says the edge signs people in', async ({ page, prim
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Install BentoPDF');
   await expect(page.getByText('The edge asks for the household account first.')).toBeVisible();
   await expect(page.getByText('BentoPDF learns who someone is from the edge alone', { exact: false })).toBeVisible();
+  // BentoPDF's manifest doesn't ask when someone signed in (#253): its plan doesn't say it's told.
+  await expect(page.getByText('also told when they last signed in', { exact: false })).toHaveCount(0);
   await expect(page.getByText('Nothing to back up: it keeps no data.')).toBeVisible();
   await expect(page.getByText('pdf.ferreira.family').first()).toBeVisible();
 });

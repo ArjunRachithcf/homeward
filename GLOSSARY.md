@@ -14,7 +14,7 @@ _Avoid_: HomersLab (for the product)
 **HomersLab**:
 The maker's umbrella name, which Homeward and its maker's other apps (Philobiblos, the reading app) are published
 under. Its prefix stays in what Homeward has written into other software or published to apps: the identity headers
-`X-HomersLab-*`, the identity contract `homerslab-v1`, and the identity provider's, the mesh's and the engine's
+`X-HomersLab-*`, the identity contracts `homerslab-v1` and `homerslab-v2`, and the identity provider's, the mesh's and the engine's
 objects (ADR 0022).
 
 ### The household
@@ -183,7 +183,9 @@ A node's front door: it ends encryption and asks for the household account befor
 _Avoid_: proxy, reverse proxy, ingress, gateway
 
 **Identity contract**:
-What a guarded app is told about who someone is, by the edge alone: their stable id, their name and their role.
+What a guarded app is told about who someone is, by the edge alone: their stable id, their name and their role; with
+`homerslab-v2`, and only when the app asks, also their **sign-in time**: when they last signed in, which a refresh of
+their session doesn't move.
 _Avoid_: identity headers (the providers' own, which never reach an app), SSO headers
 
 **Exposure**:

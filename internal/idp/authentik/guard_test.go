@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +19,7 @@ import (
 	"github.com/ArjunRachithcf/homeward/internal/idp"
 	"github.com/ArjunRachithcf/homeward/internal/idp/authentik"
 	"github.com/ArjunRachithcf/homeward/internal/idp/idptest"
+	"github.com/ArjunRachithcf/homeward/internal/idp/webauthntest"
 )
 
 // scopeMapping is a scope mapping as the suite reads it behind the adapter's back.
@@ -416,5 +421,88 @@ func guardSettingsDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		if !slices.Contains(embedded().Providers, pk) {
 			t.Errorf("after Prepare, the embedded outpost serves %v, want the guard %d too", embedded().Providers, pk)
 		}
+	}
+}
+
+// signInTime is the sign-in time Homeward's mapping names in the guard's answer (#253), which the edge passes as
+// X-HomersLab-Auth-Time to an app that asks: Authentik's auth_time of the token, which it takes from the session's
+// sign-in. Once the outpost's own session is gone (as when it expires), the guard sends the browser back through the
+// sign-in, whose session still holds: nobody is asked anything, a new token is made, and its sign-in time is still the
+// first one. A new sign-in moves it. With no token (Authentik's own test of a mapping) it names none, never a made-up one;
+// and an attribute that would set it fails the mapping closed, as any forged header does.
+func signInTime(w *world) func(*testing.T) {
+	return func(t *testing.T) {
+		if edge.AuthentikGuard("").AuthTime != authentik.AuthTimeHeader {
+			t.Fatalf("the edge reads the sign-in time from %s, the guard names it in %s", edge.AuthentikGuard("").AuthTime, authentik.AuthTimeHeader)
+		}
+		ctx, p := context.Background(), w.provider
+		if err := p.EnsurePerson(ctx, idp.Person{Username: "ana", Name: "Ana", Mail: "ana@ferreira.family", Role: idp.Adult}); err != nil {
+			t.Fatal(err)
+		}
+		link, err := p.EnrolmentLink(ctx, "ana")
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := webauthntest.New(household.Origin())
+		if _, err := w.Browser(t, key).Enrol(t, link); err != nil {
+			t.Fatal(err)
+		}
+		pdf := "pdf." + household.Domain // the adults' guarded app, from the suite
+		digits := regexp.MustCompile(edge.UnixSeconds)
+		at := func(how string, jar http.CookieJar) (int64, int) {
+			t.Helper()
+			status, h, asked := w.guardIn(t, jar, key, "ana", pdf)
+			v := h.Values(authentik.AuthTimeHeader)
+			if status/100 != 2 || h.Get(authentik.RoleHeader) != string(idp.Adult) || len(v) != 1 || !digits.MatchString(v[0]) {
+				t.Fatalf("%s: %d, role %q, sign-in time %q: want 2xx, adult, one time in Unix seconds", how, status, h.Get(authentik.RoleHeader), v)
+			}
+			n, _ := strconv.ParseInt(v[0], 10, 64)
+			return n, asked
+		}
+		// The sign-in's own cookies alone: the outpost's session is gone, Authentik's is kept.
+		signInOnly := func(from http.CookieJar) http.CookieJar {
+			jar, _ := cookiejar.New(nil)
+			o, _ := url.Parse(household.Origin())
+			jar.SetCookies(o, from.Cookies(o))
+			return jar
+		}
+
+		before := time.Now().Unix()
+		jar, _ := cookiejar.New(nil)
+		first, asked := at("signed in", jar)
+		if asked == 0 || first < before-60 || first > time.Now().Unix()+60 {
+			t.Fatalf("signed in (asked %d times) at %d, between %d and now", asked, first, before)
+		}
+		time.Sleep(3 * time.Second)
+		refreshed := signInOnly(jar)
+		again, asked := at("the session refreshed", refreshed)
+		if asked != 0 {
+			t.Fatalf("refreshing the outpost's session asked who the person is %d times: that was a new sign-in", asked)
+		}
+		if again != first {
+			t.Errorf("the session refreshed without a sign-in: sign-in time %d, want %d (the first sign-in's, not the refresh's)", again, first)
+		}
+		time.Sleep(2 * time.Second)
+		fresh, _ := cookiejar.New(nil)
+		moved, asked := at("signed in again", fresh)
+		if asked == 0 || moved < first+5 {
+			t.Errorf("signed in again (asked %d times): sign-in time %d, want at least %d", asked, moved, first+5)
+		}
+
+		// Authentik's own test of the mapping has no token: no sign-in time, never a made-up one.
+		if h := w.evaluate(t, "ana"); h[authentik.AuthTimeHeader] != "" || h[authentik.RoleHeader] != string(idp.Adult) {
+			t.Errorf("the mapping with no token: %v, want the role and no sign-in time", h)
+		}
+		// An attribute naming a sign-in time, in Authentik's spelling or another: the mapping fails closed.
+		ana := w.userPK(t, "ana")
+		for _, name := range []string{authentik.AuthTimeHeader, "x_authentik_homerslab_auth_time"} {
+			w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/core/users/%d/", ana),
+				map[string]any{"attributes": map[string]any{"additionalHeaders": map[string]any{name: "9999999999"}}}, nil)
+			status, h := w.passGuard(t, key, "ana", pdf)
+			if status/100 == 2 && (h.Get(authentik.RoleHeader) != "" || strings.Contains(fmt.Sprint(h), "9999999999")) {
+				t.Errorf("an attribute %s: %d, role %q, headers %v: want no role, and no forged time", name, status, h.Get(authentik.RoleHeader), h)
+			}
+		}
+		w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/core/users/%d/", ana), map[string]any{"attributes": map[string]any{}}, nil)
 	}
 }
