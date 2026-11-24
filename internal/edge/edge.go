@@ -275,6 +275,8 @@ func Render(c Config) ([]byte, error) {
 		}
 		sites = append(sites, served{c.SignIn.Name, obj{"handler": "subroute", "routes": []obj{
 			{"match": []obj{{"path": FirstAdminPaths}}, "handle": []obj{{"handler": "static_response", "status_code": 403}}, "terminal": true},
+			// Authentik's server answers its embedded outpost's paths at any name, its own too (#273).
+			{"match": []obj{{"path": AuthentikGuard("").Paths}}, "handle": []obj{toGuard(c.SignIn.Dial)}, "terminal": true},
 			{"handle": []obj{{"handler": "reverse_proxy", "upstreams": []obj{{"dial": c.SignIn.Dial}}}}},
 		}}})
 	}
@@ -402,10 +404,25 @@ func Render(c Config) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// CredentialHeaders never reach a guard, neither its answer for an app nor the provider's own paths (#273). Authentik's
+// outpost accepts client_credentials regardless of its provider's settings (Basic with an app password, or a bearer
+// token, in an Authorization header, for a session), so an LDAP app password an app's container saw would open every
+// guarded app with no passkey. The app itself still gets the client's own. Header names are matched without regard to
+// case, over HTTP/1.1 and HTTP/2 alike. Caddy drops Proxy-Authorization before every upstream already, as a hop-by-hop
+// header: an app never gets it either.
+var CredentialHeaders = []string{"Authorization", "Proxy-Authorization"}
+
+// toGuard is every request the edge sends a guard's server, on the guard's own paths or for its answer: without the
+// client's credentials.
+func toGuard(dial string) obj {
+	return obj{"handler": "reverse_proxy", "upstreams": []obj{{"dial": dial}}, "headers": obj{"request": obj{"delete": CredentialHeaders}}}
+}
+
 // appRoute is a guarded app's site: the client's identity headers deleted first; the provider's own paths to the
-// provider; then the guard, whose 2xx answer sets the identity it names (and passes on the provider's refreshed cookie,
-// ADR 0006); then the app, without the provider's cookie, and without any cookie it sets for a whole household domain
-// (#83). It is the site's handler, which Render serves at the app's name with HSTS and Secure cookies, as every name.
+// provider, without the client's credentials (CredentialHeaders); then the guard, without them too, whose 2xx answer
+// sets the identity it names (and passes on the provider's refreshed cookie, ADR 0006); then the app, with the client's
+// Authorization, without the provider's cookie, and without any cookie it sets for a whole household domain (#83). It
+// is the site's handler, which Render serves at the app's name with HSTS and Secure cookies, as every name.
 func appRoute(a App, domains []string) (obj, error) {
 	if a.SignsIn {
 		return nativeRoute(a, domains)
@@ -419,10 +436,10 @@ func appRoute(a App, domains []string) (obj, error) {
 	copied := slices.Concat([]obj{{"handle": []obj{{"handler": "vars"}}}}, identity(g))
 	// The provider's refreshed cookies, each its own header: a placeholder would join them into one with commas.
 	copied = append(copied, obj{"handle": []obj{{"handler": "copy_response_headers", "include": []string{"Set-Cookie"}}}})
-	guard := obj{"handler": "reverse_proxy", "upstreams": []obj{{"dial": g.Dial}},
-		"rewrite":         obj{"method": "GET", "uri": g.AuthURI},
-		"headers":         obj{"request": obj{"set": obj{"X-Forwarded-Method": []string{"{http.request.method}"}, "X-Forwarded-Uri": []string{"{http.request.uri}"}}}},
-		"handle_response": []obj{{"match": obj{"status_code": []int{2}}, "routes": copied}}}
+	guard := toGuard(g.Dial)
+	guard["rewrite"] = obj{"method": "GET", "uri": g.AuthURI}
+	guard["headers"].(obj)["request"].(obj)["set"] = obj{"X-Forwarded-Method": []string{"{http.request.method}"}, "X-Forwarded-Uri": []string{"{http.request.uri}"}}
+	guard["handle_response"] = []obj{{"match": obj{"status_code": []int{2}}, "routes": copied}}
 	// The provider's cookies, out of the Cookie header the app gets; a Set-Cookie of the app's for a household domain,
 	// emptied (a browser ignores an empty one).
 	cookie := regexp.QuoteMeta(g.Cookie) + `[^=;]*=[^;]*(;\s*|$)`
@@ -432,7 +449,7 @@ func appRoute(a App, domains []string) (obj, error) {
 	}
 	var own []obj
 	if len(g.Paths) > 0 {
-		own = []obj{{"match": []obj{{"path": g.Paths}}, "handle": []obj{{"handler": "reverse_proxy", "upstreams": []obj{{"dial": g.Dial}}}}, "terminal": true}}
+		own = []obj{{"match": []obj{{"path": g.Paths}}, "handle": []obj{toGuard(g.Dial)}, "terminal": true}}
 	}
 	sub := slices.Concat(
 		[]obj{{"handle": []obj{{"handler": "headers", "request": obj{"delete": identitySpellings}}}}},

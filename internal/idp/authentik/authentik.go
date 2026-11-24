@@ -737,7 +737,7 @@ func (a *Authentik) Prepare(ctx context.Context, h idp.Household) error {
 	if _, err := a.ldapTidy(ctx, true); err != nil {
 		errs = append(errs, err)
 	}
-	// The guards' mappings back to Homeward's (#244).
+	// The guards back to Homeward's: their mappings (#244), their settings and the embedded outpost serving them (#273).
 	if err := a.ensureGuards(ctx); err != nil {
 		errs = append(errs, err)
 	}
@@ -1466,46 +1466,113 @@ func (a *Authentik) ensureRoleMapping(ctx context.Context) (string, error) {
 		"scope_name": roleScope, "description": "HomersLab: the role the edge passes to an app", "expression": roleExpression()})
 }
 
-// guardProvider is a proxy provider, as the guards' checks read it.
+// guardProvider is a proxy provider, as the guards' checks read it. The fields that decide who gets past a guard are
+// read so that one Authentik no longer answers reads as changed, never as Homeward's (#273).
 type guardProvider struct {
 	PK       int      `json:"pk"`
 	Name     string   `json:"name"`
 	Mode     string   `json:"mode"`
 	App      *string  `json:"assigned_application_slug"`
 	Mappings []string `json:"property_mappings"`
+	// Header auth is Authentik's setting for taking an Authorization header (an app password, a token) for a session,
+	// through the provider's client_credentials grant, which runs no flow. The outpost accepts client_credentials
+	// regardless, so the edge never passes either credential header to a guard (edge.CredentialHeaders); Homeward keeps
+	// the setting off as well.
+	Intercept *bool `json:"intercept_header_auth"`
+	// Basic auth sends the app a username and password from the person's attributes.
+	Basic          *bool           `json:"basic_auth_enabled"`
+	Authentication json.RawMessage `json:"authentication_flow"` // null: the brand's, Homeward's sign-in
+	Authorization  *string         `json:"authorization_flow"`
+	Invalidation   *string         `json:"invalidation_flow"`
+	Skip           *string         `json:"skip_path_regex"` // a path it matches gets past with no sign-in
+	JWTSources     []any           `json:"jwt_federation_sources"`
+	JWTProviders   []any           `json:"jwt_federation_providers"`
+	Cookie         *string         `json:"cookie_domain"`         // one for the whole domain would serve every app's
+	Validity       *string         `json:"access_token_validity"` // how long until the person signs in again
+	Host           string          `json:"external_host"`
 }
 
-// guardMappings reads the guards: every proxy provider that is a homerslab- application's, and which scope mappings
-// each may carry besides Homeward's role mapping (Authentik's own for a proxy provider). role is the role mapping, nil
-// when there is none or when there are two.
-func (a *Authentik) guardMappings(ctx context.Context) (guards []guardProvider, allowed map[string]bool, role *scopeMapping, err error) {
+// guardState is what the guards' checks read: the guards, every proxy provider that is a homerslab- application's;
+// which scope mappings each may carry besides Homeward's role mapping (Authentik's own for a proxy provider); the role
+// mapping, nil when there is none or when there are two; the flows a guard's provider names ("" when missing); and
+// Authentik's embedded outpost, nil when missing.
+type guardState struct {
+	guards         []guardProvider
+	allowed        map[string]bool
+	role           *scopeMapping
+	consent, inval string
+	outpost        *embedded
+}
+
+// embedded is Authentik's embedded outpost, as the guards read it.
+type embedded struct {
+	PK        string `json:"pk"`
+	Providers []int  `json:"providers"`
+}
+
+// guardSettings are a guard's provider's fields that decide who gets past it, as EnsureGuard makes them and Prepare
+// puts them back (#83, #244, #273): forward_single, never forward_domain; no Authorization header taken for a session
+// and none sent to the app; the brand's sign-in (Homeward's) and the default consent and invalidation flows; no path
+// skipped; no federated token; a session of 12 hours; Homeward's role mapping alone beside Authentik's own (Authentik
+// adds those). Authentik validates a partial update of a proxy provider as proxy mode unless it names its mode.
+// settingsAsOurs checks each of these.
+func guardSettings(consent, inval, role string) map[string]any {
+	return map[string]any{"mode": "forward_single", "cookie_domain": "", "intercept_header_auth": false, "basic_auth_enabled": false,
+		"basic_auth_user_attribute": "", "basic_auth_password_attribute": "", "authentication_flow": nil, "authorization_flow": consent,
+		"invalidation_flow": inval, "skip_path_regex": "", "jwt_federation_sources": []string{}, "jwt_federation_providers": []int{},
+		"access_token_validity": guardSession, "property_mappings": []string{role}}
+}
+
+// guardSession is how long a guard's session lasts before the person signs in again.
+const guardSession = "hours=12"
+
+// embeddedServing is Authentik's embedded outpost, nil when missing.
+func (a *Authentik) embeddedServing(ctx context.Context) (*embedded, error) {
+	return find[embedded](ctx, a.api, "/outposts/instances/?managed__iexact="+q(embeddedOutpost), "managed", embeddedOutpost)
+}
+
+func (a *Authentik) guardState(ctx context.Context) (st guardState, err error) {
 	ps, err := list[guardProvider](ctx, a.api, "/providers/proxy/")
 	if err != nil {
-		return nil, nil, nil, err
+		return st, err
 	}
 	for _, p := range ps {
 		if p.App != nil && strings.HasPrefix(*p.App, "homerslab-") {
-			guards = append(guards, p)
+			st.guards = append(st.guards, p)
 		}
+	}
+	if len(st.guards) == 0 {
+		return st, nil
 	}
 	ms, err := list[scopeMapping](ctx, a.api, "/propertymappings/provider/scope/")
 	if err != nil {
-		return nil, nil, nil, err
+		return st, err
 	}
-	allowed, mine := map[string]bool{}, 0
+	st.allowed = map[string]bool{}
+	mine := 0
 	for _, m := range ms {
 		if m.Managed != nil && strings.HasPrefix(*m.Managed, authentiksOwn) {
-			allowed[m.PK] = true
+			st.allowed[m.PK] = true
 		}
 		if m.Name == roleMapping {
 			mine++
-			role = &m
+			st.role = &m
 		}
 	}
 	if mine != 1 {
-		role = nil
+		st.role = nil
 	}
-	return guards, allowed, role, nil
+	for slug, pk := range map[string]*string{consentFlow: &st.consent, invalidateFlow: &st.inval} {
+		f, err := a.flow(ctx, slug)
+		if err != nil {
+			return st, err
+		}
+		if f != nil {
+			*pk = f.PK
+		}
+	}
+	st.outpost, err = a.embeddedServing(ctx)
+	return st, err
 }
 
 // asOurs says whether a role mapping is Homeward's as it writes it. Authentik trims an expression's spaces at both
@@ -1523,49 +1590,67 @@ type scopeMapping struct {
 	Expression string  `json:"expression"`
 }
 
-// mappedAsOurs says whether a guard's provider carries Homeward's role mapping and, besides it, Authentik's own
-// mappings for a proxy provider alone. Any other mapping (an admin's, in whatever scope) could name the role after
-// Homeward's does, since Authentik merges each mapping's answer in its scope's order, and over the one before it
-// (#244).
-func mappedAsOurs(p guardProvider, allowed map[string]bool, role string) bool {
+// asGuard says whether a guard's provider is as Homeward makes it, its role mapping role (#244, #273): its settings
+// as guardSettings has them, served by the embedded outpost, and carrying Homeward's role mapping and, besides it,
+// Authentik's own mappings for a proxy provider alone. Any other mapping (an admin's, in whatever scope) could name the
+// role after Homeward's does, since Authentik merges each mapping's answer in its scope's order, and over the one before
+// it.
+func (st guardState) asGuard(p guardProvider, role string) bool {
+	return st.outpost != nil && slices.Contains(st.outpost.Providers, p.PK) && st.settingsAsOurs(p, role)
+}
+
+// settingsAsOurs is asGuard of the provider alone, wherever it is served.
+func (st guardState) settingsAsOurs(p guardProvider, role string) bool {
 	if p.Mode != "forward_single" || !slices.Contains(p.Mappings, role) { // #83: never forward_domain
 		return false
 	}
+	if p.Intercept == nil || *p.Intercept || p.Basic == nil || *p.Basic || string(p.Authentication) != "null" ||
+		st.consent == "" || p.Authorization == nil || *p.Authorization != st.consent || st.inval == "" || p.Invalidation == nil || *p.Invalidation != st.inval ||
+		p.Skip == nil || *p.Skip != "" || p.JWTSources == nil || len(p.JWTSources) != 0 || p.JWTProviders == nil || len(p.JWTProviders) != 0 ||
+		p.Cookie == nil || *p.Cookie != "" || p.Validity == nil || *p.Validity != guardSession {
+		return false
+	}
 	for _, m := range p.Mappings {
-		if m != role && !allowed[m] {
+		if m != role && !st.allowed[m] {
 			return false
 		}
 	}
 	return true
 }
 
-// guardsIntact says whether every guard is as Homeward makes it: its own app's provider, in forward_single mode,
-// carrying Homeward's role mapping, unchanged, and no mapping beside it but Authentik's own (#244). A homerslab-
-// application whose provider is another one isn't intact either; Prepare leaves that one to EnsureGuard for its app.
+// guardsIntact says whether every guard is as Homeward makes it (asGuard): its own app's provider, with Homeward's
+// settings, at the embedded outpost, carrying Homeward's role mapping, unchanged, and no mapping beside it but
+// Authentik's own (#244, #273), each at a URL of its own. A homerslab- application whose provider is another one isn't
+// intact either; Prepare leaves that one to EnsureGuard for its app.
 func (a *Authentik) guardsIntact(ctx context.Context) (bool, error) {
-	guards, allowed, role, err := a.guardMappings(ctx)
-	if err != nil || len(guards) == 0 {
+	st, err := a.guardState(ctx)
+	if err != nil || len(st.guards) == 0 {
 		return err == nil, err
 	}
-	if !role.asOurs() {
+	if !st.role.asOurs() {
 		return false, nil
 	}
-	for _, p := range guards {
-		if p.Name != *p.App || !mappedAsOurs(p, allowed, role.PK) {
+	// Two guards at one URL: the outpost answers for that app with either one, and so with the other's audience. Prepare
+	// doesn't know an app's URL; EnsureGuard, for its app, puts its guard back at it.
+	hosts := map[string]bool{}
+	for _, p := range st.guards {
+		if p.Name != *p.App || !st.asGuard(p, st.role.PK) || hosts[p.Host] {
 			return false, nil
 		}
+		hosts[p.Host] = true
 	}
 	return true, nil
 }
 
-// ensureGuards puts each guard's mappings back, as EnsureGuard makes them: Homeward's role mapping as it writes it,
-// and on each guard's provider that mapping alone beside Authentik's own (#244). A provider that isn't its
-// application's own is another's, which only EnsureGuard, for its app, replaces.
+// ensureGuards puts each guard back as EnsureGuard makes it: Homeward's role mapping as it writes it, and on each
+// guard's provider Homeward's settings with that mapping alone beside Authentik's own, served by the embedded outpost
+// (#244, #273). A provider that isn't its application's own is another's, which only EnsureGuard, for its app, replaces.
 func (a *Authentik) ensureGuards(ctx context.Context) error {
-	guards, allowed, role, err := a.guardMappings(ctx)
-	if err != nil || len(guards) == 0 {
+	st, err := a.guardState(ctx)
+	if err != nil || len(st.guards) == 0 {
 		return err
 	}
+	role := st.role
 	if !role.asOurs() {
 		pk, err := a.ensureRoleMapping(ctx)
 		if err != nil {
@@ -1575,16 +1660,47 @@ func (a *Authentik) ensureGuards(ctx context.Context) error {
 	}
 	// One guard that can't be put back keeps none of the others from it: its error comes back with theirs.
 	var errs []error
-	for _, p := range guards {
-		if p.Name != *p.App || mappedAsOurs(p, allowed, role.PK) {
+	var serve []int
+	for _, p := range st.guards {
+		if p.Name != *p.App {
 			continue
 		}
-		if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/providers/proxy/%d/", p.PK), map[string]any{"mode": "forward_single",
-			"cookie_domain": "", "property_mappings": []string{role.PK}}, nil); err != nil {
-			errs = append(errs, fmt.Errorf("authentik: the guard %s's mappings: %w", p.Name, err))
+		serve = append(serve, p.PK)
+		if st.settingsAsOurs(p, role.PK) {
+			continue
+		}
+		if st.consent == "" || st.inval == "" {
+			errs = append(errs, fmt.Errorf("authentik: the guard %s: its default provider flows are missing", p.Name))
+			continue
+		}
+		if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/providers/proxy/%d/", p.PK), guardSettings(st.consent, st.inval, role.PK), nil); err != nil {
+			errs = append(errs, fmt.Errorf("authentik: the guard %s: %w", p.Name, err))
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(errs, a.serveGuards(ctx, serve...))...)
+}
+
+// serveGuards puts guards' providers on Authentik's embedded outpost, whose answers the edge asks for. It reads the
+// outpost just before it writes, so a guard another call has just put there stays.
+func (a *Authentik) serveGuards(ctx context.Context, pks ...int) error {
+	o, err := a.embeddedServing(ctx)
+	if err != nil {
+		return err
+	}
+	if o == nil {
+		return errors.New("authentik: its embedded outpost is missing")
+	}
+	providers := slices.Clone(o.Providers)
+	for _, pk := range pks {
+		if !slices.Contains(providers, pk) {
+			providers = append(providers, pk)
+		}
+	}
+	if len(providers) == len(o.Providers) {
+		return nil
+	}
+	slices.Sort(providers)
+	return a.api.call(ctx, http.MethodPatch, "/outposts/instances/"+o.PK+"/", map[string]any{"providers": providers}, nil)
 }
 
 // EnsureGuard makes an app's guard: a proxy provider of its own in forward_single mode, at the app's one URL, its
@@ -1610,9 +1726,8 @@ func (a *Authentik) EnsureGuard(ctx context.Context, g idp.Guard) error {
 	if err != nil {
 		return err
 	}
-	body := map[string]any{"name": g.Slug, "authorization_flow": consent.PK, "invalidation_flow": inval.PK, "mode": "forward_single",
-		"external_host": g.URL, "internal_host": "", "basic_auth_enabled": false, "intercept_header_auth": false, "cookie_domain": "",
-		"access_token_validity": "hours=12", "authentication_flow": nil, "property_mappings": []string{role}}
+	body := guardSettings(consent.PK, inval.PK, role)
+	body["name"], body["external_host"], body["internal_host"] = g.Slug, g.URL, ""
 	type provider struct {
 		PK   int     `json:"pk"`
 		Host string  `json:"external_host"`
@@ -1640,20 +1755,7 @@ func (a *Authentik) EnsureGuard(ctx context.Context, g idp.Guard) error {
 	if err := a.ensureApp(ctx, g.Slug, g.Name, p.PK, g.Roles); err != nil {
 		return err
 	}
-	type outpost struct {
-		PK        string `json:"pk"`
-		Providers []int  `json:"providers"`
-	}
-	o, err := find[outpost](ctx, a.api, "/outposts/instances/?managed__iexact="+q(embeddedOutpost), "managed", embeddedOutpost)
-	if err != nil || o == nil {
-		return fmt.Errorf("authentik: its embedded outpost is missing: %v", err)
-	}
-	if slices.Contains(o.Providers, p.PK) {
-		return nil
-	}
-	providers := append(slices.Clone(o.Providers), p.PK)
-	slices.Sort(providers)
-	return a.api.call(ctx, http.MethodPatch, "/outposts/instances/"+o.PK+"/", map[string]any{"providers": providers}, nil)
+	return a.serveGuards(ctx, p.PK)
 }
 
 // ensureApp makes an application for a provider, or brings it in line, which only roles may open.
@@ -1784,7 +1886,8 @@ func (a *Authentik) Report(ctx context.Context) (idp.Report, error) {
 	if err != nil {
 		return idp.Report{}, err
 	}
-	// A guard whose role another mapping could name, or whose role mapping isn't Homeward's, provides no forward-auth
+	// A guard whose role another mapping could name, or whose role mapping isn't Homeward's, or that someone gets past
+	// another way than its sign-in (#273), or two guards at one URL, provides no forward-auth
 	// the edge can take a role from (#244).
 	if r.ForwardAuth, err = a.guardsIntact(ctx); err != nil {
 		return idp.Report{}, err

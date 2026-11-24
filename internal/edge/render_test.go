@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -229,7 +230,7 @@ func TestTheSignInIsServedWithTheFirstAdminFlowCutOff(t *testing.T) {
 		if len(r.Match) == 1 && strings.Join(r.Match[0]["host"], ",") == "auth.example.test" && len(r.Handle) == 2 &&
 			r.Handle[0].Handler == "headers" && r.Handle[1].Handler == "subroute" {
 			subs := r.Handle[1].Routes
-			if len(subs) != 2 {
+			if len(subs) != 3 {
 				t.Fatalf("the sign-in's subroutes: %+v", subs)
 			}
 			paths := strings.Join(subs[0].Match[0]["path"], " ")
@@ -241,7 +242,12 @@ func TestTheSignInIsServedWithTheFirstAdminFlowCutOff(t *testing.T) {
 			if subs[0].Handle[0]["handler"] != "static_response" || subs[0].Handle[0]["status_code"] != float64(403) {
 				t.Errorf("the first-admin paths are answered with %v, want 403", subs[0].Handle[0])
 			}
-			signIn = &subs[1]
+			// The embedded outpost's paths, without the client's credentials (#273).
+			if p := strings.Join(subs[1].Match[0]["path"], " "); p != "/outpost.goauthentik.io/*" ||
+				fmt.Sprint(subs[1].Handle[0]["headers"]) != "map[request:map[delete:[Authorization Proxy-Authorization]]]" {
+				t.Errorf("the outpost's paths %q are answered with %v, want no credentials", p, subs[1].Handle[0])
+			}
+			signIn = &subs[2]
 		}
 	}
 	if signIn == nil {

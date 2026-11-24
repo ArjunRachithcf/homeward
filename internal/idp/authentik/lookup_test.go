@@ -72,6 +72,9 @@ func (f *fakeAuthentik) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if f.after != nil && r.Method != http.MethodGet {
 		defer f.after()
 	}
+	if coll == "/core/applications/" && r.Method != http.MethodGet {
+		defer f.assign()
+	}
 	if coll == "/flows/bindings/" && (r.Method == http.MethodPost || r.Method == http.MethodPatch) {
 		// Authentik keeps a flow's stage bindings unique by (target, stage, order).
 		merged := map[string]any{}
@@ -131,6 +134,18 @@ func (f *fakeAuthentik) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete:
 		f.objs[coll] = append(f.objs[coll][:at], f.objs[coll][at+1:]...)
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// assign answers each proxy provider's application, as Authentik does: the slug of the application on it, or none.
+func (f *fakeAuthentik) assign() {
+	for _, p := range f.objs["/providers/proxy/"] {
+		p["assigned_application_slug"] = nil
+		for _, app := range f.objs["/core/applications/"] {
+			if fmt.Sprint(app["provider"]) == fmt.Sprint(p["pk"]) {
+				p["assigned_application_slug"] = app["slug"]
+			}
+		}
 	}
 }
 
@@ -422,5 +437,165 @@ func TestEveryGuardCarriesTheRoleMapping(t *testing.T) {
 		if ms, _ := p["property_mappings"].([]any); len(ms) != 1 || ms[0] != m["pk"] {
 			t.Errorf("%s's provider carries %v, want the role mapping %v", name, p["property_mappings"], m["pk"])
 		}
+	}
+}
+
+// A guard changed in Authentik's console where it decides who gets past it (#273), its mappings left alone: guardsIntact
+// (Report's ForwardAuth) says so, and ensureGuards (Prepare) puts it back as EnsureGuard makes it. Header auth on would
+// take an app password in an Authorization header for a session, through the provider's client_credentials grant, with
+// no flow run; other flows than Homeward's would sign someone in another way; a skipped path or a federated token
+// would let a request past with no sign-in; a guard off the embedded outpost isn't the one the edge asks.
+func TestAGuardChangedInTheConsoleIsReportedAndPutBack(t *testing.T) {
+	testenv.Isolate(t)
+	for _, c := range []struct {
+		name   string
+		field  string
+		set    any
+		want   any
+		extras map[string]any
+	}{
+		{"header auth on", "intercept_header_auth", true, false, nil},
+		{"Basic auth to the app", "basic_auth_enabled", true, false, map[string]any{"basic_auth_user_attribute": "u", "basic_auth_password_attribute": "p"}},
+		{"another authentication flow", "authentication_flow", "flow-other", nil, nil},
+		{"another authorization flow", "authorization_flow", "flow-other", "flow-consent", nil},
+		{"another invalidation flow", "invalidation_flow", "flow-other", "flow-inval", nil},
+		{"a path that skips the sign-in", "skip_path_regex", ".*", "", nil},
+		{"tokens of another source", "jwt_federation_sources", []any{"source-1"}, []any{}, nil},
+		{"tokens of another provider", "jwt_federation_providers", []any{5}, []any{}, nil},
+		{"a cookie for the whole domain", "cookie_domain", "example.test", "", nil},
+		{"a session of a year", "access_token_validity", "weeks=52", "hours=12", nil},
+		{"a field Authentik no longer answers", "intercept_header_auth", nil, false, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFake()
+			a := f.open(t)
+			ctx := context.Background()
+			if err := a.EnsureGuard(ctx, chores); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := a.guardsIntact(ctx); !ok || err != nil {
+				t.Fatalf("as EnsureGuard made it: intact %v, %v", ok, err)
+			}
+			p := f.providers()[chores.Slug]
+			f.mu.Lock()
+			if c.set == nil {
+				delete(p, c.field)
+			} else {
+				p[c.field] = c.set
+			}
+			for k, v := range c.extras {
+				p[k] = v
+			}
+			f.mu.Unlock()
+			if ok, err := a.guardsIntact(ctx); ok || err != nil {
+				t.Errorf("changed: intact %v, %v; want not intact", ok, err)
+			}
+			if err := a.ensureGuards(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.providers()[chores.Slug][c.field]; fmt.Sprint(got) != fmt.Sprint(c.want) {
+				t.Errorf("after ensureGuards, %s is %v, want %v", c.field, got, c.want)
+			}
+			if ok, err := a.guardsIntact(ctx); !ok || err != nil {
+				t.Errorf("after ensureGuards: intact %v, %v", ok, err)
+			}
+		})
+	}
+	t.Run("off the embedded outpost", func(t *testing.T) {
+		f := newFake()
+		a := f.open(t)
+		ctx := context.Background()
+		for _, g := range []idp.Guard{pdf, chores} {
+			if err := a.EnsureGuard(ctx, g); err != nil {
+				t.Fatal(err)
+			}
+		}
+		embedded := func() map[string]any {
+			for _, o := range f.objs["/outposts/instances/"] {
+				if o["managed"] == embeddedOutpost {
+					return o
+				}
+			}
+			t.Fatal("no embedded outpost")
+			return nil
+		}
+		pk := f.providers()[chores.Slug]["pk"]
+		f.mu.Lock()
+		o := embedded()
+		var left []any
+		for _, p := range o["providers"].([]any) {
+			if fmt.Sprint(p) != fmt.Sprint(pk) {
+				left = append(left, p)
+			}
+		}
+		o["providers"] = left
+		f.mu.Unlock()
+		if ok, err := a.guardsIntact(ctx); ok || err != nil {
+			t.Errorf("off the outpost: intact %v, %v; want not intact", ok, err)
+		}
+		if err := a.ensureGuards(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprint(embedded()["providers"]); !strings.Contains(got, fmt.Sprint(pk)) || len(embedded()["providers"].([]any)) != 2 {
+			t.Errorf("after ensureGuards, the outpost serves %v, want both guards", got)
+		}
+		if ok, err := a.guardsIntact(ctx); !ok || err != nil {
+			t.Errorf("after ensureGuards: intact %v, %v", ok, err)
+		}
+	})
+}
+
+// Two guards at one URL (#273, #262): the outpost would answer for that app with either one's audience. The report
+// says so; Prepare doesn't know the app's URL, and EnsureGuard, for its app, puts its guard back at it.
+func TestTwoGuardsAtOneURLAreReported(t *testing.T) {
+	testenv.Isolate(t)
+	f := newFake()
+	a := f.open(t)
+	ctx := context.Background()
+	for _, g := range []idp.Guard{pdf, chores} {
+		if err := a.EnsureGuard(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := f.providers()[chores.Slug]
+	f.mu.Lock()
+	p["external_host"] = pdf.URL
+	f.mu.Unlock()
+	if ok, err := a.guardsIntact(ctx); ok || err != nil {
+		t.Errorf("two guards at %s: intact %v, %v; want not intact", pdf.URL, ok, err)
+	}
+	if err := a.EnsureGuard(ctx, chores); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := a.guardsIntact(ctx); !ok || err != nil {
+		t.Errorf("after EnsureGuard: intact %v, %v", ok, err)
+	}
+}
+
+// Without the default provider flows, Prepare still puts Homeward's role mapping back (#244), and says what it
+// couldn't put back.
+func TestGuardsWithoutTheirFlowsStillGetTheirRoleMappingBack(t *testing.T) {
+	testenv.Isolate(t)
+	f := newFake()
+	a := f.open(t)
+	ctx := context.Background()
+	if err := a.EnsureGuard(ctx, chores); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	var mapping map[string]any
+	for _, m := range f.objs["/propertymappings/provider/scope/"] {
+		if m["name"] == roleMapping {
+			mapping = m
+		}
+	}
+	mapping["expression"] = "return {}"
+	f.objs["/flows/instances/"] = f.objs["/flows/instances/"][2:] // the consent and invalidation flows gone
+	f.mu.Unlock()
+	if err := a.ensureGuards(ctx); err == nil {
+		t.Error("ensureGuards without the flows: no error")
+	}
+	if mapping["expression"] != roleExpression() {
+		t.Errorf("the role mapping's expression: %v, want Homeward's", mapping["expression"])
 	}
 }

@@ -316,6 +316,7 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 
 	t.Run("the role mapping names no role when anything is forged, whatever order the outpost writes in (#244)", roleMappingFailsClosed(w))
 	t.Run("drift: a foreign scope mapping on a guard, or Homeward's role mapping changed, shows in the report, and Prepare puts it back (#244)", guardDrift(w, a))
+	t.Run("drift: a guard's header auth, Basic auth, flows, skipped paths, federated tokens, cookie, session or outpost changed show in the report, and Prepare puts them back (#273)", guardSettingsDrift(w, a))
 
 	t.Run("each guard's provider keeps its own app's URL (#219)", func(t *testing.T) {
 		for slug, host := range map[string]string{"homerslab-bentopdf": "https://pdf.example.test", "homerslab-chores": "https://chores.example.test"} {

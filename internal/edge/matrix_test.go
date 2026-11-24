@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -168,7 +169,7 @@ func helper(mode, arg string) int {
 				kanidmGuard(w, r)
 				return
 			}
-			fmt.Fprintf(w, "Authentik, at %s %s%s", r.Host, r.URL.RequestURI(), ours(r))
+			fmt.Fprintf(w, "Authentik, at %s %s%s%s", r.Host, r.URL.RequestURI(), ours(r), credentials(r))
 		}))
 	case "app": // a guarded app: it says who the request names, and which cookies reached it
 		_ = http.ListenAndServe(appStub, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -278,6 +279,8 @@ func guard(w http.ResponseWriter, r *http.Request) {
 	known := false
 	if err == nil && strings.HasSuffix(c.Value, "-session") {
 		who, known = people[strings.TrimSuffix(c.Value, "-session")]
+	} else if who, known = byCredentials(r); known {
+		c = &http.Cookie{Value: who.username + "-session"} // the outpost saves the session it made from them
 	}
 	if known && r.Header.Get("X-Forwarded-Host") == "pdf.example.test" {
 		if who.id != "" {
@@ -307,9 +310,14 @@ func guard(w http.ResponseWriter, r *http.Request) {
 // kanidmGuard is the stub of oauth2-proxy in front of Kanidm, as its --set-xauthrequest answers: 202, the person's
 // sub (a UUID in Kanidm), their preferred username and their groups, comma-separated.
 func kanidmGuard(w http.ResponseWriter, r *http.Request) {
-	c, err := r.Cookie("_oauth2_proxy")
-	if err == nil && r.Header.Get("X-Forwarded-Host") == "chores.example.test" {
-		if who, ok := people[c.Value]; ok {
+	name := ""
+	if c, err := r.Cookie("_oauth2_proxy"); err == nil {
+		name = c.Value
+	} else if who, ok := byCredentials(r); ok {
+		name = who.username
+	}
+	if r.Header.Get("X-Forwarded-Host") == "chores.example.test" {
+		if who, ok := people[name]; ok {
 			if who.id != "" {
 				w.Header().Set("X-Auth-Request-User", "kanidm-"+who.id)
 			}
@@ -321,6 +329,33 @@ func kanidmGuard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(http.StatusUnauthorized)
+}
+
+// appPassword is the password the stub guards take for anyone in an Authorization header, as Authentik's outpost takes
+// a person's app password (Basic) or a token (Bearer): it accepts client_credentials regardless of its provider's
+// settings (#273): the edge never passes either header to a guard.
+const appPassword = "app-password-of-theirs"
+
+// byCredentials is the person an Authorization header names to a stub guard: Basic with appPassword, or Bearer
+// appPassword-<username>.
+func byCredentials(r *http.Request) (person, bool) {
+	if u, pw, ok := r.BasicAuth(); ok && pw == appPassword {
+		who, known := people[u]
+		return who, known
+	}
+	if token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "+appPassword+"-"); ok {
+		who, known := people[token]
+		return who, known
+	}
+	return person{}, false
+}
+
+// credentials says when an Authorization or Proxy-Authorization header reached the sign-in's server.
+func credentials(r *http.Request) string {
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Proxy-Authorization") != "" {
+		return " with credentials"
+	}
+	return ""
 }
 
 // ours are a request's headers whose names say Homeward in any case or spelling, as " [name=value …]": a site that
@@ -636,6 +671,33 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 				"\nSet-Cookie: authentik_proxy_7f3a_csrf=c; Path=/; HttpOnly; Secure"}},
 		{name: "the provider's own paths go to the provider, never the app", q: app("/outpost.goauthentik.io/callback?X-authentik-auth-callback=true", signedIn),
 			wants: []string{"200 Authentik, at pdf.example.test /outpost.goauthentik.io/callback"}, notWants: []string{"App,"}},
+		// #273: an app password, or a token, in an Authorization header would open the app with no passkey, through the
+		// provider's client_credentials grant, which the outpost accepts regardless of its provider's settings. The edge
+		// never passes it to the guard, in any spelling or protocol, nor to the provider's own paths, where the outpost
+		// would make a session of it; the app itself still gets the client's own.
+		{name: "Basic with an app password and no cookie: a redirect to the sign-in, never the app", q: app("/", map[string]string{"Authorization": basicOf("ines")}),
+			wants: []string{"302 ", "Location: https://auth.example.test/application/o/authorize/"}, notWants: []string{"App,", "authentik_proxy_7f3a=ines-session"}},
+		{name: "Basic in lower case and in odd case: never the app", q: request{Addr: edgeMesh + ":443", SNI: "pdf.example.test", Host: "pdf.example.test", Path: "/",
+			Raw: [][2]string{{"authorization", basicOf("ines")}, {"AUTHORIZATION", basicOf("rui")}, {"aUtHoRiZaTiOn", basicOf("kiko")}}},
+			wants: []string{"302 "}, notWants: []string{"App,", "-session"}},
+		{name: "Basic over HTTP/2: never the app", q: request{Addr: edgeMesh + ":443", SNI: "pdf.example.test", Host: "pdf.example.test", Path: "/", H2: true,
+			Headers: map[string]string{"Authorization": basicOf("ines")}},
+			wants: []string{"302 "}, notWants: []string{"App,", "-session"}},
+		{name: "a bearer token and no cookie: never the app", q: app("/", map[string]string{"Authorization": "Bearer " + appPassword + "-ines"}),
+			wants: []string{"302 "}, notWants: []string{"App,", "-session"}},
+		{name: "Basic at the guard's own endpoint, asked directly: no session of it", q: app("/outpost.goauthentik.io/auth/caddy",
+			map[string]string{"Authorization": basicOf("ines"), "Proxy-Authorization": basicOf("ines")}),
+			wants: []string{"302 "}, notWants: []string{"-session", "App,"}},
+		{name: "Basic at the provider's start, over HTTP/2: no credentials reach the provider", q: request{Addr: edgeMesh + ":443", SNI: "pdf.example.test",
+			Host: "pdf.example.test", Path: "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fpdf.example.test%2F", H2: true,
+			Headers: map[string]string{"Authorization": basicOf("ines"), "Proxy-Authorization": basicOf("ines")}},
+			wants: []string{"Authentik, at pdf.example.test /outpost.goauthentik.io/start"}, notWants: []string{"with credentials", "App,"}},
+		{name: "signed in, with the app's own Authorization: the app gets it unchanged", q: app("/", map[string]string{"Cookie": signedIn["Cookie"],
+			"Authorization": "Basic YXBpLWNsaWVudDphcGkta2V5"}),
+			wants: []string{"200 App, at pdf.example.test, as [Authorization=Basic YXBpLWNsaWVudDphcGkta2V5 X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"}},
+		{name: "signed in over HTTP/2, with the app's own bearer token: the app gets it unchanged", q: request{Addr: edgeMesh + ":443", SNI: "pdf.example.test",
+			Host: "pdf.example.test", Path: "/", H2: true, Headers: map[string]string{"Cookie": signedIn["Cookie"], "Authorization": "Bearer the-apps-own-token"}},
+			wants: []string{"200 App, at pdf.example.test, as [Authorization=Bearer the-apps-own-token X-Homerslab-Name=Inês Ferreira"}},
 	} {
 		t.Run("a guarded app, "+row.name, func(t *testing.T) {
 			got := ask("phone", row.q)
@@ -648,6 +710,17 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 				if strings.Contains(got, bad) {
 					t.Errorf("%q has %q", got, bad)
 				}
+			}
+		})
+	}
+
+	// Kanidm's guard too (#273): oauth2-proxy never gets a client's Authorization header from the edge.
+	for _, row := range []struct{ name, auth string }{{"Basic", basicOf("ines")}, {"a bearer token", "Bearer " + appPassword + "-ines"}} {
+		t.Run("Kanidm's guard, "+row.name+" and no cookie: never the app", func(t *testing.T) {
+			got := ask("phone", request{Addr: edgeMesh + ":443", SNI: "chores.example.test", Host: "chores.example.test", Path: "/",
+				Headers: map[string]string{"Authorization": row.auth}})
+			if strings.Contains(got, "App,") || !strings.HasPrefix(got, "401 ") && !strings.HasPrefix(got, "302 ") {
+				t.Errorf("%q, want the guard's refusal", got)
 			}
 		})
 	}
@@ -792,6 +865,12 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			q: toListener("pdf.example.test", "pdf.example.test", "/"), want: "error: ", notWants: "App,"},
 		{name: "the first-admin flow: 403, never the provider", from: "app",
 			q: toListener("auth.example.test", "auth.example.test", "/if/flow/initial-setup/"), want: "403 ", notWants: "Authentik"},
+		{name: "an app password at the embedded outpost's paths: no credentials reach the provider (#273)", from: "app",
+			q: func() request {
+				q := toListener("auth.example.test", "auth.example.test", "/outpost.goauthentik.io/auth/nginx")
+				q.Headers = map[string]string{"Authorization": basicOf("ines"), "X-Original-URL": "https://pdf.example.test/"}
+				return q
+			}(), want: "200 Authentik, at auth.example.test /outpost.goauthentik.io/auth/nginx\n", notWants: "with credentials"},
 		{name: "the edge machine's mesh listener, from an app: dropped", from: "app",
 			q: request{Addr: edgeApps + ":443", SNI: "auth.example.test", Host: "auth.example.test"}, want: "error: ", notWants: "Authentik"},
 	} {
@@ -972,6 +1051,33 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 			got := ask("phone", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test", Path: path})
 			if !strings.HasPrefix(got, "403 ") || strings.Contains(got, "Authentik") {
 				t.Errorf("%s: %q", path, got)
+			}
+		})
+	}
+
+	// Authentik's server answers its embedded outpost's paths at the sign-in's name too, with the outpost's session for
+	// an app it names (#273): no client credentials reach it there, in any spelling or protocol; its API still gets
+	// them.
+	for _, row := range []struct {
+		name string
+		q    request
+		want string
+		bad  string
+	}{
+		{"Basic at the outpost's nginx endpoint", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/outpost.goauthentik.io/auth/nginx", Headers: map[string]string{"Authorization": basicOf("ines"), "X-Original-URL": "https://pdf.example.test/"}},
+			"Authentik, at auth.example.test /outpost.goauthentik.io/auth/nginx", "with credentials"},
+		{"Basic in lower case over HTTP/2 at the outpost's start", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fpdf.example.test%2F", H2: true, Raw: [][2]string{{"authorization", basicOf("ines")}}},
+			"Authentik, at auth.example.test /outpost.goauthentik.io/start", "with credentials"},
+		{"a bearer token at the API: it reaches the provider", request{Addr: edgeMesh + ":443", SNI: "auth.example.test", Host: "auth.example.test",
+			Path: "/api/v3/core/users/me/", Headers: map[string]string{"Authorization": "Bearer an-api-token"}},
+			"Authentik, at auth.example.test /api/v3/core/users/me/ with credentials", ""},
+	} {
+		t.Run("the sign-in, "+row.name, func(t *testing.T) {
+			got := ask("phone", row.q)
+			if !strings.Contains(got, row.want) || row.bad != "" && strings.Contains(got, row.bad) {
+				t.Errorf("%q, want %q and never %q", got, row.want, row.bad)
 			}
 		})
 	}
@@ -1319,4 +1425,9 @@ func (w *world) compose(t *testing.T, args ...string) {
 func toJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// basicOf is an Authorization header with a person's app password.
+func basicOf(username string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+appPassword))
 }

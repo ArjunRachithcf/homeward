@@ -437,6 +437,14 @@ Stories 120–121 are decided in #87.
     - with Authentik, any other scope mapping on a guard's provider (Authentik's own aside), Homeward's mapping changed,
       or a provider not in `forward_single` mode could name the role instead: the provider's report then says it
       provides no forward-auth, and preparing the sign-in puts the guards' mappings back (#244);
+    - the edge never passes a client's `Authorization` or `Proxy-Authorization` to a guard, neither for an app's request
+      nor on the provider's own paths: Authentik's outpost accepts `client_credentials` regardless of the provider's
+      settings, which would take an app password or a token for a session with no passkey (#273). The app itself still
+      gets the client's `Authorization`;
+    - with Authentik, a guard's provider with header auth on, HTTP Basic sent to the app, other flows than Homeward's, a
+      path that skips the sign-in, federated tokens, a cookie for a whole domain, another session length, off the
+      embedded outpost, or two guards at one URL: reported as no forward-auth, and preparing the sign-in puts the
+      provider back (EnsureGuard, for its app, the URL) (#273);
     - a person without an id, without a name or username, in no role group or in more than one, is refused (403), never
       taken for an adult;
     - every name the edge serves deletes every `X-HomersLab-*` header a client sends, in any case, with underscores or
