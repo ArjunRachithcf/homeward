@@ -40,6 +40,7 @@ func newFake() *fakeAuthentik {
 	f.objs["/outposts/instances/"] = []map[string]any{{"pk": "outpost-ldap", "managed": nil, "providers": []int{}},
 		{"pk": "outpost-embedded", "managed": embeddedOutpost, "providers": []int{}}}
 	f.objs["/core/applications/"], f.objs["/policies/bindings/"], f.objs["/providers/proxy/"] = nil, nil, nil
+	f.objs["/sources/user_connections/all/"] = nil
 	f.objs["/policies/expression/"] = []map[string]any{{"pk": "policy-other", "name": "default-source-enrollment-if-username"}}
 	f.objs["/propertymappings/provider/scope/"] = []map[string]any{{"pk": "m-proxy", "name": "authentik default OAuth Mapping: Proxy outpost",
 		"managed": "goauthentik.io/providers/proxy/scope-proxy", "scope_name": "ak_proxy"}}
@@ -77,6 +78,14 @@ func (f *fakeAuthentik) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(p, "/core/tokens/") && strings.HasSuffix(p, "/view_key/") && r.Method == http.MethodGet {
 		reply(map[string]any{"key": "key-of-" + strings.TrimSuffix(strings.TrimPrefix(p, "/core/tokens/"), "/view_key/")})
+		return
+	}
+	if p == "/authenticators/admin/all/" && r.Method == http.MethodGet { // a bare list, of everyone's devices
+		ds := f.objs[p]
+		if ds == nil {
+			ds = []map[string]any{}
+		}
+		reply(ds)
 		return
 	}
 	if f.after != nil && r.Method != http.MethodGet {

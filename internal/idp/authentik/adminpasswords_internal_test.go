@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -214,5 +215,117 @@ func TestAnAppPasswordWhoseRoleCantBeReadAgainIsDeleted(t *testing.T) {
 	}
 	if ts := f.tokens(); len(ts) != 0 {
 		t.Errorf("the app password made is still there: %v", ts)
+	}
+}
+
+// Nobody is made an admin while they hold anything but passkeys (#292), each kind alone; the refusal changes nothing.
+// A new account made an admin, and an admin already, whatever they hold, aren't refused: nobody is locked out.
+func TestSomeoneHoldingAnythingButPasskeysIsntMadeAnAdmin(t *testing.T) {
+	testenv.Isolate(t)
+	joined := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		name string
+		give func(f *fakeAuthentik)
+		app  bool // an app password among them: ErrAdminAppPassword too
+	}{
+		{"a password", func(f *fakeAuthentik) { f.objs["/core/users/"][0]["password_change_date"] = joined.Add(time.Hour) }, false},
+		{"TOTP", func(f *fakeAuthentik) {
+			f.objs["/authenticators/admin/all/"] = []map[string]any{{"type": "authentik_stages_authenticator_totp.TOTPDevice", "confirmed": true}}
+		}, false},
+		{"recovery codes", func(f *fakeAuthentik) {
+			f.objs["/authenticators/admin/all/"] = []map[string]any{{"type": "authentik_stages_authenticator_static.StaticDevice", "confirmed": true}}
+		}, false},
+		{"an API token", func(f *fakeAuthentik) {
+			f.objs["/core/tokens/"] = []map[string]any{{"pk": "lenas-api", "identifier": "lenas-api", "intent": "api", "user": 1}}
+		}, false},
+		{"an account linked at a source", func(f *fakeAuthentik) {
+			f.objs["/sources/user_connections/all/"] = []map[string]any{{"pk": 1, "user": 1}}
+		}, false},
+		{"an app password", func(f *fakeAuthentik) { f.objs["/core/tokens/"] = []map[string]any{token("lenas", 1, nil)} }, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := withPeople()
+			f.objs["/core/users/"][0]["date_joined"], f.objs["/core/users/"][0]["password_change_date"] = joined, joined
+			// Her passkey, which never counts against her.
+			f.objs["/authenticators/admin/all/"] = []map[string]any{{"type": "authentik_stages_authenticator_webauthn.WebAuthnDevice", "confirmed": true}}
+			a := f.open(t)
+			ctx := context.Background()
+			lena := idp.Person{Username: "lena", Name: "Lena", Mail: "lena@ferreira.family", Role: idp.Admin}
+			c.give(f)
+			err := a.EnsurePerson(ctx, lena)
+			if !errors.Is(err, idp.ErrAdminCredentials) || errors.Is(err, idp.ErrAdminAppPassword) != c.app {
+				t.Fatalf("made an admin holding %s: %v, want ErrAdminCredentials (and ErrAdminAppPassword: %v)", c.name, err, c.app)
+			}
+			if len(f.changes) != 0 {
+				t.Errorf("refused, yet changed: %v", f.changes)
+			}
+			// An admin already, holding the same, whose name changes: not refused (their step-up is).
+			f.objs["/core/users/"][0]["groups"] = []any{"group-admin"}
+			lena.Name = "Lena F."
+			if err := a.EnsurePerson(ctx, lena); err != nil {
+				t.Errorf("an admin already, holding %s: %v", c.name, err)
+			}
+		})
+	}
+	t.Run("passkeys only, and a new account", func(t *testing.T) {
+		f := withPeople()
+		f.objs["/authenticators/admin/all/"] = []map[string]any{{"type": "authentik_stages_authenticator_webauthn.WebAuthnDevice", "confirmed": true},
+			{"type": "authentik_stages_authenticator_totp.TOTPDevice", "confirmed": false}} // a setup never finished
+		a := f.open(t)
+		ctx := context.Background()
+		if err := a.EnsurePerson(ctx, idp.Person{Username: "lena", Role: idp.Admin}); err != nil {
+			t.Errorf("made an admin holding passkeys only: %v", err)
+		}
+		if err := a.EnsurePerson(ctx, idp.Person{Username: "nuno", Role: idp.Admin}); err != nil {
+			t.Errorf("a new account made an admin, as the first admin is: %v", err)
+		}
+	})
+}
+
+// A superuser of Authentik's, by a group other than the admins', gets no app password either (#292's decision).
+func TestAnAuthentikSuperuserGetsNoAppPassword(t *testing.T) {
+	testenv.Isolate(t)
+	f := withPeople()
+	f.objs["/core/users/"][0]["is_superuser"] = true
+	a := f.open(t)
+	if _, err := a.AppPassword(context.Background(), "homerslab-media", "lena"); !errors.Is(err, idp.ErrAdminAppPassword) {
+		t.Errorf("an app password for a superuser: %v, want ErrAdminAppPassword", err)
+	}
+	if len(f.tokens()) != 0 || len(f.changes) != 0 {
+		t.Errorf("refused, yet changed: %v, tokens %v", f.changes, f.tokens())
+	}
+	// Made one while it was being made: ended.
+	f.objs["/core/users/"][0]["is_superuser"] = false
+	f.after = func() {
+		if f.changes[len(f.changes)-1] == "POST /core/tokens/" {
+			f.objs["/core/users/"][0]["is_superuser"] = true
+		}
+	}
+	if _, err := a.AppPassword(context.Background(), "homerslab-media", "lena"); !errors.Is(err, idp.ErrAdminAppPassword) {
+		t.Errorf("made a superuser meanwhile: %v, want ErrAdminAppPassword", err)
+	}
+	if ts := f.tokens(); len(ts) != 0 {
+		t.Errorf("the app password made meanwhile is still there: %v", ts)
+	}
+}
+
+// The no-admin policy names the admins' group by its pk, and only a pk that is a group's goes into its expression.
+func TestTheNoAdminPolicyNamesTheAdminsGroupByItsPK(t *testing.T) {
+	testenv.Isolate(t)
+	const admins = "0b8e2c8e-6a3c-4f00-9a5e-1c2d3e4f5a6b"
+	e := ldapNoAdminExpr(admins)
+	for _, want := range []string{`user.groups.filter(pk="` + admins + `").exists()`, "not user.is_superuser", `getattr(user, "pk", None)`} {
+		if !strings.Contains(e, want) {
+			t.Errorf("the expression has no %s:\n%s", want, e)
+		}
+	}
+	f := withPeople() // its groups' pks aren't UUIDs
+	for _, g := range f.objs["/core/groups/"] {
+		if g["name"] == idp.RoleGroup(idp.Admin) {
+			g["pk"] = `x") or True or ("`
+		}
+	}
+	if _, err := f.open(t).ensureNoAdmin(context.Background()); err == nil {
+		t.Error("an expression made with a pk that isn't a group's")
 	}
 }

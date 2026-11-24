@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -273,6 +275,95 @@ func ldapDrift(w *world, a *authentik.Authentik) func(*testing.T) {
 		}
 		if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
 			t.Errorf("after Prepare, a fifth time: %+v %v", r, err)
+		}
+		// The policy that refuses admins (#292): taken off the session stage, negated, outvoted (the stage passing on any
+		// one policy), or made to name another group. Each shows, and Prepare puts it back.
+		var noAdmin struct {
+			Results []struct {
+				PK string `json:"pk"`
+			}
+		}
+		w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name=homerslab-ldap-no-admin", nil, &noAdmin)
+		if len(noAdmin.Results) != 1 {
+			t.Fatalf("the no-admin policy: %+v", noAdmin.Results)
+		}
+		// The app's session stage binding (pk, and its policy binding model), and the no-admin policy's bindings there.
+		sessionBinding := func() (string, string) {
+			var fsb struct {
+				Results []struct {
+					PK    string `json:"pk"`
+					PBM   string `json:"policybindingmodel_ptr_id"`
+					Order int    `json:"order"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/flows/bindings/?target="+flowPK(t, w, flow), nil, &fsb)
+			for _, b := range fsb.Results {
+				if b.Order == 30 {
+					return b.PK, b.PBM
+				}
+			}
+			t.Fatalf("no session stage in %s: %+v", flow, fsb.Results)
+			return "", ""
+		}
+		noAdminBindings := func() []string {
+			pk, pbm := sessionBinding()
+			var pbs struct {
+				Results []struct {
+					PK     string `json:"pk"`
+					Policy string `json:"policy"`
+					Target string `json:"target"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+pbm, nil, &pbs)
+			var out []string
+			for _, b := range pbs.Results {
+				if b.Policy == noAdmin.Results[0].PK && b.Target == pk {
+					out = append(out, b.PK)
+				}
+			}
+			return out
+		}
+		admins := w.groupPK(t, idp.RoleGroup(idp.Admin))
+		for i, drift := range []struct {
+			what string
+			do   func()
+		}{
+			{"taken off the session stage", func() {
+				for _, b := range noAdminBindings() {
+					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
+				}
+			}},
+			{"negated", func() {
+				// Authentik answers a PATCH of negate alone with a 500: the binding is made again, negated.
+				_, pbm := sessionBinding()
+				for _, b := range noAdminBindings() {
+					w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+b+"/", nil, nil)
+				}
+				w.raw(t, w.own, "POST", "/api/v3/policies/bindings/", map[string]any{"target": pbm, "policy": noAdmin.Results[0].PK,
+					"order": 10, "negate": true, "enabled": true, "timeout": 30}, nil)
+			}},
+			{"outvoted: the session stage passes on any one policy", func() {
+				pk, _ := sessionBinding()
+				w.raw(t, w.own, "PATCH", "/api/v3/flows/bindings/"+pk+"/", map[string]any{"policy_engine_mode": "any"}, nil)
+			}},
+			{"naming another group", func() {
+				w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+noAdmin.Results[0].PK+"/",
+					map[string]any{"expression": strings.ReplaceAll(authentik.LDAPNoAdminExpr(admins), admins, "00000000-0000-4000-8000-000000000000")}, nil)
+			}},
+		} {
+			drift.do()
+			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+				t.Errorf("the no-admin policy %s: %+v %v, want not passkey-only", drift.what, r, err)
+			}
+			if err := idptest.Prepare(ctx, a, household); err != nil {
+				t.Fatal(err)
+			}
+			if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+				t.Errorf("after Prepare, the no-admin policy %s (%d): %+v %v", drift.what, i, r, err)
+			}
+		}
+		if bs := noAdminBindings(); len(bs) != 1 {
+			t.Errorf("the no-admin policy's bindings on the session stage, put back: %v, want one", bs)
 		}
 		t.Run("a session stage left refusing by a failure halfway is put back by the next pass", func(t *testing.T) { ldapHalfDone(t, w, a, app) })
 		t.Run("one app's bind flow that can't be put back keeps Prepare from nothing else, the first part's bind flow going among it", func(t *testing.T) { ldapOneStuck(t, w, a) })
@@ -842,5 +933,235 @@ func ldapOwnUnit(w *world) func(*testing.T) {
 		if code := w.status(t, w.own, "/api/v3/core/users/me/"); code != http.StatusOK {
 			t.Errorf("Authentik, after the outpost stopped: %d", code)
 		}
+	}
+}
+
+// groupPK is a group's pk, by name.
+func (w *world) groupPK(t *testing.T, name string) string {
+	t.Helper()
+	var gs struct {
+		Results []struct {
+			PK   string `json:"pk"`
+			Name string `json:"name"`
+		}
+	}
+	w.raw(t, w.own, "GET", "/api/v3/core/groups/?name="+url.QueryEscape(name), nil, &gs)
+	if len(gs.Results) != 1 || gs.Results[0].Name != name {
+		t.Fatalf("the group %s: %+v", name, gs.Results)
+	}
+	return gs.Results[0].PK
+}
+
+// consoleGroup makes a group as Authentik's console can, under parents, and deletes it when the test ends.
+func (w *world) consoleGroup(t *testing.T, name string, superuser bool, parents ...string) string {
+	t.Helper()
+	var g struct {
+		PK string `json:"pk"`
+	}
+	w.raw(t, w.own, "POST", "/api/v3/core/groups/", map[string]any{"name": name, "is_superuser": superuser, "parents": append([]string{}, parents...)}, &g)
+	t.Cleanup(func() { w.do(t, w.own, "DELETE", "/api/v3/core/groups/"+g.PK+"/", nil) })
+	return g.PK
+}
+
+// consoleUser makes an account as Authentik's console can, of a type, at a path, in groups, with a password set, and
+// deletes it when the test ends. It returns the password.
+func (w *world) consoleUser(t *testing.T, username, typ, path string, groups ...string) string {
+	t.Helper()
+	var u struct {
+		PK int `json:"pk"`
+	}
+	w.raw(t, w.own, "POST", "/api/v3/core/users/", map[string]any{"username": username, "name": username, "path": path, "type": typ,
+		"is_active": true, "groups": groups}, &u)
+	t.Cleanup(func() { w.do(t, w.own, "DELETE", fmt.Sprintf("/api/v3/core/users/%d/", u.PK), nil) })
+	pw := secret() + "-Aa1!"
+	w.raw(t, w.own, "POST", fmt.Sprintf("/api/v3/core/users/%d/set_password/", u.PK), map[string]string{"password": pw}, nil)
+	return pw
+}
+
+// ldapRefusesAdmins checks the bind flow's refusal of admins (#292): anyone in the admins' group, of any type and at
+// any path, the console's accounts included, binds nowhere, with an app password or with a password a drifted flow
+// would take; a person of a group under the admins' (whom the role claim, reading direct groups, doesn't take for an
+// admin either) binds; an Authentik superuser, by any group, nested ones too, doesn't. Without the policy the admins
+// would bind, and Prepare puts it back.
+func ldapRefusesAdmins(w *world, a *authentik.Authentik) func(*testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		app := idp.LDAPApp{Slug: "homerslab-staff", Name: "Staff", Roles: []idp.Role{idp.Adult, idp.Admin}}
+		creds, err := a.EnsureLDAP(ctx, app)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := a.DeleteLDAP(ctx, app.Slug); err != nil {
+				t.Error(err)
+			}
+		}()
+		dn := func(username string) string { return fmt.Sprintf(creds.UserDN, username) }
+		admins, adults := w.groupPK(t, idp.RoleGroup(idp.Admin)), w.groupPK(t, idp.RoleGroup(idp.Adult))
+		if err := a.EnsurePerson(ctx, idp.Person{Username: "hugo", Name: "Hugo", Mail: "hugo@ferreira.family", Role: idp.Adult}); err != nil {
+			t.Fatal(err)
+		}
+		hugo := appPassword(t, a, app.Slug, "hugo")
+		for deadline := time.Now().Add(90 * time.Second); w.Bind(t, dn("hugo"), hugo) != nil; time.Sleep(3 * time.Second) {
+			if time.Now().After(deadline) {
+				t.Fatal("an adult never bound: the outpost didn't take the app")
+			}
+		}
+		type account struct{ name, password, app string }
+		var inAdmins []account
+		for _, x := range []struct{ name, typ, path string }{{"ivo", "internal", "users"}, {"jon", "external", "users"},
+			{"kai", "service_account", "users"}, {"luz", "internal", authentik.UserPath}} {
+			pw := w.consoleUser(t, x.name, x.typ, x.path, admins)
+			inAdmins = append(inAdmins, account{x.name, pw, w.OwnAppPassword(t, app.Slug, x.name)})
+		}
+		refused := func(when string) {
+			t.Helper()
+			for _, x := range inAdmins {
+				if err := w.Bind(t, dn(x.name), x.app); err == nil {
+					t.Errorf("%s: %s, in the admins' group, bound with an app password made for the app", when, x.name)
+				}
+			}
+		}
+		refused("as made")
+
+		t.Run("whatever the credential: a bind flow drifted to take passwords still refuses them", func(t *testing.T) {
+			var st struct {
+				Results []struct {
+					PK string `json:"pk"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/stages/password/?name=homerslab-ldap-app-password", nil, &st)
+			if len(st.Results) != 1 {
+				t.Fatalf("the bind flow's password stage: %+v", st.Results)
+			}
+			defer func() {
+				if err := idptest.Prepare(ctx, a, household); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			w.raw(t, w.own, "PATCH", "/api/v3/stages/password/"+st.Results[0].PK+"/",
+				map[string]any{"backends": []string{"authentik.core.auth.InbuiltBackend", "authentik.core.auth.TokenBackend"}}, nil)
+			f := w.GiveFactors(t, "hugo")
+			if err := w.Bind(t, dn("hugo"), f.Password); err != nil {
+				t.Fatalf("an adult's password, at a flow drifted to take passwords: %v; the drift isn't one", err)
+			}
+			for _, x := range inAdmins {
+				if err := w.Bind(t, dn(x.name), x.password); err == nil {
+					t.Errorf("%s, in the admins' group, bound with a password", x.name)
+				}
+			}
+			refused("drifted")
+		})
+
+		t.Run("the refusal is the policy's: without it they bind, and Prepare puts it back", func(t *testing.T) {
+			var p struct {
+				Results []struct {
+					PK string `json:"pk"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name=homerslab-ldap-no-admin", nil, &p)
+			if len(p.Results) != 1 {
+				t.Fatalf("the no-admin policy: %+v", p.Results)
+			}
+			w.raw(t, w.own, "PATCH", "/api/v3/policies/expression/"+p.Results[0].PK+"/", map[string]any{"expression": "return True"}, nil)
+			if err := w.Bind(t, dn("ivo"), inAdmins[0].app); err != nil {
+				t.Errorf("without the policy, an admin's app password: %v; the refusal isn't the policy's", err)
+			}
+			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+				t.Errorf("the policy let everyone through: %+v %v, want not passkey-only", r, err)
+			}
+			if err := idptest.Prepare(ctx, a, household); err != nil {
+				t.Fatal(err)
+			}
+			if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+				t.Errorf("after Prepare: %+v %v", r, err)
+			}
+			refused("put back")
+		})
+
+		t.Run("a flow without the policy closes no app: another app's tidy puts it back first", func(t *testing.T) {
+			var p struct {
+				Results []struct {
+					PK string `json:"pk"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/policies/expression/?name=homerslab-ldap-no-admin", nil, &p)
+			if len(p.Results) != 1 {
+				t.Fatalf("the no-admin policy: %+v", p.Results)
+			}
+			// Taken off this app's session stage alone, as a flow made before #292 lacks it.
+			var fsb struct {
+				Results []struct {
+					PBM   string `json:"policybindingmodel_ptr_id"`
+					Order int    `json:"order"`
+				}
+			}
+			w.raw(t, w.own, "GET", "/api/v3/flows/bindings/?target="+flowPK(t, w, authentik.LDAPBindFlow(app.Slug)), nil, &fsb)
+			for _, b := range fsb.Results {
+				if b.Order != 30 {
+					continue
+				}
+				var pbs struct {
+					Results []struct {
+						PK     string `json:"pk"`
+						Policy string `json:"policy"`
+					}
+				}
+				w.raw(t, w.own, "GET", "/api/v3/policies/bindings/?target="+b.PBM, nil, &pbs)
+				for _, pb := range pbs.Results {
+					if pb.Policy == p.Results[0].PK {
+						w.raw(t, w.own, "DELETE", "/api/v3/policies/bindings/"+pb.PK+"/", nil, nil)
+					}
+				}
+			}
+			if r, err := a.Report(ctx); err != nil || r.PasskeyOnlySignIn {
+				t.Errorf("the policy off the app's session stage: %+v %v, want not passkey-only", r, err)
+			}
+			other := idp.LDAPApp{Slug: "homerslab-staff-two", Name: "Staff two", Roles: []idp.Role{idp.Adult}}
+			if _, err := a.EnsureLDAP(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.DeleteLDAP(ctx, other.Slug); err != nil {
+				t.Fatal(err)
+			}
+			if r, err := a.Report(ctx); err != nil || !r.PasskeyOnlySignIn {
+				t.Errorf("after another app's tidy: %+v %v, want every flow put back", r, err)
+			}
+			if err := w.Bind(t, dn("hugo"), hugo); err != nil {
+				t.Errorf("the first app, after another app's tidy: %v, want still open to its adult", err)
+			}
+			refused("after another app's tidy")
+		})
+
+		t.Run("a group under the admins' isn't the admins' group, as the role claim reads it", func(t *testing.T) {
+			under := w.consoleGroup(t, "hltest-under-admins", false, admins)
+			w.consoleUser(t, "nina", "internal", authentik.UserPath, adults, under)
+			if err := w.Bind(t, dn("nina"), w.OwnAppPassword(t, app.Slug, "nina")); err != nil {
+				t.Errorf("an adult in a group under the admins': %v, want bound (only direct members are admins)", err)
+			}
+		})
+
+		t.Run("an Authentik superuser who isn't Homeward's admin, by any group: no app password, no bind (#292's decision)", func(t *testing.T) {
+			supers := w.consoleGroup(t, "hltest-superusers", true)
+			under := w.consoleGroup(t, "hltest-under-superusers", false, supers)
+			w.consoleUser(t, "sam", "internal", authentik.UserPath, adults, supers)
+			w.consoleUser(t, "tea", "internal", authentik.UserPath, adults, under)
+			for _, who := range []string{"sam", "tea"} {
+				if _, err := a.AppPassword(ctx, app.Slug, who); !errors.Is(err, idp.ErrAdminAppPassword) {
+					t.Errorf("an app password for %s, a superuser: %v, want ErrAdminAppPassword", who, err)
+				}
+			}
+			sam, tea := w.OwnAppPassword(t, app.Slug, "sam"), w.OwnAppPassword(t, app.Slug, "tea")
+			if err := w.Bind(t, dn("sam"), sam); err == nil {
+				t.Error("a superuser bound")
+			}
+			if err := w.Bind(t, dn("tea"), tea); err == nil {
+				t.Error("a superuser by a group under a superusers' group bound")
+			}
+			w.raw(t, w.own, "PATCH", fmt.Sprintf("/api/v3/core/users/%d/", w.userPK(t, "sam")), map[string]any{"groups": []string{adults}}, nil)
+			if err := w.Bind(t, dn("sam"), sam); err != nil {
+				t.Errorf("no longer a superuser: %v, want bound (the refusal was the superuser's)", err)
+			}
+		})
 	}
 }
