@@ -914,36 +914,40 @@ func TestTheEdgesRequestMatrix(t *testing.T) {
 	// request's headers (spec: the identity contract). These rows pin today's behaviour: trailers never declared never
 	// reach the app; declared ones reach it as trailers only, never as its headers, which stay the edge's.
 	forgedTrailers := [][2]string{{"X-HomersLab-Role", "admin"}, {"X-HomersLab-Auth-Time", "9999999999"}}
-	for _, h2 := range []bool{false, true} {
-		for _, row := range []struct {
-			name       string
-			undeclared bool
-		}{{"never declared: none reaches the app", true}, {"declared in a Trailer header: they reach it as trailers only (accepted, #309)", false}} {
-			t.Run(fmt.Sprintf("request trailers forging the role and the sign-in time, %s (HTTP/2 %v)", row.name, h2), func(t *testing.T) {
-				q := timeAs("books.example.test", "ines")
-				q.Trailers, q.Undeclared, q.H2 = forgedTrailers, row.undeclared, h2
-				got, _, _ := strings.Cut(ask("phone", q), "\n") // the app's answer, without the edge's headers
-				if !strings.HasPrefix(got, "200 App, at books.example.test, as "+inesAt+",") {
-					t.Fatalf("%q: the app's headers aren't the edge's", got)
-				}
-				gap := ", trailers [X-Homerslab-Auth-Time=9999999999 X-Homerslab-Role=admin]"
-				if row.undeclared && strings.Contains(got, "trailers [") {
-					t.Errorf("%q: trailers no Trailer header declared reached the app", got)
-				}
-				if !row.undeclared && !strings.HasSuffix(got, gap) {
-					t.Errorf("%q, want it to end %q: Caddy no longer passes declared trailers on as it did when #309 accepted it; "+
-						"make this row say none reaches the app, and update the spec's accepted risk", got, gap)
+	headersOf := map[string]string{"books.example.test": inesAt, // homerslab-v2, told the sign-in time
+		"pdf.example.test": "[X-Homerslab-Name=Inês Ferreira X-Homerslab-Person=ak-uid-6f1c X-Homerslab-Role=adult]"} // homerslab-v1
+	for _, host := range []string{"books.example.test", "pdf.example.test"} {
+		for _, h2 := range []bool{false, true} {
+			for _, row := range []struct {
+				name       string
+				undeclared bool
+			}{{"never declared: none reaches the app", true}, {"declared in a Trailer header: they reach it as trailers only (accepted, #309)", false}} {
+				t.Run(fmt.Sprintf("request trailers forging the role and the sign-in time, at %s, %s (HTTP/2 %v)", host, row.name, h2), func(t *testing.T) {
+					q := timeAs(host, "ines")
+					q.Trailers, q.Undeclared, q.H2 = forgedTrailers, row.undeclared, h2
+					got, _, _ := strings.Cut(ask("phone", q), "\n") // the app's answer, without the edge's headers
+					if !strings.HasPrefix(got, "200 App, at "+host+", as "+headersOf[host]+",") {
+						t.Fatalf("%q: the app's headers aren't the edge's", got)
+					}
+					gap := ", trailers [X-Homerslab-Auth-Time=9999999999 X-Homerslab-Role=admin]"
+					if row.undeclared && strings.Contains(got, "trailers [") {
+						t.Errorf("%q: trailers no Trailer header declared reached the app", got)
+					}
+					if !row.undeclared && !strings.HasSuffix(got, gap) {
+						t.Errorf("%q, want it to end %q: Caddy no longer passes declared trailers on as it did when #309 accepted it; "+
+							"make this row say none reaches the app, and update the spec's accepted risk", got, gap)
+					}
+				})
+			}
+			t.Run(fmt.Sprintf("TE: trailers alone is served as ever, and passed on, at %s (HTTP/2 %v)", host, h2), func(t *testing.T) {
+				q := timeAs(host, "ines", [2]string{"TE", "trailers"})
+				q.H2 = h2
+				want := "200 App, at " + host + ", as [Te=trailers " + strings.TrimPrefix(headersOf[host], "[") + ", cookies []\n"
+				if got := ask("phone", q); !strings.HasPrefix(got, want) {
+					t.Errorf("%q, want it to start %q", got, want)
 				}
 			})
 		}
-		t.Run(fmt.Sprintf("TE: trailers alone is served as ever, and passed on (HTTP/2 %v)", h2), func(t *testing.T) {
-			q := timeAs("books.example.test", "ines", [2]string{"TE", "trailers"})
-			q.H2 = h2
-			want := "200 App, at books.example.test, as [Te=trailers " + strings.TrimPrefix(inesAt, "[") + ", cookies []\n"
-			if got := ask("phone", q); !strings.HasPrefix(got, want) {
-				t.Errorf("%q, want it to start %q", got, want)
-			}
-		})
 	}
 	// Every other site deletes them too: an app that signs people in itself, Admin, and the sign-in.
 	for _, row := range []struct {
@@ -1292,11 +1296,13 @@ type trailing struct {
 	r       io.Reader
 	trailer http.Header
 	values  [][2]string
+	set     bool
 }
 
 func (b *trailing) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
-	if err == io.EOF {
+	if err == io.EOF && !b.set {
+		b.set = true
 		for _, h := range b.values {
 			b.trailer.Add(h[0], h[1])
 		}
@@ -1319,7 +1325,8 @@ func (q request) tlsTo(ctx context.Context, proto string) (*tls.Conn, error) {
 	return c.(*tls.Conn), nil
 }
 
-// trailersH1 is a POST over HTTP/1.1 with a chunked body whose trailer section holds the request's trailers, and no
+// trailersH1 is a POST over HTTP/1.1 and TLS (Method, Plain and Target don't apply), its Headers and Raw sent as
+// written, with a chunked body whose trailer section holds the request's trailers, and no
 // Trailer header naming them: Go's client always writes one.
 func (q request) trailersH1(ctx context.Context) string {
 	c, err := q.tlsTo(ctx, "http/1.1")
@@ -1331,6 +1338,9 @@ func (q request) trailersH1(ctx context.Context) string {
 	fmt.Fprintf(&b, "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n", cmp.Or(q.Path, "/"), q.Host)
 	for k, v := range q.Headers {
 		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	for _, h := range q.Raw {
+		fmt.Fprintf(&b, "%s: %s\r\n", h[0], h[1])
 	}
 	b.WriteString("\r\n2\r\n{}\r\n0\r\n")
 	for _, h := range q.Trailers {
@@ -1349,7 +1359,7 @@ func (q request) trailersH1(ctx context.Context) string {
 	return fmt.Sprintf("%d %s", resp.StatusCode, body)
 }
 
-// trailersH2 is a POST over HTTP/2, framed by hand: its headers, a body, then a HEADERS frame ending the stream with the
+// trailersH2 is a POST over HTTP/2, framed by hand (Method, Plain and Target don't apply): its Headers and Raw, a body, then a HEADERS frame ending the stream with the
 // request's trailers, which no trailer header declared.
 func (q request) trailersH2(ctx context.Context) string {
 	c, err := q.tlsTo(ctx, "h2")
@@ -1372,15 +1382,16 @@ func (q request) trailersH2(ctx context.Context) string {
 	for k, v := range q.Headers {
 		fields = append(fields, [2]string{k, v})
 	}
+	fields = append(fields, q.Raw...)
 	_, _ = io.WriteString(c, http2.ClientPreface)
 	fr := http2.NewFramer(c, c)
+	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil) // HEADERS with their CONTINUATIONs, decoded whole
 	if err := errors.Join(fr.WriteSettings(),
 		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block(fields...), EndHeaders: true}),
 		fr.WriteData(1, false, []byte("{}")),
 		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block(q.Trailers...), EndHeaders: true, EndStream: true})); err != nil {
 		return "error: " + err.Error()
 	}
-	dec := hpack.NewDecoder(4096, nil)
 	status, body := "", ""
 	for {
 		f, err := fr.ReadFrame()
@@ -1392,17 +1403,20 @@ func (q request) trailersH2(ctx context.Context) string {
 			if !f.IsAck() {
 				_ = fr.WriteSettingsAck()
 			}
-		case *http2.HeadersFrame:
-			hs, _ := dec.DecodeFull(f.HeaderBlockFragment())
-			for _, h := range hs {
-				if h.Name == ":status" {
-					status = h.Value
-				}
+		case *http2.MetaHeadersFrame:
+			if f.StreamID != 1 {
+				return fmt.Sprintf("error: headers on stream %d", f.StreamID)
+			}
+			if status == "" {
+				status = f.PseudoValue("status")
 			}
 			if f.StreamEnded() {
 				return status + " " + body
 			}
 		case *http2.DataFrame:
+			if f.StreamID != 1 {
+				return fmt.Sprintf("error: data on stream %d", f.StreamID)
+			}
 			body += string(f.Data())
 			if f.StreamEnded() {
 				return status + " " + body
