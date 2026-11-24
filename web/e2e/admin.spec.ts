@@ -103,6 +103,42 @@ test('before first-time setup, Get says what’s missing', async ({ page, primar
   await expect(page).toHaveURL(store);
 });
 
+// The manager's two answers when the primary can't read an app (its tests make them with a real agent: manager
+// refusedread_test.go), stood in for here, since a real agent refuses its reads only as root (#293).
+const cantRead = {
+  'agent-unreachable': { status: 503, says: 'the primary didn’t answer. Try again in a moment.' },
+  'agent-refused-read': { status: 500, says: 'the primary answered, but wouldn’t read the app’s definition. The network is fine: the primary needs mending' },
+} as const;
+
+for (const [code, { status, says }] of Object.entries(cantRead)) {
+  test(`Get says why the primary can’t plan an app: ${code} (#293)`, async ({ page, primary }) => {
+    await primary.setUp();
+    await page.route('**/api/v1/plans', (route) =>
+      route.request().method() === 'POST' ? route.fulfill({ status, json: { error: code } }) : route.continue());
+    await page.goto(await primary.adminURL());
+    await page.getByRole('button', { name: 'Get Immich: see its install plan' }).click();
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText(`Homeward can’t plan this app: ${says}`);
+    await expect(alert).not.toContainText(code);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Store');
+  });
+
+  test(`Install says why the primary can’t install an app: ${code} (#293)`, async ({ page, primary }) => {
+    await primary.setUp();
+    await page.route('**/api/v1/plans/*/apply', (route) => route.fulfill({ status, json: { error: code } }));
+    await page.goto(await primary.adminURL());
+    await page.getByRole('button', { name: 'Get BentoPDF: see its install plan' }).click();
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Install BentoPDF');
+    const install = page.getByRole('button', { name: 'Install', exact: true });
+    await install.click();
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText(code === 'agent-unreachable' ? 'Not installed: study-pc didn’t answer.'
+      : 'Not installed: study-pc answered, but wouldn’t read BentoPDF’s definition. The network is fine');
+    await expect(alert).not.toContainText(code);
+    await expect(install).toBeEnabled();
+  });
+}
+
 test('the admin’s cookie comes from the sign-in, and Admin’s calls carry it', async ({ page, primary }) => {
   await primary.setUp();
   await page.goto(await primary.adminURL());

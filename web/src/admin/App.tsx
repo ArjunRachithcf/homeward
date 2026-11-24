@@ -122,6 +122,16 @@ const Tier = ({ tier }: { tier: string }) => (
 );
 const AppIcon = ({ src, className = '' }: { src: string; className?: string }) => <img className={`app-icon ${className}`} src={src} alt="" />;
 
+// Why Get made no plan, by the manager's code. An app that asks for a storage location (#28): this page can't choose
+// one yet, and says so. The primary silent, or answering but refusing to read the app's definition (#293): two causes,
+// two fixes.
+const cantPlan: Partial<Record<string, Key>> = {
+  'household-not-set-up': 'store.notSetUp',
+  'storage-location-needed': 'store.needsStorage',
+  'agent-unreachable': 'store.cantPlan.agent-unreachable',
+  'agent-refused-read': 'store.cantPlan.agent-refused-read',
+};
+
 /** Get: makes the app's install plan, and opens it. */
 function GetButton({ app, go, primary }: { app: { id: string; name: string }; go: Go; primary?: boolean }) {
   const [state, setState] = useState<{ busy?: boolean; why?: string }>({});
@@ -131,9 +141,8 @@ function GetButton({ app, go, primary }: { app: { id: string; name: string }; go
       go(`/plans/${(await makePlan(app.id)).id}`);
     } catch (e) {
       const code = e instanceof Refused ? e.code : 'unknown';
-      // An app that asks for a storage location (#28): this page can't choose one yet, and says so, not a code.
-      const why = code === 'household-not-set-up' ? t('store.notSetUp')
-        : code === 'storage-location-needed' ? t('store.needsStorage') : t('store.cantPlan', { why: code });
+      const known = cantPlan[code];
+      const why = known ? t(known) : t('store.cantPlan', { why: code });
       setState({ why });
     }
   };
@@ -452,7 +461,7 @@ function Installed({ p, app }: { p: Plan; app: InstalledApp }) {
 
 function refusal(p: Plan, e: unknown): string {
   const code = e instanceof Refused ? e.code : 'unknown';
-  const known = ['sign-in-not-ready', 'stale-plan', 'not-ours', 'agent-unreachable', 'client-failed', 'step-up-required'].includes(code);
+  const known = ['sign-in-not-ready', 'stale-plan', 'not-ours', 'agent-unreachable', 'agent-refused-read', 'client-failed', 'step-up-required'].includes(code);
   return known ? t(`plan.install.refused.${code}` as Key, { node: p.placement.node, app: p.app.name }) : t('plan.install.refused', { why: code });
 }
 
