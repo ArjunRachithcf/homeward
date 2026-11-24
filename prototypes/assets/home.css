@@ -14,7 +14,7 @@
 
 /* the greeting: the large title, then today's one fact in grey (apple.com's two-tone headline) */
 .h-hello { padding: 56px 0 36px; }
-.h-hello h1 { font-size: var(--fs-large-title); line-height: var(--lh-title); font-weight: var(--weight-bold); letter-spacing: var(--tracking-large); max-width: 24ch; }
+.h-hello h1 { font-size: var(--fs-large-title); line-height: var(--lh-title); font-weight: var(--weight-bold); letter-spacing: var(--tracking-large); max-width: 24ch; overflow-wrap: anywhere; hyphens: auto; }
 .h-hello h1 .fact { color: var(--text-2); transition: opacity var(--dur-base), filter var(--dur-base); }
 .h-hello h1 .fact.swap { opacity: 0; filter: blur(4px); }
 .h-hello .h-sub { margin-top: 12px; color: var(--text-2); font-size: var(--fs-headline); }
@@ -33,7 +33,6 @@
 .row.only-wide::before { display: none; }
 @media (max-width: 640px) {
   .h-hello { padding: 28px 0 24px; }
-  .h-hello .h-sub { font-size: var(--fs-body); }
   .h-me .h-me-name { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .h-me { padding: 4px; }
   .only-phone { display: revert; }
