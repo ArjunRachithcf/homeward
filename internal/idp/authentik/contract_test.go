@@ -944,7 +944,14 @@ func up(t *testing.T, engine string) *world {
 		}
 	}
 	file := strings.NewReplacer("name: homerslab-authentik", "name: "+project, "172.31.250.", signInNet+".",
-		"/run/homeward-authentik/", dir+"/", "/run/homeward-ldap/", dir+"/").Replace(string(packaged))
+		"/run/homeward-authentik/", dir+"/", "/run/homeward-ldap/", dir+"/",
+		// Authentik's web workers are replaced after a thousand requests each, and its front answers 503 ("authentik
+		// starting") for that moment: the manager waits that out as a provider not ready yet, but the suite's own calls
+		// don't, and it makes that many requests a few minutes apart (#303). Here they are kept.
+		"\n    AUTHENTIK_LOG_LEVEL: warning\n", "\n    AUTHENTIK_LOG_LEVEL: warning\n    AUTHENTIK_WEB__MAX_REQUESTS: \"0\"\n").Replace(string(packaged))
+	if strings.Count(file, "AUTHENTIK_WEB__MAX_REQUESTS") != 1 {
+		t.Fatal("the packaged compose file hasn't the one AUTHENTIK_LOG_LEVEL line of the server's and worker's to keep the web workers beside")
+	}
 	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte(file), 0o644); err != nil {
 		t.Fatal(err)
 	}
