@@ -208,12 +208,19 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 				t.Errorf("%s at once: %+v %v, want a password", c.path, got, err)
 			}
 		}
-		// Someone else's password is never one's own.
+		// Someone else's password is never one's own, an earlier account's of the same name included.
+		var old struct {
+			PK int `json:"pk"`
+		}
+		w.raw(t, own, "POST", "/api/v3/core/users/", map[string]any{"username": "wes", "name": "wes", "path": "users", "type": "internal",
+			"is_active": true}, &old)
+		w.raw(t, own, "POST", fmt.Sprintf("/api/v3/core/users/%d/set_password/", old.PK), map[string]string{"password": secret() + "-Aa1!"}, nil)
+		w.raw(t, own, "DELETE", fmt.Sprintf("/api/v3/core/users/%d/", old.PK), nil, nil)
 		if err := w.provider.EnsurePerson(ctx, idp.Person{Username: "wes", Name: "Wes", Mail: "wes@ferreira.family", Role: idp.Adult}); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := w.provider.Credentials(ctx, "wes"); err != nil || slices.Contains(got.Others, idp.CredPassword) {
-			t.Errorf("someone who set no password: %+v %v, want none", got, err)
+			t.Errorf("someone who set no password, after an earlier account of their name did: %+v %v, want none", got, err)
 		}
 	})
 	t.Run("LDAP: an app's directory at the outpost, for its roles only (#204)", func(t *testing.T) {
