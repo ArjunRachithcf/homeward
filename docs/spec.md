@@ -550,6 +550,19 @@ Stories 120–121 are decided in #87.
       it there; Authentik's settings and console allow the same. So every pass of the manager's schedule reads the app passwords of
       every member of the admins' group (an account the console made or put there included, inactive ones too) and
       ends them, with a security event per admin that says the way, or that they couldn't be ended;
+    - nobody in the admins' group binds over LDAP at all, whatever they bind with: every LDAP bind flow of Homeward's
+      carries a policy that refuses them, by the group's id, so an app password that outlived its admin until the next
+      pass, or a password a drifted flow would take, opens nothing (#292). Membership is direct, whatever the account's
+      type or path, as the role claim reads it: someone in a group under the admins' isn't an admin there either. The
+      drift check reads that policy and its binding, and Prepare puts them back;
+    - an Authentik superuser who isn't Homeward's admin (a group of the console's that makes superusers) is refused the
+      same way: Homeward makes them no app password, and they bind nowhere, by whatever group (#292). They hold every
+      power of the provider, as an admin does; the role claim gives them no role, so the edge already lets them into
+      nothing;
+  - nobody is made an admin who holds anything but passkeys (a password, TOTP, recovery codes, a token, an account
+    linked at a source): the role change is refused, changing nothing, and says to remove them first or make the admin
+    a new account (#292). A new account made an admin (the first admin) and someone who is an admin already are never
+    refused, so nobody is locked out; an admin who holds more anyway is refused at step-up, as above, with the way out;
 - optional SSH sign-in on nodes: SSSD with Authentik, kanidm-unixd with Kanidm;
 - a report of what it can do.
 
@@ -1452,3 +1465,4 @@ Every answer of the grilling (2026-11-09) and where it lives:
 | 188 | Admins' app-scoped LDAP credentials count against the passkey-only check; an admin uses LDAP apps with a separate account that isn't an admin (decided) | Adapter contracts (#104, #274) |
 | 189 | The catalog's app waves, and two apps per purpose beyond classic | The catalog's app waves (#118–#122, #123) |
 | 190 | No app password for an admin, enforced with either provider: refused for an admin, the promotion of someone holding one refused, admins' own (Kanidm's, a console's) ended at every pass with a security event (decided by default) | Adapter contracts (#281) |
+| 191 | Nobody in the admins' group binds over LDAP, whatever the credential (a policy on every bind flow, by the group's id, direct membership, guarded by the drift check); an Authentik superuser who isn't Homeward's admin is refused the same way; nobody holding anything but passkeys is made an admin (decided by default) | Adapter contracts (#292) |

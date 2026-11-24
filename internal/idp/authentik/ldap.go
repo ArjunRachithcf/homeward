@@ -95,6 +95,30 @@ func ldapPasswordOnly(obj string) string {
 		"return context.get(\"auth_method\") == \"token\" and str(token.get(\"name\", \"\")).startswith(\"" + ldapPasswordOf(obj) + "\")"
 }
 
+// ldapNoAdmin is the policy on every LDAP bind flow's session stage, beside the provider's own app-password policy,
+// that refuses anyone in the admins' group, whatever they bind with (#292): an admin holds passkeys only, and an app
+// password that drifted past AppPassword, or a password a drifted flow would take, still opens nothing. The stage's
+// policies are re-evaluated when it is reached, on the person the flow identified (the plan's pending user).
+const ldapNoAdmin = "homerslab-ldap-no-admin"
+
+// groupPK is what an Authentik group's pk looks like: a UUID. Only one goes into a policy's expression.
+var groupPK = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ldapNoAdminExpr is ldapNoAdmin's expression, for the admins' group's pk. Membership is the groups a person is in
+// directly, as the role claim reads them (roleExpression): a person of a group under the admins' isn't an admin there
+// either. Any account type and path counts: the console can put any account in the group. An Authentik superuser, by
+// whatever group, is refused too (#292's decision): they hold the provider's every power, as an admin does.
+func ldapNoAdminExpr(admins string) string {
+	return strings.Join([]string{
+		"# HomersLab (#292): nobody in the admins' group, nor an Authentik superuser, binds over LDAP, whatever they bind with.",
+		"# The admins' group by its pk, among the groups the person is in directly, as the role claim reads them.",
+		"user = request.user",
+		`if not getattr(user, "pk", None):`,
+		"    return False",
+		`return not user.is_superuser and not user.groups.filter(pk="` + admins + `").exists()`,
+	}, "\n")
+}
+
 var _ idp.LDAP = (*Authentik)(nil)
 
 func validLDAPSlug(slug string) error {
@@ -143,6 +167,10 @@ func (a *Authentik) ldapBindFlow(ctx context.Context, obj string) (string, error
 	if err != nil {
 		return "", err
 	}
+	noAdmin, err := a.ensureNoAdmin(ctx)
+	if err != nil {
+		return "", err
+	}
 	f, err := a.ensureFlow(ctx, ldapFlowOf(obj), map[string]any{"name": "HomersLab: an app's LDAP bind (" + obj + ")", "title": "LDAP",
 		"designation": "authentication", "authentication": "require_outpost", "denied_action": "message",
 		"policy_engine_mode": "all", "compatibility_mode": false, "layout": "stacked"})
@@ -150,7 +178,7 @@ func (a *Authentik) ldapBindFlow(ctx context.Context, obj string) (string, error
 		return "", err
 	}
 	if err := a.bindStages(ctx, f, []stageBinding{{Stage: pks[stageLDAPID]}, {Stage: pks[stageLDAPPass]},
-		{Stage: pks[stageLDAPLogin], Policies: []binding{{Policy: only}}}}); err != nil {
+		{Stage: pks[stageLDAPLogin], Policies: []binding{{Policy: only}, {Policy: noAdmin}}}}); err != nil {
 		return "", err
 	}
 	// No policy on the flow itself: only the application's decide who binds.
@@ -162,6 +190,19 @@ func (a *Authentik) ldapBindFlow(ctx context.Context, obj string) (string, error
 		return "", err
 	}
 	return f, nil
+}
+
+// ensureNoAdmin makes ldapNoAdmin, or brings it back to the admins' group as it is now, and returns its pk.
+func (a *Authentik) ensureNoAdmin(ctx context.Context) (string, error) {
+	admins, err := a.adminGroup(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !groupPK.MatchString(admins) {
+		return "", fmt.Errorf("authentik: the admins' group's pk %q isn't a group's", admins)
+	}
+	return a.ensure(ctx, "/policies/expression/", ldapNoAdmin, map[string]any{"name": ldapNoAdmin,
+		"expression": ldapNoAdminExpr(admins), "execution_logging": false})
 }
 
 // ldapFlows are Homeward's bind flows, by the names of the providers they are for.
@@ -183,7 +224,8 @@ func (a *Authentik) ldapFlows(ctx context.Context) ([]string, error) {
 // flow it is: at an outpost only, bound to its three stages alone, in order, each as bindStages makes it (never decided
 // at planning, decided again when reached), with no policy bound to the flow, to the username's or to the password's
 // stage (a policy that fails skips its stage: a bind with no password), the session's bound to the provider's own
-// app-password policy alone, as Homeward writes it, and each stage as it should be (the username with no password of
+// app-password policy and to ldapNoAdmin, both as Homeward writes them (ldapNoAdmin for the admins' group as it is now),
+// both to pass, and nothing else (#292), and each stage as it should be (the username with no password of
 // its own, an app password only, the session). Otherwise a password from the console, no password at all, or an app
 // password made for another app could sign a person in to an LDAP app (#204). A flow that isn't there isn't intact.
 func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, string, error) {
@@ -202,6 +244,7 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 		OnPlan  bool   `json:"evaluate_on_plan"`
 		ReEval  bool   `json:"re_evaluate_policies"`
 		Invalid string `json:"invalid_response_action"`
+		Mode    string `json:"policy_engine_mode"`
 	}
 	bs, err := where[bound](ctx, a.api, "/flows/bindings/?target="+q(f.PK), "target", f.PK)
 	if err != nil {
@@ -228,12 +271,15 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 	pw, err2 := find[password](ctx, a.api, "/stages/password/?name="+q(stageLDAPPass), "name", stageLDAPPass)
 	in, err3 := find[login](ctx, a.api, "/stages/user_login/?name="+q(stageLDAPLogin), "name", stageLDAPLogin)
 	only, err4 := find[expression](ctx, a.api, "/policies/expression/?name="+q(ldapPolicyOf(obj)), "name", ldapPolicyOf(obj))
-	if err := errors.Join(err1, err2, err3, err4); err != nil || id == nil || pw == nil || in == nil || only == nil {
+	noAdmin, err5 := find[expression](ctx, a.api, "/policies/expression/?name="+q(ldapNoAdmin), "name", ldapNoAdmin)
+	admins, err6 := find[group](ctx, a.api, "/core/groups/?name="+q(idp.RoleGroup(idp.Admin)), "name", idp.RoleGroup(idp.Admin))
+	if err := errors.Join(err1, err2, err3, err4, err5, err6); err != nil || id == nil || pw == nil || in == nil || only == nil ||
+		noAdmin == nil || admins == nil {
 		return false, f.PK, err
 	}
 	// Authentik keeps an expression without the whitespace around it.
 	if id.Password != nil || id.Passless != nil || !slices.Equal(id.Fields, []string{"username"}) || !slices.Equal(pw.Backends, []string{appPasswords}) ||
-		strings.TrimSpace(only.Expr) != ldapPasswordOnly(obj) {
+		strings.TrimSpace(only.Expr) != ldapPasswordOnly(obj) || strings.TrimSpace(noAdmin.Expr) != ldapNoAdminExpr(admins.PK) {
 		return false, f.PK, nil
 	}
 	slices.SortFunc(bs, func(x, y bound) int { return x.Order - y.Order })
@@ -249,13 +295,14 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 		Negate bool    `json:"negate"`
 		On     bool    `json:"enabled"`
 	}
-	// The policies each target may have: none on the flow and its first two stages, the provider's own on the session.
+	// The policies each target may have: none on the flow and its first two stages; on the session, the provider's own
+	// and ldapNoAdmin, each once, both to pass.
 	targets := []struct {
 		t    target
 		only bool
 	}{{t: target{PBM: f.PBM, PK: f.PK}}}
 	for i, b := range bs {
-		if b.Stage != want[i] || b.Order != (i+1)*10 || b.OnPlan || !b.ReEval || b.Invalid != "retry" {
+		if b.Stage != want[i] || b.Order != (i+1)*10 || b.OnPlan || !b.ReEval || b.Invalid != "retry" || i == len(want)-1 && b.Mode != "all" {
 			return false, f.PK, nil
 		}
 		targets = append(targets, struct {
@@ -271,8 +318,20 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 		switch {
 		case !t.only && len(ps) > 0:
 			return false, f.PK, nil
-		case t.only && (len(ps) != 1 || ptrStr(ps[0].Policy) != only.PK || ps[0].Group != nil || ps[0].User != nil || ps[0].Negate || !ps[0].On):
-			return false, f.PK, nil
+		case t.only:
+			var got []string
+			for _, p := range ps {
+				if p.Group != nil || p.User != nil || p.Negate || !p.On {
+					return false, f.PK, nil
+				}
+				got = append(got, ptrStr(p.Policy))
+			}
+			slices.Sort(got)
+			want := []string{only.PK, noAdmin.PK}
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				return false, f.PK, nil
+			}
 		}
 	}
 	return true, f.PK, nil
@@ -304,7 +363,8 @@ func (a *Authentik) AppPassword(ctx context.Context, slug, username string) (idp
 	if err != nil {
 		return "", err
 	}
-	if slices.Contains(u.Groups, admins) {
+	// An Authentik superuser who isn't Homeward's admin gets none either: their bind is refused all the same (#292).
+	if slices.Contains(u.Groups, admins) || u.Superuser {
 		return "", idp.ErrAdminAppPassword
 	}
 	b := make([]byte, 12)
@@ -317,7 +377,7 @@ func (a *Authentik) AppPassword(ctx context.Context, slug, username string) (idp
 	// Made an admin while it was being made: EnsurePerson reads the app passwords after its change, and this the role
 	// after its own, so one of the two sees the other's and ends the password (#281).
 	again, err := find[user](ctx, a.api, "/core/users/?username="+q(username), "username", username)
-	if err != nil || again == nil || slices.Contains(again.Groups, admins) {
+	if err != nil || again == nil || slices.Contains(again.Groups, admins) || again.Superuser {
 		why := idp.ErrAdminAppPassword
 		switch {
 		case err != nil:
@@ -745,6 +805,16 @@ func (a *Authentik) ldapTidy(ctx context.Context, repair bool) (bool, error) {
 			intact, flowPK, err := a.ldapBindIntact(ctx, p.Name)
 			if err != nil {
 				return false, err
+			}
+			if repair && !intact && flowPK != "" && p.Flow == flowPK {
+				// Its own flow, drifted or made before a rule it lacks (#292's policy, after an upgrade): put back
+				// before it is judged, so one shared policy's drift never closes every app. One that can't be put
+				// back is closed, as before.
+				if _, err := a.ldapBindFlow(ctx, p.Name); err == nil {
+					if intact, flowPK, err = a.ldapBindIntact(ctx, p.Name); err != nil {
+						return false, err
+					}
+				}
 			}
 			fine = intact && p.Flow == flowPK
 		}

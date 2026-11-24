@@ -127,6 +127,8 @@ type user struct {
 	Groups   []string       `json:"groups"`
 	Attrs    map[string]any `json:"attributes"`
 	Path     string         `json:"path"`
+	// Superuser is Authentik's own: true when any group the account is in, or one above them, makes a superuser.
+	Superuser bool `json:"is_superuser"`
 }
 
 type group struct {
@@ -470,6 +472,7 @@ func (a *Authentik) bindStages(ctx context.Context, flowPK string, want []stageB
 		OnPlan  bool   `json:"evaluate_on_plan"`
 		ReEval  bool   `json:"re_evaluate_policies"`
 		Invalid string `json:"invalid_response_action"`
+		Mode    string `json:"policy_engine_mode"`
 	}
 	have, err := where[fsb](ctx, a.api, "/flows/bindings/?target="+q(flowPK), "target", flowPK)
 	if err != nil {
@@ -478,7 +481,11 @@ func (a *Authentik) bindStages(ctx context.Context, flowPK string, want []stageB
 	// The wanted stages are in place before anything else goes, so a flow being put back never runs with a stage
 	// missing (the LDAP bind flow without its password stage would bind anyone, #204): a binding of the stage that is
 	// there already is changed in place, a missing one is made, and only then are the others deleted.
-	conforms := func(h fsb, i int) bool { return h.Order == (i+1)*10 && !h.OnPlan && h.ReEval && h.Invalid == "retry" }
+	// Every policy bound to a stage must pass (#292: a session stage passing on any one of them would let the app's
+	// app-password policy outvote the one refusing admins).
+	conforms := func(h fsb, i int) bool {
+		return h.Order == (i+1)*10 && !h.OnPlan && h.ReEval && h.Invalid == "retry" && h.Mode == "all"
+	}
 	used := make([]bool, len(have))
 	for i, w := range want {
 		j := -1 // this stage's binding: one that conforms, or else any to change in place
@@ -972,7 +979,9 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 		body["groups"] = []string{want}
 		return a.api.call(ctx, http.MethodPost, "/core/users/", body, nil)
 	}
-	// Made an admin: refused while they hold an app password that binds (#281), before anything changes.
+	// Made an admin: refused while they hold anything but passkeys (#292), an app password that binds among them
+	// (#281), before anything changes. An admin already isn't refused here, whatever they hold: their step-up is, with
+	// the way out, so nobody is locked out of Admin by a change of their name.
 	promoted := p.Role == idp.Admin && !slices.Contains(u.Groups, want)
 	if promoted {
 		ts, err := a.appPasswords(ctx, u)
@@ -981,7 +990,15 @@ func (a *Authentik) EnsurePerson(ctx context.Context, p idp.Person) error {
 		}
 		if n := liveAppPasswords(ts); n > 0 {
 			return fmt.Errorf("authentik: %s holds %d app passwords; remove them first, or keep them on a separate account that isn't an admin: %w",
-				p.Username, n, idp.ErrAdminAppPassword)
+				p.Username, n, errors.Join(idp.ErrAdminAppPassword, idp.ErrAdminCredentials))
+		}
+		c, err := a.credentialsOf(ctx, u)
+		if err != nil {
+			return err
+		}
+		if len(c.Others) > 0 {
+			return fmt.Errorf("authentik: %s holds %s besides passkeys; an admin holds passkeys only, so remove them first, or make the admin a new account: %w",
+				p.Username, strings.Join(c.Others, ", "), idp.ErrAdminCredentials)
 		}
 	}
 	keep := []string{want}
@@ -1060,6 +1077,12 @@ func (a *Authentik) Credentials(ctx context.Context, username string) (idp.Crede
 	if err != nil {
 		return idp.Credentials{}, err
 	}
+	return a.credentialsOf(ctx, u)
+}
+
+// credentialsOf is Credentials, of an account read already.
+func (a *Authentik) credentialsOf(ctx context.Context, u *user) (idp.Credentials, error) {
+	username := u.Username
 	out := idp.Credentials{Others: []string{}}
 	add := func(kind string) {
 		if !slices.Contains(out.Others, kind) {

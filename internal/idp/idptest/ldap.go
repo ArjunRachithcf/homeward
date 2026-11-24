@@ -408,8 +408,15 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 		w.ConsoleAdmin(t, "carla")
 		bea, olga, maria := w.OwnAppPassword(t, notes.Slug, "bea"), w.OwnAppPassword(t, notes.Slug, "olga"), password(notes, "maria")
 		carla := w.OwnAppPassword(t, notes.Slug, "carla")
-		if err := ready(shared, "bea", bea); err != nil {
-			t.Fatalf("an admin, with the app password she made herself: %v", err)
+		if err := ready(shared, "maria", maria); err != nil {
+			t.Fatalf("an adult, in an app open to adults and admins: %v", err)
+		}
+		// Before any pass ends them: nobody in the admins' group binds, the console's admin too, at an app open to
+		// admins, with an app password made for it (#292).
+		for who, pw := range map[string]string{"bea": bea, "olga": olga, "carla": carla} {
+			if err := w.Bind(t, dn(shared, who), pw); err == nil {
+				t.Errorf("%s, an admin, bound with the app password she made herself (#292)", who)
+			}
 		}
 		found, err := l.EndAdminAppPasswords(ctx)
 		if err != nil {

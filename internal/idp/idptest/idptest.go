@@ -655,4 +655,78 @@ func Run(t *testing.T, w World, version string) {
 			t.Errorf("after Prepare: %+v", r)
 		}
 	})
+
+	t.Run("nobody holding anything but passkeys is made an admin, and nobody is locked out by it (#292)", func(t *testing.T) {
+		isAdmin := func(username string) bool {
+			t.Helper()
+			admins, err := p.People(ctx, idp.Admin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return slices.ContainsFunc(admins, func(x idp.Person) bool { return x.Username == username })
+		}
+		for _, c := range []struct {
+			who  idp.Person
+			give func(t *testing.T, username string)
+		}{
+			{idp.Person{Username: "dora", Name: "Dora", Mail: "dora@ferreira.family", Role: idp.Adult},
+				func(t *testing.T, u string) { w.GiveFactors(t, u) }}, // a password and TOTP
+			{idp.Person{Username: "edu", Name: "Edu", Mail: "edu@ferreira.family", Role: idp.Adult},
+				func(t *testing.T, u string) { w.GiveOthers(t, u) }}, // an app password and recovery codes
+		} {
+			if err := p.EnsurePerson(ctx, c.who); err != nil {
+				t.Fatal(err)
+			}
+			c.give(t, c.who.Username)
+			before, err := p.Credentials(ctx, c.who.Username)
+			if err != nil || len(before.Others) == 0 {
+				t.Fatalf("%s's credentials: %+v %v, want something besides passkeys", c.who.Username, before, err)
+			}
+			c.who.Role = idp.Admin
+			if err := p.EnsurePerson(ctx, c.who); !errors.Is(err, idp.ErrAdminCredentials) {
+				t.Errorf("%s, holding %v, made an admin: %v, want ErrAdminCredentials", c.who.Username, before.Others, err)
+			}
+			if isAdmin(c.who.Username) {
+				t.Errorf("%s is an admin after the refusal", c.who.Username)
+			}
+			if after, err := p.Credentials(ctx, c.who.Username); err != nil || !slices.Equal(after.Others, before.Others) {
+				t.Errorf("%s's credentials after the refusal: %+v %v, want them unchanged", c.who.Username, after, err)
+			}
+		}
+		// Passkeys only: made an admin, then back.
+		fern := idp.Person{Username: "fern", Name: "Fern", Mail: "fern@ferreira.family", Role: idp.Adult}
+		if err := p.EnsurePerson(ctx, fern); err != nil {
+			t.Fatal(err)
+		}
+		link, err := p.EnrolmentLink(ctx, "fern")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Browser(t, webauthntest.New(h.Origin())).Enrol(t, link); err != nil {
+			t.Fatal(err)
+		}
+		fern.Role = idp.Admin
+		if err := p.EnsurePerson(ctx, fern); err != nil || !isAdmin("fern") {
+			t.Errorf("someone holding a passkey only, made an admin: %v", err)
+		}
+		// An admin already who holds something else isn't refused a change (their step-up is, with the way out), and
+		// recovery still mints them a link: neither changes a role.
+		w.GiveFactors(t, "fern")
+		fern.Name = "Fern F."
+		if err := p.EnsurePerson(ctx, fern); err != nil || !isAdmin("fern") {
+			t.Errorf("an admin holding a password, renamed: %v, want no refusal", err)
+		}
+		if _, err := p.EnrolmentLink(ctx, "fern"); err != nil {
+			t.Errorf("a recovery link for that admin: %v", err)
+		}
+		// A new account made an admin straight away, as the first admin is.
+		if err := p.EnsurePerson(ctx, idp.Person{Username: "gil", Name: "Gil", Mail: "gil@ferreira.family", Role: idp.Admin}); err != nil || !isAdmin("gil") {
+			t.Errorf("a new account made an admin: %v", err)
+		}
+		for _, u := range []string{"fern", "gil"} {
+			if err := p.EnsurePerson(ctx, idp.Person{Username: u, Name: u, Mail: u + "@ferreira.family", Role: idp.Adult}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
 }

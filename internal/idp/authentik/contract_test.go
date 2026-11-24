@@ -185,6 +185,7 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 		idptest.RunLDAP(t, w)
 		t.Run("an LDAP-only app binds from its own container through the LDAPS port, and reads only its own person", ldapAppInItsContainer(w, a))
 		t.Run("drift: a bind flow that takes passwords, or another app's, shows in the report, and Prepare puts it back", ldapDrift(w, a))
+		t.Run("nobody in the admins' group, nor a superuser, binds, whatever they hold; the policy guarded (#292)", ldapRefusesAdmins(w, a))
 		t.Run("an app's directory keeps apart from the app's own application", ldapBesideTheAppsOwn(w, a))
 		t.Run("drift: a provider at the outpost without its application is closed and taken off, then deleted", ldapOrphan(w, a))
 		t.Run("drift: providers of the console's at the outpost, named as an app's, are taken off", ldapImpostors(w, a))

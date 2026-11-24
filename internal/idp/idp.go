@@ -185,7 +185,10 @@ type Provider interface {
 	// passkey: one comes only from an enrolment link. Making someone an admin who holds app passwords is refused with
 	// ErrAdminAppPassword and changes nothing: they're removed first (LDAP.RevokeAppPasswords, or the person in the
 	// provider's own settings), or the person keeps them on a separate account that isn't an admin (#281). One made
-	// at the same moment as the promotion is ended with it.
+	// at the same moment as the promotion is ended with it. Making someone an admin who holds anything else but
+	// passkeys (Credentials.Others: a password, TOTP, recovery codes, a token, a linked account) is refused the same
+	// way, with ErrAdminCredentials, which an app password's refusal wraps too (#292). A new account, or someone who is
+	// an admin already, is never refused: the first admin is a new account, and recovery changes no role.
 	EnsurePerson(ctx context.Context, p Person) error
 	// People are the people in a role.
 	People(ctx context.Context, r Role) ([]Person, error)
@@ -216,6 +219,8 @@ var (
 	// ErrAdminAppPassword refuses an app password for an admin, and making an admin of someone who holds one (#281):
 	// an admin who uses LDAP apps does it with a separate account that isn't an admin.
 	ErrAdminAppPassword = errors.New("an admin holds no app password: LDAP apps take a separate account that isn't an admin")
+	// ErrAdminCredentials refuses making an admin of someone who holds anything but passkeys (#292).
+	ErrAdminCredentials = errors.New("an admin holds passkeys only")
 )
 
 // LDAPApp is an app that signs people in over LDAP (#204): an LDAP provider of its own at the sign-in's LDAP outpost,
@@ -266,7 +271,8 @@ type LDAP interface {
 	// DN and at no other app's, so an app that is handed it can't replay it elsewhere. It is shown only here. The app's
 	// directory must be there; whether the person is in its audience is the bind's to say, as for every other password.
 	// Credentials counts it, so an admin who holds one passes no step-up: it refuses an admin with ErrAdminAppPassword,
-	// one made an admin while it was being made included (#274, #281).
+	// one made an admin while it was being made included (#274, #281). Nobody in the admins' group binds over LDAP
+	// anyway, whatever they bind with: the provider's bind refuses them (#292).
 	AppPassword(ctx context.Context, slug, username string) (Secret, error)
 	// RevokeAppPasswords ends every app password the person holds, for every app, whoever made it: from the moment it
 	// returns, none of them binds anywhere.
