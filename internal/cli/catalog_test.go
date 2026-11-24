@@ -84,7 +84,7 @@ func TestTheCLISaysWhyThePrimaryCantReadAnApp(t *testing.T) {
 		"agent-refused-read": {"500", "the primary answered, but wouldn't read the app's definition. The network is fine: the primary needs mending, and sudo journalctl -u homeward-agent there says why"},
 		"agent-busy":         {"503", "the primary was busy reading another app's definition. Try again in a moment"},
 		"read-timeout":       {"422", "its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher"},
-		"read-too-big":       {"422", "its definition is too large to read, so the primary stopped. Trying again won't help: tell the catalog's publisher"},
+		"read-too-big":       {"422", "its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher"},
 	} {
 		sock, _ := routedControl(t, map[string][2]string{"POST /api/v1/plans": {c.status, `{"error":"` + code + `"}`}})
 		exit, _, errOut := run(t, "plan", "immich", "--control-socket", sock)

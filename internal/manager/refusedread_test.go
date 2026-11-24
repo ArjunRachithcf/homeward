@@ -133,7 +133,9 @@ func installs(check bool) func(*http.Request) bool {
 }
 
 // reads matches the agent's compose reads.
-func reads(r *http.Request) bool { return r.Method == http.MethodPost && r.URL.Path == "/v1/projects/read" }
+func reads(r *http.Request) bool {
+	return r.Method == http.MethodPost && r.URL.Path == "/v1/projects/read"
+}
 
 // answerInstead puts a socket in front of p's agent that passes everything to it but the requests match picks, which it
 // answers status with only the error code, as the agent does. It counts them.

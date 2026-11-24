@@ -138,7 +138,7 @@ var cantRead = map[string]string{
 	"agent-refused-read": "the primary answered, but wouldn't read the app's definition. The network is fine: the primary needs mending, and sudo journalctl -u homeward-agent there says why (most often a missing read user or permission)",
 	"agent-busy":         "the primary was busy reading another app's definition. Try again in a moment",
 	"read-timeout":       "its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher",
-	"read-too-big":       "its definition is too large to read, so the primary stopped. Trying again won't help: tell the catalog's publisher",
+	"read-too-big":       "its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher",
 }
 
 // planWords says a plan in plain words, as Admin's plan page does.

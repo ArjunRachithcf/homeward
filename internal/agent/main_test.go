@@ -50,6 +50,12 @@ func TestMain(m *testing.M) {
 			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
 				panic("the reader fell over on line 7")
 			}))
+		case "read-project-panic-elsewhere": // its panic in a goroutine of the reader's own, which no recover reaches
+			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
+				go panic("the reader's helper fell over on line 9")
+				time.Sleep(time.Hour)
+				return engine.Project{}, nil
+			}))
 		case "read-project-hog":
 			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
 				for {

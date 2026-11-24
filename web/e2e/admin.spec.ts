@@ -115,8 +115,8 @@ const cantRead = {
     install: 'Not installed: study-pc was busy reading another app’s definition. Try again in a moment.' },
   'read-timeout': { status: 422, says: 'its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog’s publisher.',
     install: 'Not installed: BentoPDF’s definition took too long to read, so study-pc stopped. Try again later' },
-  'read-too-big': { status: 422, says: 'its definition is too large to read, so the primary stopped. Trying again won’t help: tell the catalog’s publisher.',
-    install: 'Not installed: BentoPDF’s definition is too large to read, so study-pc stopped. Trying again won’t help' },
+  'read-too-big': { status: 422, says: 'its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog’s publisher.',
+    install: 'Not installed: BentoPDF’s definition needs more memory to read than Homeward allows, so study-pc stopped. Try again later' },
 } as const;
 
 for (const [code, { status, says, install: installSays }] of Object.entries(cantRead)) {

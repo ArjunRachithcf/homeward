@@ -34,7 +34,10 @@ func routedControl(t *testing.T, answers map[string][2]string) (string, *[]strin
 		}
 		code := http.StatusOK
 		if a[0] != "" {
-			code, _ = strconv.Atoi(a[0])
+			var err error
+			if code, err = strconv.Atoi(a[0]); err != nil {
+				code = http.StatusInternalServerError
+			}
 		}
 		w.WriteHeader(code)
 		_, _ = w.Write([]byte(a[1]))

@@ -807,7 +807,7 @@ func (a *Agent) readProject(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) readTrouble(w http.ResponseWriter, err error, project string) bool {
 	switch {
 	case errors.Is(err, errBusy):
-		a.log.Warn("a compose read waited for another to end", "project", project)
+		a.log.Warn("a compose read was refused as busy: another held the slot, or too many children are alive", "project", project)
 		fail(w, http.StatusServiceUnavailable, "busy")
 	case errors.Is(err, errReadTimeout):
 		a.log.Warn("a compose read ran out of time", "project", project)
@@ -1209,6 +1209,11 @@ func (rs *reads) read(ctx context.Context, name string, file []byte) (engine.Pro
 			return engine.Project{}, errReadTimeout
 		case killed, strings.Contains(said, "out of memory"), strings.Contains(said, "cannot allocate memory"):
 			return engine.Project{}, errReadTooBig
+		case ended && crashed(said):
+			// A crash readSafely can't recover (a panic in another goroutine, a fatal runtime error such as a stack
+			// overflow) is the reader's bug on this file too: invalid-compose, its words for the log (#295).
+			rs.log.Error("the compose reader crashed on an app's compose file", "project", name, "panic", head(said, maxPanic))
+			return engine.Project{}, errReaderPanicked
 		}
 		return engine.Project{}, fmt.Errorf("%w: %v (%v) %s", errNoReader, err, runErr, strings.TrimSpace(said))
 	}
@@ -1229,6 +1234,20 @@ func (rs *reads) read(ctx context.Context, name string, file []byte) (engine.Pro
 	default:
 		return engine.Project{}, errors.New(res.Detail)
 	}
+}
+
+// crashed says whether a Go child's standard error ends with a crash: an unrecovered panic or a fatal runtime error.
+func crashed(said string) bool {
+	return strings.HasPrefix(said, "panic: ") || strings.Contains(said, "\npanic: ") ||
+		strings.HasPrefix(said, "fatal error: ") || strings.Contains(said, "\nfatal error: ")
+}
+
+// head is s's first n bytes at most.
+func head(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 // cpuUsed is the CPU time a child used, user and system.

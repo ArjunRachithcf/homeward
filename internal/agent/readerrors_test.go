@@ -2,7 +2,9 @@ package agent_test
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -54,8 +56,16 @@ func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
 	started := filepath.Join(t.TempDir(), "started")
 	agent.ShellReads(t, 2*time.Second, "cat >/dev/null; touch "+started+"; sleep 4 & sleep 4")
 	held := make(chan int, 1)
-	go func() {
-		resp, _ := post(t, sock, "/v1/projects/read", map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"})
+	go func() { // not post: no t.Fatal off the test's goroutine
+		c := http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		}}}
+		resp, err := c.Post("http://agent/v1/projects/read", "application/json", strings.NewReader(`{"project":"homerslab-web","compose":"services: {web: {image: x}}\n"}`))
+		if err != nil {
+			held <- 0
+			return
+		}
+		resp.Body.Close()
 		held <- resp.StatusCode
 	}()
 	for range 100 {
@@ -113,5 +123,39 @@ func TestAReaderThatPanicsIsAnInvalidFile(t *testing.T) {
 	}
 	if got := logs.String(); strings.Count(got, "the reader fell over on line 7") < 2 || !strings.Contains(got, "goroutine") {
 		t.Errorf("the agent's log doesn't keep each panic with its stack:\n%s", got)
+	}
+}
+
+// A crash in the reader that no recover reaches, a panic in a goroutine of its own or a fatal runtime error (a stack
+// overflow, say), is the reader's bug on this file too: invalid-compose, its words in the agent's log; a child that
+// ends with anything else is still a reader that broke (no-reader, TestAReadsEndingIsSaid) (#295).
+func TestAReaderThatCrashesIsAnInvalidFile(t *testing.T) {
+	testenv.Isolate(t)
+	body := map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"}
+	for name, c := range map[string]struct {
+		child, said string // a mode of this test binary, or a script for sh
+	}{
+		"a real Go child, panicking in another goroutine": {"read-project-panic-elsewhere", "the reader's helper fell over on line 9"},
+		"a fatal runtime error":                           {"cat >/dev/null; printf 'runtime: goroutine stack exceeds 1000000000-byte limit\\nfatal error: stack overflow\\n' >&2; exit 2", "fatal error: stack overflow"},
+		"an unrecovered panic":                            {"cat >/dev/null; printf 'panic: the reader fell over\\n\\ngoroutine 1 [running]:\\n' >&2; exit 2", "panic: the reader fell over"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testenv.Isolate(t)
+			if strings.HasPrefix(c.child, "read-project") {
+				agent.ChildReads(t, agenttest.Executable(t), c.child, 20*time.Second, 10)
+			} else {
+				agent.ShellReads(t, 5*time.Second, c.child)
+			}
+			var logs bytes.Buffer
+			log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			sock, _ := agenttest.StartWith(t, agent.Config{Log: log})
+			resp, out := post(t, sock, "/v1/projects/read", body)
+			if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(out), `"error":"invalid-compose"`) || strings.Contains(string(out), c.said) {
+				t.Errorf("%d %s, want 422 invalid-compose without the crash", resp.StatusCode, out)
+			}
+			if !strings.Contains(logs.String(), "crashed") || !strings.Contains(logs.String(), c.said) {
+				t.Errorf("the agent's log doesn't keep the crash:\n%s", logs.String())
+			}
+		})
 	}
 }

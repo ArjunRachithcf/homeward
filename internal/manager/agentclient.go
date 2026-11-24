@@ -233,48 +233,46 @@ var (
 	errReadTooBig  = errors.New("read-too-big")
 )
 
-// readTrouble is the manager's error for the agent's answer, its status and error code, to a compose read, from a
-// read or from an install's: one of the errors above, or nil for any other answer.
-func readTrouble(status int, code string) error {
-	switch {
-	case status == http.StatusInternalServerError && code == "no-reader":
-		return errReadRefused
-	case status == http.StatusServiceUnavailable && code == "busy":
-		return errReadBusy
-	case status == http.StatusGatewayTimeout && code == "read-timeout":
-		return errReadTimeout
-	case status == http.StatusUnprocessableEntity && code == "read-too-big":
-		return errReadTooBig
-	}
-	return nil
+// readTroubles is each of the agent's answers to a compose read that the manager says as one of the errors above, from
+// a read or from an install's, with the manager's own status for it: the primary's trouble is 500 or 503, the app
+// definition's 422.
+var readTroubles = []struct {
+	status int
+	code   string
+	err    error
+	answer int
+}{
+	{http.StatusInternalServerError, "no-reader", errReadRefused, http.StatusInternalServerError},
+	{http.StatusServiceUnavailable, "busy", errReadBusy, http.StatusServiceUnavailable},
+	{http.StatusGatewayTimeout, "read-timeout", errReadTimeout, http.StatusUnprocessableEntity},
+	{http.StatusUnprocessableEntity, "read-too-big", errReadTooBig, http.StatusUnprocessableEntity},
 }
 
-// readTroubleStatus is the manager's status for a readTrouble error: the primary's trouble is 500 or 503, the app
-// definition's 422.
-func readTroubleStatus(err error) int {
-	switch {
-	case errors.Is(err, errReadRefused):
-		return http.StatusInternalServerError
-	case errors.Is(err, errReadBusy):
-		return http.StatusServiceUnavailable
+// readTrouble is the manager's error for the agent's answer, its status and error code, to a compose read: one of the
+// errors above, or nil for any other answer.
+func readTrouble(status int, code string) error {
+	for _, t := range readTroubles {
+		if t.status == status && t.code == code {
+			return t.err
+		}
 	}
-	return http.StatusUnprocessableEntity
+	return nil
 }
 
 // failRead answers a compose read's trouble (readTrouble) with its code alone, and logs it with where it came from,
 // as an error when the primary needs mending; it says whether err was one.
 func (m *Manager) failRead(w http.ResponseWriter, err error, where string, args ...any) bool {
-	for _, trouble := range []error{errReadRefused, errReadBusy, errReadTimeout, errReadTooBig} {
-		if !errors.Is(err, trouble) {
+	for _, t := range readTroubles {
+		if !errors.Is(err, t.err) {
 			continue
 		}
 		args = append(args, "err", err)
-		if trouble == errReadRefused {
+		if t.err == errReadRefused {
 			m.log.Error("the agent refused to read an app's compose file, "+where+"; its log says why", args...)
 		} else {
 			m.log.Warn("the agent's read of an app's compose file, "+where+", ended", args...)
 		}
-		fail(w, readTroubleStatus(trouble), trouble.Error())
+		fail(w, t.answer, t.err.Error())
 		return true
 	}
 	return false
