@@ -321,6 +321,9 @@ func (f *fakeSignIn) EnsureLDAP(_ context.Context, app idp.LDAPApp) (idp.LDAPCre
 	if f.ldapFails != nil {
 		return idp.LDAPCredentials{}, f.ldapFails
 	}
+	if slices.Contains(app.Roles, idp.Admin) { // as the adapters do (#298)
+		return idp.LDAPCredentials{}, idp.ErrLDAPAdminAudience
+	}
 	f.ldaps = append(f.ldaps, app)
 	f.tidies++
 	if f.made == nil {
@@ -338,7 +341,12 @@ func (f *fakeSignIn) EnsureLDAPApps(_ context.Context, apps []idp.LDAPApp) error
 	if f.ldapFails != nil {
 		return f.ldapFails
 	}
+	var errs []error
 	for _, app := range apps {
+		if slices.Contains(app.Roles, idp.Admin) { // as the adapters do (#298), the other apps going on
+			errs = append(errs, fmt.Errorf("%s: %w", app.Slug, idp.ErrLDAPAdminAudience))
+			continue
+		}
 		f.ldaps = append(f.ldaps, app)
 		if f.made == nil {
 			f.made = map[string]bool{}
@@ -346,7 +354,7 @@ func (f *fakeSignIn) EnsureLDAPApps(_ context.Context, apps []idp.LDAPApp) error
 		f.made[app.Slug+"-ldap"] = true
 	}
 	f.tidies++
-	return nil
+	return errors.Join(errs...)
 }
 
 func (f *fakeSignIn) DeleteLDAP(_ context.Context, slug string) error {

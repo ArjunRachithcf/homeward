@@ -353,7 +353,13 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 			}
 		}
 	})
-	notes := idp.LDAPApp{Slug: "homerslab-family-notes", Name: "Family notes", Roles: []idp.Role{idp.Adult, idp.Admin}}
+	// Admins bind over LDAP nowhere (#292), so an LDAP app's audience never has the Admin role (#298).
+	for _, roles := range [][]idp.Role{{idp.Admin}, {idp.Adult, idp.Admin}} {
+		if _, err := l.EnsureLDAP(ctx, idp.LDAPApp{Slug: "homerslab-family-board", Name: "Board", Roles: roles}); !errors.Is(err, idp.ErrLDAPAdminAudience) {
+			t.Errorf("an LDAP app for %v: %v, want ErrLDAPAdminAudience (#298)", roles, err)
+		}
+	}
+	notes := idp.LDAPApp{Slug: "homerslab-family-notes", Name: "Family notes", Roles: []idp.Role{idp.Adult}}
 	var shared idp.LDAPCredentials
 	t.Run("someone holding app passwords isn't made an admin until they're removed (#281)", func(t *testing.T) {
 		var err error
@@ -409,10 +415,10 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 		bea, olga, maria := w.OwnAppPassword(t, notes.Slug, "bea"), w.OwnAppPassword(t, notes.Slug, "olga"), password(notes, "maria")
 		carla := w.OwnAppPassword(t, notes.Slug, "carla")
 		if err := ready(shared, "maria", maria); err != nil {
-			t.Fatalf("an adult, in an app open to adults and admins: %v", err)
+			t.Fatalf("an adult, in an app open to adults: %v", err)
 		}
-		// Before any pass ends them: nobody in the admins' group binds, the console's admin too, at an app open to
-		// admins, with an app password made for it (#292).
+		// Before any pass ends them: nobody in the admins' group binds, the console's admin too, with an app password
+		// made for the app (#292).
 		for who, pw := range map[string]string{"bea": bea, "olga": olga, "carla": carla} {
 			if err := w.Bind(t, dn(shared, who), pw); err == nil {
 				t.Errorf("%s, an admin, bound with the app password she made herself (#292)", who)

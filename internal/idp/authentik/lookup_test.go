@@ -41,6 +41,7 @@ func newFake() *fakeAuthentik {
 		{"pk": "outpost-embedded", "managed": embeddedOutpost, "providers": []int{}}}
 	f.objs["/core/applications/"], f.objs["/policies/bindings/"], f.objs["/providers/proxy/"] = nil, nil, nil
 	f.objs["/sources/user_connections/all/"] = nil
+	f.objs["/events/events/"] = nil
 	f.objs["/policies/expression/"] = []map[string]any{{"pk": "policy-other", "name": "default-source-enrollment-if-username"}}
 	f.objs["/propertymappings/provider/scope/"] = []map[string]any{{"pk": "m-proxy", "name": "authentik default OAuth Mapping: Proxy outpost",
 		"managed": "goauthentik.io/providers/proxy/scope-proxy", "scope_name": "ak_proxy"}}

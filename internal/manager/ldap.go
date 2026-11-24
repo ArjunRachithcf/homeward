@@ -36,7 +36,7 @@ func (m *Manager) ensureLDAPApps(ctx context.Context) error {
 			continue
 		}
 		if p.SignIn.Method == catalog.LDAP {
-			want = append(want, idp.LDAPApp{Slug: "homerslab-" + a.ID, Name: p.App.Name, Roles: roles(p.Audience.Default)})
+			want = append(want, idp.LDAPApp{Slug: "homerslab-" + a.ID, Name: p.App.Name, Roles: ldapRoles(p.Audience.Default)})
 		}
 	}
 	if len(want) == 0 {

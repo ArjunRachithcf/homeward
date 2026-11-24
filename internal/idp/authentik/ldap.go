@@ -225,7 +225,7 @@ func (a *Authentik) ldapFlows(ctx context.Context) ([]string, error) {
 // at planning, decided again when reached), with no policy bound to the flow, to the username's or to the password's
 // stage (a policy that fails skips its stage: a bind with no password), the session's bound to the provider's own
 // app-password policy and to ldapNoAdmin, both as Homeward writes them (ldapNoAdmin for the admins' group as it is now),
-// both to pass, and nothing else (#292), and each stage as it should be (the username with no password of
+// both to pass, neither passing when it fails (#298), and nothing else (#292), and each stage as it should be (the username with no password of
 // its own, an app password only, the session). Otherwise a password from the console, no password at all, or an app
 // password made for another app could sign a person in to an LDAP app (#204). A flow that isn't there isn't intact.
 func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, string, error) {
@@ -294,6 +294,9 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 		User   *int    `json:"user"`
 		Negate bool    `json:"negate"`
 		On     bool    `json:"enabled"`
+		// Failure passes the binding when its policy fails (an exception, a timeout): the policy would refuse nobody
+		// then (#298).
+		Failure bool `json:"failure_result"`
 	}
 	// The policies each target may have: none on the flow and its first two stages; on the session, the provider's own
 	// and ldapNoAdmin, each once, both to pass.
@@ -321,7 +324,7 @@ func (a *Authentik) ldapBindIntact(ctx context.Context, obj string) (bool, strin
 		case t.only:
 			var got []string
 			for _, p := range ps {
-				if p.Group != nil || p.User != nil || p.Negate || !p.On {
+				if p.Group != nil || p.User != nil || p.Negate || !p.On || p.Failure {
 					return false, f.PK, nil
 				}
 				got = append(got, ptrStr(p.Policy))
@@ -515,6 +518,11 @@ type ldapProviderObj struct {
 	App    *string `json:"assigned_application_slug"`
 	BaseDN string  `json:"base_dn"`
 	Flow   string  `json:"authorization_flow"`
+	// BindMode and SearchMode are direct as Homeward makes them: cached, the outpost keeps taking a bind that once
+	// passed after its app password ended or its person left, and answers searches from a copy, people who left and
+	// groups as they were included (#298).
+	BindMode   string `json:"bind_mode"`
+	SearchMode string `json:"search_mode"`
 }
 
 // ensureLDAPProvider makes an LDAP provider of a base DN, by name, or brings it in line: never another application's
@@ -695,7 +703,8 @@ func (a *Authentik) ldapApp(ctx context.Context, slug string) (*ldapAppState, er
 }
 
 // ldapOwnBindings are the bindings Homeward gives an LDAP application: a role's group, or the policy that refuses
-// everyone. Only what is there now is listed, and nothing is made.
+// everyone. Only what is there now is listed, and nothing is made. The admins' group is taken out before they are
+// judged (ldapDropAdmins).
 func (a *Authentik) ldapOwnBindings(ctx context.Context) (map[binding]bool, error) {
 	own := map[binding]bool{}
 	for _, r := range idp.Roles() {
@@ -741,6 +750,56 @@ func (a *Authentik) ldapBoundByUs(ctx context.Context, app *ldapAppState, own ma
 	return true, nil
 }
 
+// ldapDropAdmins takes the admins' group out of an LDAP application's audience, as Homeward made it before #298, and
+// says whether it was there. An application's group binding counts the groups under it too, so it let in people the
+// role claim takes for no admin, while the admins themselves bind nowhere (#292). The rest of the audience stays; an
+// application the admins' group alone opened gets the policy that refuses everyone first, so it is never left without a
+// binding, which would open it to everyone, and stays on the outpost, refusing everyone, as long as its app does. With
+// repair false it only reads.
+func (a *Authentik) ldapDropAdmins(ctx context.Context, app *ldapAppState, admins string, repair bool) (bool, error) {
+	type pb struct {
+		PK     string  `json:"pk"`
+		Group  *string `json:"group"`
+		Negate bool    `json:"negate"`
+		Order  int     `json:"order"`
+		On     bool    `json:"enabled"`
+	}
+	bs, err := where[pb](ctx, a.api, "/policies/bindings/?target="+q(app.PBM), "target", app.PK)
+	if err != nil || admins == "" {
+		return false, err
+	}
+	var drop []string
+	others, last := 0, 0
+	for _, b := range bs {
+		last = max(last, b.Order)
+		switch {
+		case ptrStr(b.Group) == admins && !b.Negate: // as Homeward made it; anything else is the console's, judged below
+			drop = append(drop, b.PK)
+		case b.On:
+			others++
+		}
+	}
+	if len(drop) == 0 || !repair {
+		return len(drop) > 0, nil
+	}
+	if others == 0 {
+		never, err := a.audience(ctx, nil)
+		if err != nil {
+			return true, err
+		}
+		if err := a.api.call(ctx, http.MethodPost, "/policies/bindings/", map[string]any{"target": app.PBM, "policy": never[0].Policy,
+			"order": last + 10, "enabled": true, "negate": false, "failure_result": false, "timeout": 30}, nil); err != nil {
+			return true, err
+		}
+	}
+	for _, pk := range drop {
+		if err := gone(a.api.call(ctx, http.MethodDelete, "/policies/bindings/"+pk+"/", nil, nil)); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
 func ptrStr(s *string) string {
 	if s == nil {
 		return ""
@@ -767,6 +826,12 @@ func (a *Authentik) ldapTidy(ctx context.Context, repair bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	admins := ""
+	if g, err := find[group](ctx, a.api, "/core/groups/?name="+q(idp.RoleGroup(idp.Admin)), "name", idp.RoleGroup(idp.Admin)); err != nil {
+		return false, err
+	} else if g != nil {
+		admins = g.PK
+	}
 	// The outpost's own application opens to nobody: the policy that refuses everyone is its one binding.
 	refusesAll := map[binding]bool{}
 	for b := range own {
@@ -791,6 +856,14 @@ func (a *Authentik) ldapTidy(ctx context.Context, repair bool) (bool, error) {
 			}
 		}
 		fine := named && sameDN(p.BaseDN, dn) && app != nil && app.Provider != nil && *app.Provider == p.PK
+		if fine && p.Name != ldapNone {
+			// The admins' group in its audience, as Homeward made it before #298: taken out, the rest kept.
+			had, err := a.ldapDropAdmins(ctx, app, admins, repair)
+			if err != nil {
+				return false, err
+			}
+			clean = clean && !had
+		}
 		if fine {
 			allowed := own
 			if p.Name == ldapNone {
@@ -817,6 +890,16 @@ func (a *Authentik) ldapTidy(ctx context.Context, repair bool) (bool, error) {
 				}
 			}
 			fine = intact && p.Flow == flowPK
+		}
+		if fine && on && (p.BindMode != "direct" || p.SearchMode != "direct") {
+			// Cached, an earlier bind would keep binding after its app password ended (#298): put back at once.
+			clean = false
+			if repair {
+				if err := a.api.call(ctx, http.MethodPatch, fmt.Sprintf("/providers/ldap/%d/", p.PK),
+					map[string]any{"bind_mode": "direct", "search_mode": "direct"}, nil); err != nil {
+					return false, err
+				}
+			}
 		}
 		at, closed := time.Time{}, false
 		if app != nil {
@@ -969,6 +1052,10 @@ func (a *Authentik) ensureLDAP(ctx context.Context, app idp.LDAPApp) (idp.LDAPCr
 	}
 	if len(app.Roles) == 0 {
 		return idp.LDAPCredentials{}, errors.New("authentik: an LDAP app needs roles to open to")
+	}
+	if slices.Contains(app.Roles, idp.Admin) {
+		// Admins bind nowhere (#292), and a group binding lets in the groups under the admins' too (#298).
+		return idp.LDAPCredentials{}, fmt.Errorf("authentik: %s: %w", app.Slug, idp.ErrLDAPAdminAudience)
 	}
 	bs, err := a.audience(ctx, app.Roles)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -181,11 +182,46 @@ func TestTheIdentityProviderContractOnAuthentik(t *testing.T) {
 	w.own = own
 	w.provider = a
 	idptest.Run(t, w, authentik.Version)
+	t.Run("a password or its hash set at once after the account's making counts (#298)", func(t *testing.T) {
+		for _, c := range []struct{ username, path string }{{"umar", "set_password"}, {"vito", "set_password_hash"}} {
+			if err := w.provider.EnsurePerson(ctx, idp.Person{Username: c.username, Name: c.username, Mail: c.username + "@ferreira.family",
+				Role: idp.Adult}); err != nil {
+				t.Fatal(err)
+			}
+			pw := secret() + "-Aa1!"
+			if c.path == "set_password_hash" {
+				salt := secret()[:16]
+				key, err := pbkdf2.Key(sha256.New, pw, []byte(salt), 1_000_000, 32)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pw = "pbkdf2_sha256$1000000$" + salt + "$" + base64.StdEncoding.EncodeToString(key)
+			}
+			w.raw(t, own, "POST", fmt.Sprintf("/api/v3/core/users/%d/%s/", w.userPK(t, c.username), c.path), map[string]string{"password": pw}, nil)
+			var self struct {
+				Joined  time.Time `json:"date_joined"`
+				Changed time.Time `json:"password_change_date"`
+			}
+			w.raw(t, own, "GET", fmt.Sprintf("/api/v3/core/users/%d/", w.userPK(t, c.username)), nil, &self)
+			t.Logf("%s: the password set %v after the account's making", c.path, self.Changed.Sub(self.Joined))
+			if got, err := w.provider.Credentials(ctx, c.username); err != nil || !slices.Contains(got.Others, idp.CredPassword) {
+				t.Errorf("%s at once: %+v %v, want a password", c.path, got, err)
+			}
+		}
+		// Someone else's password is never one's own.
+		if err := w.provider.EnsurePerson(ctx, idp.Person{Username: "wes", Name: "Wes", Mail: "wes@ferreira.family", Role: idp.Adult}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := w.provider.Credentials(ctx, "wes"); err != nil || slices.Contains(got.Others, idp.CredPassword) {
+			t.Errorf("someone who set no password: %+v %v, want none", got, err)
+		}
+	})
 	t.Run("LDAP: an app's directory at the outpost, for its roles only (#204)", func(t *testing.T) {
 		idptest.RunLDAP(t, w)
 		t.Run("an LDAP-only app binds from its own container through the LDAPS port, and reads only its own person", ldapAppInItsContainer(w, a))
 		t.Run("drift: a bind flow that takes passwords, or another app's, shows in the report, and Prepare puts it back", ldapDrift(w, a))
 		t.Run("nobody in the admins' group, nor a superuser, binds, whatever they hold; the policy guarded (#292)", ldapRefusesAdmins(w, a))
+		t.Run("an LDAP app's audience never has the Admin role; one that had it loses it at Prepare (#298)", ldapAdminAudience(w, a))
 		t.Run("an app's directory keeps apart from the app's own application", ldapBesideTheAppsOwn(w, a))
 		t.Run("drift: a provider at the outpost without its application is closed and taken off, then deleted", ldapOrphan(w, a))
 		t.Run("drift: providers of the console's at the outpost, named as an app's, are taken off", ldapImpostors(w, a))

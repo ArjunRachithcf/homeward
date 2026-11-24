@@ -67,7 +67,7 @@ func TestApplyingAnLDAPPlanMakesTheAppsOwnDirectory(t *testing.T) {
 	if r := p.control("POST", "/api/v1/plans/"+made.ID+"/apply", nil); r.Code != http.StatusAccepted {
 		t.Fatalf("applying: %d %s", r.Code, r.Body)
 	}
-	want := []idp.LDAPApp{{Slug: "homerslab-bentopdf", Name: "BentoPDF", Roles: []idp.Role{idp.Admin, idp.Adult}}}
+	want := []idp.LDAPApp{{Slug: "homerslab-bentopdf", Name: "BentoPDF", Roles: []idp.Role{idp.Adult}}}
 	if !reflect.DeepEqual(ldaps(fs), want) || len(fs.guards) != 0 || len(appClients(fs)) != 0 {
 		t.Errorf("the directories: %+v, want %+v; guards %+v, clients %+v, want none", ldaps(fs), want, fs.guards, appClients(fs))
 	}
@@ -111,7 +111,7 @@ func TestEveryPassPutsEachLDAPAppsDirectoryBack(t *testing.T) {
 	before, outposts := len(ldaps(fs)), fs.outposts
 	p.m.RunDue(context.Background())
 	got := ldaps(fs)
-	want := idp.LDAPApp{Slug: "homerslab-bentopdf", Name: "BentoPDF", Roles: []idp.Role{idp.Admin, idp.Adult}}
+	want := idp.LDAPApp{Slug: "homerslab-bentopdf", Name: "BentoPDF", Roles: []idp.Role{idp.Adult}}
 	if len(got) != before+1 || !reflect.DeepEqual(got[len(got)-1], want) {
 		t.Errorf("after a pass, the directories asked for: %+v, want one more, %+v", got, want)
 	}

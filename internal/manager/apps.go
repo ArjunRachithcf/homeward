@@ -85,6 +85,17 @@ func roles(audience string) []idp.Role {
 	return nil
 }
 
+// ldapRoles are the roles an LDAP app's directory opens to: its audience's, but Admin (#298). Admins bind over LDAP
+// nowhere (#292); an admin who uses an LDAP app does it with a separate account that isn't an admin. An app for admins
+// alone keeps its Admin role, so the directory refuses it by name (idp.ErrLDAPAdminAudience), as nobody could bind.
+func ldapRoles(audience string) []idp.Role {
+	rs := roles(audience)
+	if others := slices.DeleteFunc(slices.Clone(rs), func(r idp.Role) bool { return r == idp.Admin }); len(others) > 0 {
+		return others
+	}
+	return rs
+}
+
 // current is the plan the household gets now for the app a plan installs, so the two can be compared by id.
 func (m *Manager) current(ctx context.Context, p plan.Plan) (catalog.App, error) {
 	a, ok := m.catalog.App(p.App.ID)
@@ -279,7 +290,7 @@ func (m *Manager) apply(w http.ResponseWriter, r *http.Request, terminal bool) {
 			agentFailed(err)
 			return
 		}
-		creds, err := directory.EnsureLDAP(ctx, idp.LDAPApp{Slug: slug, Name: p.App.Name, Roles: roles(p.Audience.Default)})
+		creds, err := directory.EnsureLDAP(ctx, idp.LDAPApp{Slug: slug, Name: p.App.Name, Roles: ldapRoles(p.Audience.Default)})
 		if err != nil {
 			m.log.Error("making an app's LDAP directory", "app", a.ID, "err", err)
 			fail(w, http.StatusBadGateway, "ldap-failed")
