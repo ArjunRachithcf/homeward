@@ -225,12 +225,15 @@ func (e *agentRefused) Error() string {
 //     needs mending;
 //   - errReadBusy: another read held the agent's one read slot until this one's deadline. Try again;
 //   - errReadTimeout, errReadTooBig: the read ran out of time or memory, within the bounds the agent sets every read.
-//     The app's definition is too slow or too large to read.
+//     The app's definition is too slow or too large to read;
+//   - errReadCrashed: the read's child crashed before it read the file, starting or confining itself (Go unable to
+//     start a thread under the unit's TasksMax, say). Not the definition's: the primary needs mending.
 var (
 	errReadRefused = errors.New("agent-refused-read")
 	errReadBusy    = errors.New("agent-busy")
 	errReadTimeout = errors.New("read-timeout")
 	errReadTooBig  = errors.New("read-too-big")
+	errReadCrashed = errors.New("agent-read-crashed")
 )
 
 // readTroubles is each of the agent's answers to a compose read that the manager says as one of the errors above, from
@@ -246,6 +249,7 @@ var readTroubles = []struct {
 	{http.StatusServiceUnavailable, "busy", errReadBusy, http.StatusServiceUnavailable},
 	{http.StatusGatewayTimeout, "read-timeout", errReadTimeout, http.StatusUnprocessableEntity},
 	{http.StatusUnprocessableEntity, "read-too-big", errReadTooBig, http.StatusUnprocessableEntity},
+	{http.StatusInternalServerError, "reader-crashed", errReadCrashed, http.StatusInternalServerError},
 }
 
 // readTrouble is the manager's error for the agent's answer, its status and error code, to a compose read: one of the
@@ -267,8 +271,8 @@ func (m *Manager) failRead(w http.ResponseWriter, err error, where string, args 
 			continue
 		}
 		args = append(args, "err", err)
-		if t.err == errReadRefused {
-			m.log.Error("the agent refused to read an app's compose file, "+where+"; its log says why", args...)
+		if t.answer == http.StatusInternalServerError {
+			m.log.Error("the agent couldn't read an app's compose file, "+where+": the primary needs mending; its log says why", args...)
 		} else {
 			m.log.Warn("the agent's read of an app's compose file, "+where+", ended", args...)
 		}

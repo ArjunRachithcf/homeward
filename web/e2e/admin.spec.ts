@@ -105,18 +105,20 @@ test('before first-time setup, Get says what’s missing', async ({ page, primar
 
 // The manager's answers when the primary can't read an app (its tests make them: manager refusedread_test.go with a
 // real agent, readtrouble_test.go with the agent's own answers), stood in for here: a real agent refuses its reads only
-// as root (#293), and is busy, out of time or out of memory only with a file made to be (#295).
+// as root (#293), and is busy, out of time, out of memory or crashing only with a file or child made to be (#295).
 const cantRead = {
   'agent-unreachable': { status: 503, says: 'the primary didn’t answer. Try again in a moment.',
     install: 'Not installed: study-pc didn’t answer.' },
   'agent-refused-read': { status: 500, says: 'the primary answered, but wouldn’t read the app’s definition. The network is fine: the primary needs mending',
     install: 'Not installed: study-pc answered, but wouldn’t read BentoPDF’s definition. The network is fine' },
-  'agent-busy': { status: 503, says: 'the primary was busy reading another app’s definition. Try again in a moment.',
-    install: 'Not installed: study-pc was busy reading another app’s definition. Try again in a moment.' },
+  'agent-busy': { status: 503, says: 'the primary was busy: it was reading another app’s definition, or too many reads were running at once. Try again in a moment.',
+    install: 'Not installed: study-pc was busy: it was reading another app’s definition, or too many reads were running at once. Try again in a moment.' },
   'read-timeout': { status: 422, says: 'its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog’s publisher.',
     install: 'Not installed: BentoPDF’s definition took too long to read, so study-pc stopped. Try again later' },
   'read-too-big': { status: 422, says: 'its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog’s publisher.',
     install: 'Not installed: BentoPDF’s definition needs more memory to read than Homeward allows, so study-pc stopped. Try again later' },
+  'agent-read-crashed': { status: 500, says: 'the primary’s reader crashed before it read the app’s definition, so the definition isn’t the cause. The primary needs mending, and sudo journalctl -u homeward-agent there says why (most often too many processes or too little memory).',
+    install: 'Not installed: study-pc’s reader crashed before it read BentoPDF’s definition, so the definition isn’t the cause. study-pc needs mending' },
 } as const;
 
 for (const [code, { status, says, install: installSays }] of Object.entries(cantRead)) {

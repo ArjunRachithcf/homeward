@@ -56,6 +56,8 @@ func TestMain(m *testing.M) {
 				time.Sleep(time.Hour)
 				return engine.Project{}, nil
 			}))
+		case "read-project-panic-early": // a panic before the child reads, as one in confine would be
+			panic("confining fell over")
 		case "read-project-hog":
 			os.Exit(agent.ReadProjectWith(os.Args[3:], os.Stdin, os.Stdout, func(context.Context, string, []byte) (engine.Project, error) {
 				for {
@@ -112,7 +114,12 @@ func peek() int {
 		return 1
 	}
 	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
-	if line, err := bufio.NewReader(stderr).ReadString('\n'); err != nil || line != "reading\n" {
+	childSaid := bufio.NewReader(stderr)
+	line, err := childSaid.ReadString('\n')
+	if line == agent.ReadingMarker { // the child's own, just before its reader
+		line, err = childSaid.ReadString('\n')
+	}
+	if err != nil || line != "reading\n" {
 		fmt.Fprintf(os.Stderr, "the child didn't read: %q %v\n", line, err)
 		return 1
 	}

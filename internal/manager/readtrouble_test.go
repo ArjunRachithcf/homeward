@@ -10,7 +10,7 @@ import (
 // readTroubles are the agent's answers when a compose read ends for a reason other than the file's contents (agent:
 // TestAReadsEndingIsSaid, TestAnInstallsReadSaysWhyItEnded, TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy), and
 // the manager's to the household for each: busy is the primary's, try again; out of time or memory is the app
-// definition's, too slow or too large to read (#295).
+// definition's, too slow or too large to read; a child that crashed before reading is the primary's to mend (#295).
 var readTroubles = map[string]struct {
 	status     int
 	code       string
@@ -20,6 +20,8 @@ var readTroubles = map[string]struct {
 	"busy":         {http.StatusServiceUnavailable, "busy", http.StatusServiceUnavailable, "agent-busy"},
 	"read-timeout": {http.StatusGatewayTimeout, "read-timeout", http.StatusUnprocessableEntity, "read-timeout"},
 	"read-too-big": {http.StatusUnprocessableEntity, "read-too-big", http.StatusUnprocessableEntity, "read-too-big"},
+	// The read's child crashed before it read the file: the primary's (agent: TestAReaderThatCrashesBeforeReadingIsTheMachines).
+	"reader-crashed": {http.StatusInternalServerError, "reader-crashed", http.StatusInternalServerError, "agent-read-crashed"},
 }
 
 // A plan, an apply's plan made again, an install's check and the install itself each say which trouble the read had,

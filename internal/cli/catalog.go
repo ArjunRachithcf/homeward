@@ -136,7 +136,8 @@ func showPlan(ctx context.Context, env Env, socket string, asJSON bool, method, 
 var cantRead = map[string]string{
 	"agent-unreachable":  "the primary didn't answer. Try again in a moment",
 	"agent-refused-read": "the primary answered, but wouldn't read the app's definition. The network is fine: the primary needs mending, and sudo journalctl -u homeward-agent there says why (most often a missing read user or permission)",
-	"agent-busy":         "the primary was busy reading another app's definition. Try again in a moment",
+	"agent-busy":         "the primary was busy: it was reading another app's definition, or too many reads were running at once. Try again in a moment",
+	"agent-read-crashed": "the primary's reader crashed before it read the app's definition, so the definition isn't the cause. The primary needs mending, and sudo journalctl -u homeward-agent there says why (most often too many processes or too little memory)",
 	"read-timeout":       "its definition took too long to read, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher",
 	"read-too-big":       "its definition needs more memory to read than Homeward allows, so the primary stopped. Try again later; if it happens again, tell the catalog's publisher",
 }

@@ -802,7 +802,8 @@ func (a *Agent) readProject(w http.ResponseWriter, r *http.Request) {
 
 // readTrouble answers a compose read that ended for a reason other than the file's contents, and says whether it did:
 // another read held the slot (503 busy, try again), the read ran out of time (504 read-timeout) or memory (422
-// read-too-big), or the agent couldn't start it (500 no-reader, the machine's to mend). A plan's read and an install's
+// read-too-big), the agent couldn't start it (500 no-reader) or its child crashed before reading the file (500
+// reader-crashed), both the machine's to mend. A plan's read and an install's
 // answer them alike (#293, #295).
 func (a *Agent) readTrouble(w http.ResponseWriter, err error, project string) bool {
 	switch {
@@ -818,6 +819,8 @@ func (a *Agent) readTrouble(w http.ResponseWriter, err error, project string) bo
 	case errors.Is(err, errNoReader):
 		a.log.Error("starting a compose read", "project", project, "err", err)
 		fail(w, http.StatusInternalServerError, "no-reader")
+	case errors.Is(err, errReaderCrashed): // reads.read logged the crash
+		fail(w, http.StatusInternalServerError, "reader-crashed")
 	default:
 		return false
 	}
@@ -1014,6 +1017,8 @@ var (
 	errReadTimeout = errors.New("the compose read ran out of time")
 	errReadTooBig  = errors.New("the compose read ran out of memory")
 	errNoReader    = errors.New("the compose reader didn't start")
+	// errReaderCrashed is a read's child that crashed before it read the file (readingMarker): the machine's (#295).
+	errReaderCrashed = errors.New("the compose read's child crashed before it read the file")
 )
 
 // reads runs compose reads one at a time, each in a child process (ReadProjectMain) that ends at the deadline
@@ -1211,9 +1216,15 @@ func (rs *reads) read(ctx context.Context, name string, file []byte) (engine.Pro
 			return engine.Project{}, errReadTooBig
 		case ended && crashed(said):
 			// A crash readSafely can't recover (a panic in another goroutine, a fatal runtime error such as a stack
-			// overflow) is the reader's bug on this file too: invalid-compose, its words for the log (#295).
-			rs.log.Error("the compose reader crashed on an app's compose file", "project", name, "panic", head(said, maxPanic))
-			return engine.Project{}, errReaderPanicked
+			// overflow) is the reader's bug on this file too, once the child said it reads it: invalid-compose. Before
+			// that, the child crashed starting or confining itself (Go unable to start a thread under the unit's
+			// TasksMax, say): the machine's, whatever the file. Either way, its words for the log (#295).
+			if at := strings.Index(said, readingMarker); at >= 0 && crashed(said[at+len(readingMarker):]) {
+				rs.log.Error("the compose reader crashed on an app's compose file", "project", name, "panic", head(said, maxPanic))
+				return engine.Project{}, errReaderPanicked
+			}
+			rs.log.Error("a compose read's child crashed before it read the file: the machine's fault, not the file's", "project", name, "panic", head(said, maxPanic))
+			return engine.Project{}, errReaderCrashed
 		}
 		return engine.Project{}, fmt.Errorf("%w: %v (%v) %s", errNoReader, err, runErr, strings.TrimSpace(said))
 	}

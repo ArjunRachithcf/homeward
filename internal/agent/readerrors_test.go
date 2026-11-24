@@ -48,12 +48,11 @@ func TestAnInstallsReadSaysWhyItEnded(t *testing.T) {
 }
 
 // An install whose read waits out its deadline for the one read slot, another read holding it, is busy (503): try
-// again, not a bad file (#295). The read holding it leaves its output open in a process of its own, so the agent waits
-// the child's WaitDelay past its deadline before it gives the slot back.
+// again, not a bad file (#295).
 func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
 	testenv.Isolate(t)
 	sock, h, state := signedIn(t, agent.Config{})
-	agent.ShellReads(t, 2*time.Second, "cat >/dev/null; sleep 4 & sleep 4")
+	started, release := agent.HeldReads(t, 300*time.Millisecond)
 	held := make(chan int, 1)
 	go func() { // not post: no t.Fatal off the test's goroutine
 		c := http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -67,14 +66,13 @@ func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
 		resp.Body.Close()
 		held <- resp.StatusCode
 	}()
-	// Once the holder has the slot. No marker file: as root, the child runs as homeward-read, which can't write in the
-	// test's folders. The holder keeps the slot until 3 s, and this install's wait ends at 2.3 s.
-	time.Sleep(300 * time.Millisecond)
+	<-started // the holder has the slot, until released
 	if code, body := call(t, sock, "PUT", "/v1/apps/ledger?check=true", withSecrets()); code != http.StatusServiceUnavailable || string(body) != `{"error":"busy"}`+"\n" {
 		t.Errorf("an install while another read holds the slot: %d %s, want 503 and only busy", code, body)
 	}
-	if code := <-held; code != http.StatusGatewayTimeout {
-		t.Errorf("the read that held the slot: %d, want 504", code)
+	release()
+	if code := <-held; code != http.StatusInternalServerError {
+		t.Errorf("the read that held the slot, let go without a child: %d, want 500", code)
 	}
 	nothingFor(t, sock, h, state)
 }
@@ -123,35 +121,79 @@ func TestAReaderThatPanicsIsAnInvalidFile(t *testing.T) {
 }
 
 // A crash in the reader that no recover reaches, a panic in a goroutine of its own or a fatal runtime error (a stack
-// overflow, say), is the reader's bug on this file too: invalid-compose, its words in the agent's log; a child that
-// ends with anything else is still a reader that broke (no-reader, TestAReadsEndingIsSaid) (#295).
+// overflow, say), once the child said it is reading the file (agent.ReadingMarker), is the reader's bug on this file
+// too: invalid-compose, its words in the agent's log; a child that ends with anything else is still a reader that broke
+// (no-reader, TestAReadsEndingIsSaid) (#295).
 func TestAReaderThatCrashesIsAnInvalidFile(t *testing.T) {
 	testenv.Isolate(t)
-	body := map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"}
+	reading := "printf '" + strings.TrimSuffix(agent.ReadingMarker, "\n") + "\\n' >&2; "
 	for name, c := range map[string]struct {
 		child, said string // a mode of this test binary, or a script for sh
 	}{
 		"a real Go child, panicking in another goroutine": {"read-project-panic-elsewhere", "the reader's helper fell over on line 9"},
-		"a fatal runtime error":                           {"cat >/dev/null; printf 'runtime: goroutine stack exceeds 1000000000-byte limit\\nfatal error: stack overflow\\n' >&2; exit 2", "fatal error: stack overflow"},
-		"an unrecovered panic":                            {"cat >/dev/null; printf 'panic: the reader fell over\\n\\ngoroutine 1 [running]:\\n' >&2; exit 2", "panic: the reader fell over"},
+		"a fatal runtime error":                           {"cat >/dev/null; " + reading + "printf 'runtime: goroutine stack exceeds 1000000000-byte limit\\nfatal error: stack overflow\\n' >&2; exit 2", "fatal error: stack overflow"},
+		"an unrecovered panic":                            {"cat >/dev/null; " + reading + "printf 'panic: the reader fell over\\n\\ngoroutine 1 [running]:\\n' >&2; exit 2", "panic: the reader fell over"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			testenv.Isolate(t)
-			if strings.HasPrefix(c.child, "read-project") {
-				agent.ChildReads(t, agenttest.Executable(t), c.child, 20*time.Second, 10)
-			} else {
-				agent.ShellReads(t, 5*time.Second, c.child)
-			}
-			var logs bytes.Buffer
-			log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-			sock, _ := agenttest.StartWith(t, agent.Config{Log: log})
-			resp, out := post(t, sock, "/v1/projects/read", body)
+			sock, logs := crashingReads(t, c.child)
+			resp, out := post(t, sock, "/v1/projects/read", map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"})
 			if resp.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(out), `"error":"invalid-compose"`) || strings.Contains(string(out), c.said) {
 				t.Errorf("%d %s, want 422 invalid-compose without the crash", resp.StatusCode, out)
 			}
-			if !strings.Contains(logs.String(), "crashed") || !strings.Contains(logs.String(), c.said) {
+			if !strings.Contains(logs.String(), "crashed on an app's compose file") || !strings.Contains(logs.String(), c.said) {
 				t.Errorf("the agent's log doesn't keep the crash:\n%s", logs.String())
 			}
 		})
 	}
+}
+
+// A child that crashes before it says it is reading the file (a panic as it confines itself, or Go unable to start a
+// thread under the unit's TasksMax) is the machine's fault, never the file's: 500 reader-crashed, not invalid-compose,
+// for a plan's read and an install's alike, with the crash in the agent's log (#295).
+func TestAReaderThatCrashesBeforeReadingIsTheMachines(t *testing.T) {
+	testenv.Isolate(t)
+	for name, c := range map[string]struct{ child, said string }{
+		"a real Go child, panicking before it reads": {"read-project-panic-early", "confining fell over"},
+		"Go unable to start a thread":                {"cat >/dev/null; printf 'runtime: failed to create new OS thread\\nfatal error: newosproc\\n' >&2; exit 2", "fatal error: newosproc"},
+		"a crash with only part of the marker": {"cat >/dev/null; printf 'panic: confine\\n' >&2; " +
+			"printf 'reading the fi' >&2; exit 2", "panic: confine"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testenv.Isolate(t)
+			sock, logs := crashingReads(t, c.child)
+			resp, out := post(t, sock, "/v1/projects/read", map[string]string{"project": "homerslab-web", "compose": "services: {web: {image: x}}\n"})
+			if resp.StatusCode != http.StatusInternalServerError || string(out) != `{"error":"reader-crashed"}`+"\n" {
+				t.Errorf("a plan's read: %d %s, want 500 and only reader-crashed", resp.StatusCode, out)
+			}
+			if !strings.Contains(logs.String(), "before it read") || !strings.Contains(logs.String(), c.said) {
+				t.Errorf("the agent's log doesn't keep the crash:\n%s", logs.String())
+			}
+		})
+	}
+	t.Run("an install's read", func(t *testing.T) {
+		testenv.Isolate(t)
+		sock, h, state := signedIn(t, agent.Config{})
+		agent.ShellReads(t, 5*time.Second, "cat >/dev/null; printf 'fatal error: newosproc\\n' >&2; exit 2")
+		for _, path := range []string{"/v1/apps/ledger?check=true", "/v1/apps/ledger"} {
+			if code, body := call(t, sock, "PUT", path, withSecrets()); code != http.StatusInternalServerError || string(body) != `{"error":"reader-crashed"}`+"\n" {
+				t.Errorf("PUT %s: %d %s, want 500 and only reader-crashed", path, code, body)
+			}
+		}
+		nothingFor(t, sock, h, state)
+	})
+}
+
+// crashingReads starts an agent whose reads' children are child, a mode of this test binary or a script for sh, and
+// returns its socket and its log.
+func crashingReads(t *testing.T, child string) (string, *bytes.Buffer) {
+	t.Helper()
+	if strings.HasPrefix(child, "read-project") {
+		agent.ChildReads(t, agenttest.Executable(t), child, 20*time.Second, 10)
+	} else {
+		agent.ShellReads(t, 5*time.Second, child)
+	}
+	var logs bytes.Buffer
+	sock, _ := agenttest.StartWith(t, agent.Config{Log: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))})
+	return sock, &logs
 }

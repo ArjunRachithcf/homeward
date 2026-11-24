@@ -269,6 +269,7 @@ func readProjectMain(args []string, stdin io.Reader, stdout io.Writer, read func
 	file, err := io.ReadAll(io.LimitReader(stdin, 64<<10+1))
 	if err == nil {
 		var p engine.Project
+		fmt.Fprint(os.Stderr, readingMarker) // from here on, a crash is the reader's on this file (reads.read)
 		if p, res.Panic, err = readSafely(read, fs.Arg(0), file); err == nil {
 			res.Project = &p
 		}
@@ -291,6 +292,11 @@ func readProjectMain(args []string, stdin io.Reader, stdout io.Writer, read func
 	}
 	return 0
 }
+
+// readingMarker is what the child writes to its standard error just before its reader reads the file: a crash the
+// agent finds after it is the reader's on this file (invalid-compose); one before it, or without it, the machine's, in
+// the child's own start or confinement (reader-crashed) (#295).
+const readingMarker = "homeward agent read-project: reading the file\n"
 
 // errReaderPanicked is a read whose reader panicked on the file: to the household, a file Homeward can't read.
 var errReaderPanicked = errors.New("the compose reader failed on this file")
