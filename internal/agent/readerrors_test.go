@@ -53,8 +53,7 @@ func TestAnInstallsReadSaysWhyItEnded(t *testing.T) {
 func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
 	testenv.Isolate(t)
 	sock, h, state := signedIn(t, agent.Config{})
-	started := filepath.Join(t.TempDir(), "started")
-	agent.ShellReads(t, 2*time.Second, "cat >/dev/null; touch "+started+"; sleep 4 & sleep 4")
+	agent.ShellReads(t, 2*time.Second, "cat >/dev/null; sleep 4 & sleep 4")
 	held := make(chan int, 1)
 	go func() { // not post: no t.Fatal off the test's goroutine
 		c := http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -68,12 +67,9 @@ func TestAnInstallsReadWhileAnotherHoldsTheSlotIsBusy(t *testing.T) {
 		resp.Body.Close()
 		held <- resp.StatusCode
 	}()
-	for range 100 {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Once the holder has the slot. No marker file: as root, the child runs as homeward-read, which can't write in the
+	// test's folders. The holder keeps the slot until 3 s, and this install's wait ends at 2.3 s.
+	time.Sleep(300 * time.Millisecond)
 	if code, body := call(t, sock, "PUT", "/v1/apps/ledger?check=true", withSecrets()); code != http.StatusServiceUnavailable || string(body) != `{"error":"busy"}`+"\n" {
 		t.Errorf("an install while another read holds the slot: %d %s, want 503 and only busy", code, body)
 	}
