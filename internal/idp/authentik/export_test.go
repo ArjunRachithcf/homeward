@@ -7,3 +7,6 @@ func SetLDAPRetire(a *Authentik, d time.Duration) { a.ldapRetire = d }
 
 // RoleMapping is the name of Homeward's role mapping, which every guard's provider carries.
 const RoleMapping = roleMapping
+
+// LDAPPasswordPrefix is what the identifier of an app password for an LDAP app starts with, by the app's slug.
+func LDAPPasswordPrefix(slug string) string { return ldapPasswordOf(ldapObj(slug)) }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -190,5 +191,64 @@ func TestAnLDAPInstallThatFailsDeletesItsNewDirectory(t *testing.T) {
 	}
 	if len(agentApps(t, p).Apps) != 0 {
 		t.Error("an app was installed without its directory")
+	}
+}
+
+// Every pass of the schedule reads the admins' app passwords and ends them (#281): Homeward makes none for an admin,
+// but with Kanidm a person makes their own, an admin too, and a console can. Each admin it found is a security event,
+// raised once; nobody else's app passwords are touched, and a household with no LDAP app is checked all the same.
+func TestEveryPassEndsAnAdminsAppPasswordsAsASecurityEvent(t *testing.T) {
+	testenv.Isolate(t)
+	p, fs := installable(t, nil)
+	fs.mu.Lock()
+	fs.people["lena"] = idp.Person{Username: "lena", Role: idp.Adult}
+	fs.appPasswords["ines"], fs.appPasswords["lena"] = 2, 1
+	fs.mu.Unlock()
+	p.m.RunDue(context.Background())
+	fs.mu.Lock()
+	ended, ines, lena := append([]string(nil), fs.ended...), fs.appPasswords["ines"], fs.appPasswords["lena"]
+	fs.mu.Unlock()
+	if !reflect.DeepEqual(ended, []string{"ines"}) || ines != 0 || lena != 1 {
+		t.Errorf("after a pass: ended %v, the admin's %d, the adult's %d; want the admin's ended, the adult's kept", ended, ines, lena)
+	}
+	warnings := func() []string {
+		var w []struct{ Source, What, Resolved string }
+		_ = json.Unmarshal(p.control("GET", "/api/v1/warnings", nil).Body, &w)
+		var out []string
+		for _, x := range w {
+			if strings.HasPrefix(x.Source, "security:") && x.Resolved == "" {
+				out = append(out, x.Source+" "+x.What)
+			}
+		}
+		return out
+	}
+	if w := warnings(); len(w) != 1 || !strings.HasPrefix(w[0], "security:app-passwords:ines ") || !strings.Contains(w[0], "ended them") ||
+		!strings.Contains(w[0], "separate account") {
+		t.Errorf("the security events: %q, want one for ines saying the way", w)
+	}
+	p.m.RunDue(context.Background())
+	if w := warnings(); len(w) != 1 {
+		t.Errorf("after a second pass: %q, want the one event still", w)
+	}
+}
+
+// An admin's app passwords that couldn't be ended are a security event too, which says so (#281's review).
+func TestAnAdminsAppPasswordsThatCouldntEndAreASecurityEvent(t *testing.T) {
+	testenv.Isolate(t)
+	p, fs := installable(t, nil)
+	fs.mu.Lock()
+	fs.appPasswords["ines"], fs.endFails = 1, errors.New("the household account refused the delete")
+	fs.mu.Unlock()
+	p.m.RunDue(context.Background())
+	var w []struct{ Source, What, Resolved string }
+	_ = json.Unmarshal(p.control("GET", "/api/v1/warnings", nil).Body, &w)
+	var got []string
+	for _, x := range w {
+		if x.Source == "security:app-passwords:ines" && x.Resolved == "" {
+			got = append(got, x.What)
+		}
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "couldn't end them") || strings.Contains(got[0], "ended them") {
+		t.Errorf("the security events: %q, want one saying Homeward couldn't end them", got)
 	}
 }

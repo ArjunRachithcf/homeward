@@ -182,7 +182,10 @@ type Provider interface {
 	// Homeward's. It is idempotent.
 	Prepare(ctx context.Context, h Household) error
 	// EnsurePerson makes a person, or brings their name, mail and role's group in line. They have no password and no
-	// passkey: one comes only from an enrolment link.
+	// passkey: one comes only from an enrolment link. Making someone an admin who holds app passwords is refused with
+	// ErrAdminAppPassword and changes nothing: they're removed first (LDAP.RevokeAppPasswords, or the person in the
+	// provider's own settings), or the person keeps them on a separate account that isn't an admin (#281). One made
+	// at the same moment as the promotion is ended with it.
 	EnsurePerson(ctx context.Context, p Person) error
 	// People are the people in a role.
 	People(ctx context.Context, r Role) ([]Person, error)
@@ -210,6 +213,9 @@ var (
 	ErrUnreachable  = errors.New("the identity provider can't be reached")
 	ErrNoPerson     = errors.New("no such person in the household account")
 	ErrNotReady     = errors.New("the identity provider isn't ready yet")
+	// ErrAdminAppPassword refuses an app password for an admin, and making an admin of someone who holds one (#281):
+	// an admin who uses LDAP apps does it with a separate account that isn't an admin.
+	ErrAdminAppPassword = errors.New("an admin holds no app password: LDAP apps take a separate account that isn't an admin")
 )
 
 // LDAPApp is an app that signs people in over LDAP (#204): an LDAP provider of its own at the sign-in's LDAP outpost,
@@ -235,6 +241,12 @@ type LDAPCredentials struct {
 	Created bool
 }
 
+// AdminAppPasswords is an admin found holding app passwords. Err says why they couldn't be ended; nil, they were.
+type AdminAppPasswords struct {
+	Username string
+	Err      error
+}
+
 // LDAP is a provider that serves apps over LDAP through an outpost of its own: the sign-in listener's port 636 leads to
 // it (ADR 0020). People bind with an app password, never their passkey (LDAP can't carry one).
 type LDAP interface {
@@ -253,7 +265,15 @@ type LDAP interface {
 	// AppPassword makes a person a new app password for one LDAP app, by the app's slug: it binds at that app's base
 	// DN and at no other app's, so an app that is handed it can't replay it elsewhere. It is shown only here. The app's
 	// directory must be there; whether the person is in its audience is the bind's to say, as for every other password.
-	// Credentials counts it, so an admin who holds one passes no step-up: Homeward makes none for an admin, who uses
-	// LDAP apps with a separate account that isn't an admin (#274).
+	// Credentials counts it, so an admin who holds one passes no step-up: it refuses an admin with ErrAdminAppPassword,
+	// one made an admin while it was being made included (#274, #281).
 	AppPassword(ctx context.Context, slug, username string) (Secret, error)
+	// RevokeAppPasswords ends every app password the person holds, for every app, whoever made it: from the moment it
+	// returns, none of them binds anywhere.
+	RevokeAppPasswords(ctx context.Context, username string) error
+	// EndAdminAppPasswords finds every admin holding an app password, whoever made it (with Kanidm, a person makes
+	// their own, an admin too), and whoever made the admin (the provider's console included: every member of the
+	// admins' group, inactive ones too), ends those passwords, and says whose they were and where it failed, so the
+	// manager raises a security event for each (#281). Its error says what it couldn't read.
+	EndAdminAppPasswords(ctx context.Context) ([]AdminAppPasswords, error)
 }

@@ -25,6 +25,8 @@ type fakeAuthentik struct {
 	after   func()   // called once each change is made
 	// allBindings ignores the bindings' target filter too.
 	allBindings bool
+	// refuse answers 500 to requests whose "METHOD path" starts with it.
+	refuse string
 }
 
 func newFake() *fakeAuthentik {
@@ -69,6 +71,14 @@ func (f *fakeAuthentik) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	reply := func(v any) { _ = json.NewEncoder(w).Encode(v) }
+	if f.refuse != "" && strings.HasPrefix(r.Method+" "+p, f.refuse) {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if strings.HasPrefix(p, "/core/tokens/") && strings.HasSuffix(p, "/view_key/") && r.Method == http.MethodGet {
+		reply(map[string]any{"key": "key-of-" + strings.TrimSuffix(strings.TrimPrefix(p, "/core/tokens/"), "/view_key/")})
+		return
+	}
 	if f.after != nil && r.Method != http.MethodGet {
 		defer f.after()
 	}
@@ -116,6 +126,9 @@ func (f *fakeAuthentik) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if coll == "/core/applications/" { // an application's pk is its policy binding model's, as in Authentik
 			body["pbm_uuid"] = fmt.Sprintf("app-%d", f.next)
 			body["pk"] = body["pbm_uuid"]
+		}
+		if coll == "/core/tokens/" { // a token is reached by its identifier
+			body["pk"] = body["identifier"]
 		}
 		if coll == "/flows/bindings/" { // a stage binding is a target of policy bindings too
 			body["policybindingmodel_ptr_id"] = fmt.Sprintf("pbm-%d", f.next)

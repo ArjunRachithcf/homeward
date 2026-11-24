@@ -2,6 +2,7 @@ package idptest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -24,6 +25,13 @@ type LDAPWorld interface {
 	Bind(t *testing.T, dn, password string) error
 	// Search binds at the outpost as dn with password, then searches base's whole subtree for every object.
 	Search(t *testing.T, dn, password, base string) ([]ldaptest.Entry, error)
+	// OwnAppPassword has the person make themselves an app password for an LDAP app, by its slug, in the provider's own
+	// settings, and returns it: Kanidm has everyone make their own, and Authentik's settings let anyone. Homeward's
+	// refusals aren't in the way there, so an admin can make one too (#281).
+	OwnAppPassword(t *testing.T, slug, username string) string
+	// ConsoleAdmin makes an account in the provider's own console, outside Homeward, and puts it straight into the
+	// admins' group, as an admin of the provider could: Admin takes it for an admin, as it reads only the groups.
+	ConsoleAdmin(t *testing.T, username string)
 }
 
 // RunLDAP runs the LDAP contract: an app's provider opens to its roles only, a person sees nobody but themselves, and
@@ -94,7 +102,15 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 		}
 		return pw.Reveal()
 	}
-	lena, maria, kiko, olga := password(media, "lena"), password(media, "maria"), password(media, "kiko"), password(media, "olga")
+	lena, maria, kiko := password(media, "lena"), password(media, "maria"), password(media, "kiko")
+	// Homeward makes no app password for an admin (#274, #281); olga, the admin, makes her own, as she can.
+	if pw, err := l.AppPassword(ctx, media.Slug, "olga"); !errors.Is(err, idp.ErrAdminAppPassword) || pw != "" {
+		t.Errorf("an app password for an admin: %v, want ErrAdminAppPassword (#281)", err)
+	}
+	if c, err := p.Credentials(ctx, "olga"); err != nil || slices.Contains(c.Others, idp.CredToken) {
+		t.Errorf("the admin's credentials after the refusal: %+v %v, want no app password left behind", c, err)
+	}
+	olga := w.OwnAppPassword(t, media.Slug, "olga")
 	if _, err := l.AppPassword(ctx, "jellyfin", "lena"); err == nil {
 		t.Error("an app password for something that isn't an app's slug")
 	}
@@ -335,6 +351,106 @@ func RunLDAP(t *testing.T, w LDAPWorld) {
 			if err := l.DeleteLDAP(ctx, bad); err == nil {
 				t.Errorf("deleted %q", bad)
 			}
+		}
+	})
+	notes := idp.LDAPApp{Slug: "homerslab-family-notes", Name: "Family notes", Roles: []idp.Role{idp.Adult, idp.Admin}}
+	var shared idp.LDAPCredentials
+	t.Run("someone holding app passwords isn't made an admin until they're removed (#281)", func(t *testing.T) {
+		var err error
+		if shared, err = l.EnsureLDAP(ctx, notes); err != nil {
+			t.Fatal(err)
+		}
+		bea := idp.Person{Username: "bea", Name: "Bea", Mail: "bea@ferreira.family", Role: idp.Adult}
+		if err := p.EnsurePerson(ctx, bea); err != nil {
+			t.Fatal(err)
+		}
+		made, own := password(notes, "bea"), w.OwnAppPassword(t, notes.Slug, "bea")
+		if err := ready(shared, "bea", made); err != nil {
+			t.Fatalf("an adult, with the app password Homeward made: %v", err)
+		}
+		bea.Role = idp.Admin
+		if err := p.EnsurePerson(ctx, bea); !errors.Is(err, idp.ErrAdminAppPassword) {
+			t.Errorf("made an admin while holding app passwords: %v, want ErrAdminAppPassword", err)
+		}
+		if admins, err := p.People(ctx, idp.Admin); err != nil || slices.ContainsFunc(admins, func(x idp.Person) bool { return x.Username == "bea" }) {
+			t.Errorf("the admins after the refusal: %+v %v, want no bea", admins, err)
+		}
+		for _, pw := range []string{made, own} {
+			if err := w.Bind(t, dn(shared, "bea"), pw); err != nil {
+				t.Errorf("refused, yet her app passwords changed: %v", err)
+			}
+		}
+		if err := l.RevokeAppPasswords(ctx, "bea"); err != nil {
+			t.Fatal(err)
+		}
+		for _, pw := range []string{made, own} {
+			if err := w.Bind(t, dn(shared, "bea"), pw); err == nil {
+				t.Error("a revoked app password bound")
+			}
+		}
+		if c, err := p.Credentials(ctx, "bea"); err != nil || slices.Contains(c.Others, idp.CredToken) {
+			t.Errorf("her credentials once revoked: %+v %v, want no app password", c, err)
+		}
+		if err := l.RevokeAppPasswords(ctx, "nobody-of-ours"); err == nil {
+			t.Error("revoked the app passwords of someone the household doesn't have")
+		}
+		if err := p.EnsurePerson(ctx, bea); err != nil {
+			t.Errorf("made an admin once they're removed: %v", err)
+		}
+		if admins, err := p.People(ctx, idp.Admin); err != nil || !slices.ContainsFunc(admins, func(x idp.Person) bool { return x.Username == "bea" }) {
+			t.Errorf("the admins: %+v %v, want bea among them", admins, err)
+		}
+	})
+	t.Run("admins who made themselves app passwords: every one ends, and the check says whose (#281)", func(t *testing.T) {
+		if shared.BaseDN == "" {
+			t.Skip("no app for it")
+		}
+		w.ConsoleAdmin(t, "carla")
+		bea, olga, maria := w.OwnAppPassword(t, notes.Slug, "bea"), w.OwnAppPassword(t, notes.Slug, "olga"), password(notes, "maria")
+		carla := w.OwnAppPassword(t, notes.Slug, "carla")
+		if err := ready(shared, "bea", bea); err != nil {
+			t.Fatalf("an admin, with the app password she made herself: %v", err)
+		}
+		found, err := l.EndAdminAppPasswords(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ended []string
+		for _, f := range found {
+			if f.Err != nil {
+				t.Errorf("%s's app passwords didn't end: %v", f.Username, f.Err)
+			}
+			ended = append(ended, f.Username)
+		}
+		for _, who := range []string{"bea", "olga", "carla"} {
+			if !slices.Contains(ended, who) {
+				t.Errorf("ended %v: no %s", ended, who)
+			}
+		}
+		for _, who := range []string{"lena", "maria", "kiko"} {
+			if slices.Contains(ended, who) {
+				t.Errorf("ended %v: %s isn't an admin", ended, who)
+			}
+		}
+		for who, pw := range map[string]string{"bea": bea, "olga": olga, "carla": carla} {
+			if err := w.Bind(t, dn(shared, who), pw); err == nil {
+				t.Errorf("%s's app password, ended, still bound", who)
+			}
+			if who == "carla" {
+				continue // not one of the household's people: Credentials doesn't know her
+			}
+			if c, err := p.Credentials(ctx, who); err != nil || slices.Contains(c.Others, idp.CredToken) {
+				t.Errorf("%s's credentials once ended: %+v %v", who, c, err)
+			}
+		}
+		if err := w.Bind(t, dn(shared, "maria"), maria); err != nil {
+			t.Errorf("an adult's app password, after the admins' ended: %v", err)
+		}
+		if again, err := l.EndAdminAppPasswords(ctx); err != nil || len(again) != 0 {
+			t.Errorf("again: %v %v, want nobody", again, err)
+		}
+		if err := l.DeleteLDAP(ctx, notes.Slug); err != nil {
+			t.Fatal(err)
 		}
 	})
 }
