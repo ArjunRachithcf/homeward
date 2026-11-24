@@ -152,14 +152,15 @@ func TestAStorageLocationIsBackedUpOnlyWhenTheAdminOptsIn(t *testing.T) {
 		return b
 	}
 	before := plan()
-	if got := locations(t, p); got[0].Backup || len(before.Backups.Locations) != 1 || before.Backups.Locations[0].BackedUp {
+	if got := locations(t, p); len(got) != 1 || got[0].Backup || len(before.Backups.Locations) != 1 || before.Backups.Locations[0].BackedUp {
 		t.Errorf("backed up without opting in: %+v %+v", got, before.Backups)
 	}
 	if r := p.admin("PUT", "/api/v1/storage/documents/backup", map[string]bool{"backup": true}); r.Code != http.StatusOK {
 		t.Fatalf("opting in, in Admin: %d %s", r.Code, r.Body)
 	}
 	after := plan()
-	if got := locations(t, p); !got[0].Backup || !after.Backups.Locations[0].BackedUp || after.Backups.Locations[0].Location != "documents" {
+	if got := locations(t, p); len(got) != 1 || !got[0].Backup || len(after.Backups.Locations) != 1 ||
+		!after.Backups.Locations[0].BackedUp || after.Backups.Locations[0].Location != "documents" {
 		t.Errorf("opted in: %+v %+v", got, after.Backups)
 	}
 	if r := p.control("POST", "/api/v1/plans/"+before.ID+"/apply", nil); r.Code != http.StatusConflict {

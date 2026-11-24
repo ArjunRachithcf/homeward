@@ -49,9 +49,11 @@ jobs:
           sh .github/scripts/stop-commands.sh go -C tools build -o /usr/local/bin/govulncheck golang.org/x/vuln/cmd/govulncheck
       # Each target the packages ship for, as the binary is built (CGO_ENABLED=0). Exit 3 means the code calls a
       # vulnerable symbol, the standard library's included. Findings only in imported packages or required modules
-      # are listed under "Package Results" and "Module Results" and exit 0. A hypothetical example, since x/crypto
-      # isn't in the module graph today: GO-2026-5932 (x/crypto's openpgp, with no tagged fix) would be listed and
-      # pass if x/crypto were required and openpgp never imported (proven on #113's throwaway PR #112).
+      # are listed under "Package Results" and "Module Results" and exit 0. One such finding is live and accepted
+      # (2026-11-24, #289): GO-2026-5932, in x/crypto's openpgp, which has no tagged fix. x/crypto v0.58.0 is required
+      # (since #114, 2026-11-11: acmez for certificates uses its cryptobyte, and the engine's modules require it), but
+      # nothing imports openpgp, so none of its code is built or called and the scan passes with it listed (as #113's
+      # throwaway PR #112 proved). Should the code ever call the vulnerable symbols, govulncheck exits 3 and the job fails.
       - name: govulncheck ./... (linux/amd64)
         env:
           GOOS: linux
