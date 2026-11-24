@@ -215,6 +215,8 @@ func (m *Manager) Serve(ctx context.Context, setupLn, controlLn, adminLn net.Lis
 	servers := []*http.Server{
 		{Handler: m.Setup(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 			// The network step bootstraps a mesh and joins it, waiting for the client to connect: up to a few minutes.
+			// The setup page waits a little longer for its answer (web/src/setup/api.ts: WAIT.network, copied by
+			// hand): change both together.
 			WriteTimeout: 3 * time.Minute, IdleTimeout: 2 * time.Minute},
 		{Handler: m.Control(), ReadHeaderTimeout: 10 * time.Second},
 		{Handler: m.Admin(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,

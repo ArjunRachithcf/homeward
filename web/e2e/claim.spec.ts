@@ -118,18 +118,24 @@ test('a reload after the manager took the claim, before its answer came, opens s
 test('a claim sent again with another tab’s nonce is refused', async ({ browser, primary }) => {
   const link = await primary.newLink();
   const first = await browser.newPage();
-  let taken = false;
-  await first.route(CLAIM, async (route) => {
-    await route.fetch(); // the first tab's claim is taken, and its answer lost
-    taken = true;
-  });
-  await first.goto(link.localUrl);
-  await expect.poll(() => taken).toBe(true);
+  let second: Page | undefined;
+  try {
+    let taken = false;
+    await first.route(CLAIM, async (route) => {
+      await route.fetch(); // the first tab's claim is taken, and its answer lost
+      taken = true;
+    });
+    await first.goto(link.localUrl);
+    await expect.poll(() => taken).toBe(true);
 
-  const second = await (await browser.newContext()).newPage(); // the same machine, the same link, its own nonce
-  await second.goto(link.localUrl);
-  await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
-  expect(primary.openSessions()).toBe(1);
+    second = await (await browser.newContext()).newPage(); // the same machine, the same link, its own nonce
+    await second.goto(link.localUrl);
+    await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
+    expect(primary.openSessions()).toBe(1);
+  } finally { // pages left open outlive the test: a claim still out would be sent again into the next one
+    await first.context().close();
+    await second?.context().close();
+  }
 });
 
 test('the tab stores nothing but its session token, even while its claim is out', async ({ page, primary }) => {
@@ -158,14 +164,20 @@ test('a reload after the claim was answered keeps the session, and stores nothin
 test('a link the manager refused leaves the address bar', async ({ browser, primary }) => {
   const link = await primary.newLink();
   const first = await browser.newPage();
-  await first.goto(link.localUrl);
-  await expect(first.getByRole('heading', { level: 1 })).toContainText(welcome);
+  let second: Page | undefined;
+  try {
+    await first.goto(link.localUrl);
+    await expect(first.getByRole('heading', { level: 1 })).toContainText(welcome);
 
-  const second = await (await browser.newContext()).newPage();
-  await second.goto(link.localUrl);
-  await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
-  await expect(second).toHaveURL(/\/setup#\/welcome$/);
-  expect(await stored(second)).toEqual([]);
+    second = await (await browser.newContext()).newPage();
+    await second.goto(link.localUrl);
+    await expect(second.getByRole('heading', { level: 1 })).toContainText('This link doesn’t work any more');
+    await expect(second).toHaveURL(/\/setup#\/welcome$/);
+    expect(await stored(second)).toEqual([]);
+  } finally { // pages left open outlive the test: a claim still out would be sent again into the next one
+    await first.context().close();
+    await second?.context().close();
+  }
 });
 
 test('the key goes only into the claim, however often it is sent', async ({ page, primary }) => {
