@@ -1,11 +1,16 @@
-# HomersLab: notes for agents
+# Homeward: notes for agents
 
-HomersLab is a security-first app manager for a household's self-hosted apps. Before changing anything, read:
+Homeward is a security-first app manager for a household's self-hosted apps. Before changing anything, read:
 - `GLOSSARY.md`, whose words are used in code, UI, commits and issues;
 - the parts of `docs/spec.md` your ticket links;
 - the ADRs it cites in `docs/adr/`.
 
 A change that contradicts an ADR is a decision for the maintainer, not a code change.
+
+Homeward is the product; **HomersLab** is its maker's umbrella name (ADR 0022). New host-owned names (units, folders,
+users, the environment, the CLI) take `homeward`; names Homeward keeps in other software or publishes to apps (the
+identity headers `X-HomersLab-*`, the contract `homerslab-v1`, the identity provider's, the mesh's and the engine's
+objects, DNS records, cookies, the firewall table) keep `homerslab`.
 
 ## Working an issue, or running the loop
 
@@ -32,12 +37,13 @@ parking, and asking the maintainer.
 - **Commits** use the noreply identity `Arjun Rachith <106335968+ArjunRachithcf@users.noreply.github.com>`, end with the
   session's attribution lines, and come one ticket per PR.
 - **Pushing** goes over HTTPS:
-  `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/ArjunRachithcf/homerslab.git <branch>`.
+  `git -c credential.helper= -c credential.helper='!gh auth git-credential' push https://github.com/ArjunRachithcf/homeward.git <branch>`.
 
 ## The security core
 
-These areas are the **security core**. A PR touching them is labelled `security-core` and is merged by the
-maintainer, never by an agent:
+These areas are the **security core**. A PR touching them is labelled `security-core` and stacks on `integration`,
+which reaches `main` as one squash that the loop merges once its multi-axis review passes, on the maintainer's explicit
+word, as every merge (`docs/loop.md`, Branches). The areas:
 - identity provider adapters, sign-in and step-up;
 - secrets;
 - firewall rules;

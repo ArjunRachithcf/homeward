@@ -1,26 +1,46 @@
 package manager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
 
-	"github.com/ArjunRachithcf/homerslab/internal/node"
+	"github.com/ArjunRachithcf/homeward/internal/agent"
+	"github.com/ArjunRachithcf/homeward/internal/engine"
+	"github.com/ArjunRachithcf/homeward/internal/idp"
+	"github.com/ArjunRachithcf/homeward/internal/mesh"
+	"github.com/ArjunRachithcf/homeward/internal/node"
 )
 
-// agentClient asks the primary's agent, over its socket.
-type agentClient struct{ http *http.Client }
+// agentClient asks the primary's agent, over its socket. Compose reads get longer than the agent's own deadline for
+// them, so the manager hears the agent's read-timeout instead of giving up first.
+type agentClient struct{ http, reads, installs, status, backups *http.Client }
 
 func newAgentClient(socket string) *agentClient {
-	return &agentClient{http: &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	t := &http.Transport{
+		// One connection per request: a local socket costs nothing to dial, and no connection is ever left open
+		// unused, which would hold up the agent's shutdown.
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-		}},
-	}}
+		},
+	}
+	return &agentClient{
+		http:  &http.Client{Timeout: 5 * time.Second, Transport: t},
+		reads: &http.Client{Timeout: agent.ReadDeadline + 5*time.Second, Transport: t},
+		// An install asks the engine, reads the compose file, seals the app's secrets and has systemd run its unit;
+		// the apps' status asks the engine and checks every app.
+		installs: &http.Client{Timeout: agent.InstallDeadline + 5*time.Second, Transport: t},
+		status:   &http.Client{Timeout: agent.AppsDeadline + 2*time.Second, Transport: t},
+		// A backup run takes as long as its data does (a first photo library: hours); the scheduler's context ends it.
+		backups: &http.Client{Transport: t},
+	}
 }
 
 func (a *agentClient) node(ctx context.Context) (node.Facts, error) {
@@ -38,4 +58,259 @@ func (a *agentClient) node(ctx context.Context) (node.Facts, error) {
 		return f, fmt.Errorf("the agent answered %s", resp.Status)
 	}
 	return f, json.NewDecoder(resp.Body).Decode(&f)
+}
+
+// errJoin is the agent's join failing.
+var errJoin = errors.New("the primary didn't join the mesh")
+
+// call sends body as JSON to the agent and decodes its answer into out. The agent's error codes come back in the
+// error; no request body ever does.
+func (a *agentClient) call(ctx context.Context, method, path string, body, out any) error {
+	var r io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		r = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://agent"+path, r)
+	if err != nil {
+		return err
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		var e struct{ Error string }
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4<<10)).Decode(&e)
+		return &agentError{Method: method, Path: path, Status: resp.StatusCode, Code: e.Error}
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (a *agentClient) seal(ctx context.Context, name string, value mesh.Secret) error {
+	return a.call(ctx, http.MethodPut, "/v1/credentials/"+name, map[string]string{"value": value.Reveal()}, nil)
+}
+
+// agentError is the agent saying no, with its code.
+type agentError struct {
+	Method, Path string
+	Status       int
+	Code         string
+}
+
+func (e *agentError) Error() string {
+	return fmt.Sprintf("the agent answered %s %s with %d %s", e.Method, e.Path, e.Status, e.Code)
+}
+
+// errNotSealed is a credential the agent doesn't hold: not a failure to reach it.
+var errNotSealed = errors.New("the agent holds no such credential")
+
+func (a *agentClient) unseal(ctx context.Context, name string) (mesh.Secret, error) {
+	var v struct{ Value string }
+	err := a.call(ctx, http.MethodGet, "/v1/credentials/"+name, nil, &v)
+	var ae *agentError
+	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
+		return "", errNotSealed
+	}
+	return mesh.Secret(v.Value), err
+}
+
+func (a *agentClient) join(ctx context.Context, req agent.JoinRequest) (agent.Joined, error) {
+	var j agent.Joined
+	// A join waits for the mesh's client to connect: longer than the client's usual timeout.
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	c := *a.http
+	c.Timeout = 90 * time.Second
+	err := (&agentClient{http: &c}).call(ctx, http.MethodPost, "/v1/mesh/join", req, &j)
+	if err != nil {
+		return j, fmt.Errorf("%w: %v", errJoin, err)
+	}
+	return j, nil
+}
+
+func (a *agentClient) closeSetupListener(ctx context.Context) error {
+	return a.call(ctx, http.MethodPut, "/v1/firewall/setup-listener", map[string]bool{"open": false}, nil)
+}
+
+func (a *agentClient) edgeSites(ctx context.Context, s agent.EdgeSites) error {
+	c := *a.http
+	c.Timeout = 60 * time.Second // the edge may still be starting
+	return (&agentClient{http: &c}).call(ctx, http.MethodPut, "/v1/edge", s, nil)
+}
+
+func (a *agentClient) edgeStatus(ctx context.Context) (agent.EdgeStatus, error) {
+	var s agent.EdgeStatus
+	return s, a.call(ctx, http.MethodGet, "/v1/edge", nil, &s)
+}
+
+// edgeCertificate hands a domain's certificate and key to the agent, which seals them for the edge and restarts it.
+func (a *agentClient) edgeCertificate(ctx context.Context, domain string, chain []byte, key mesh.Secret) error {
+	c := *a.http
+	c.Timeout = 60 * time.Second // the edge restarts with its new credentials
+	return (&agentClient{http: &c}).call(ctx, http.MethodPut, "/v1/edge/certificates/"+domain,
+		map[string]string{"chain": string(chain), "key": key.Reveal()}, nil)
+}
+
+// errClosedForGood is the agent refusing a setup port because the listener closed for good.
+var errClosedForGood = errors.New("the setup listener is closed for good")
+
+// setupPort gives the agent the setup listener's port.
+func (a *agentClient) setupPort(ctx context.Context, port int) error {
+	err := a.call(ctx, http.MethodPut, "/v1/firewall/setup-listener", map[string]any{"open": true, "port": port}, nil)
+	if ae := (*agentError)(nil); errors.As(err, &ae) && ae.Code == "closed-for-good" {
+		return fmt.Errorf("%w: %v", errClosedForGood, err)
+	}
+	return err
+}
+
+func (a *agentClient) forget(ctx context.Context, name string) error {
+	return a.call(ctx, http.MethodDelete, "/v1/credentials/"+name, nil, nil)
+}
+
+// meshNode is the node's mesh client as its agent finds it.
+func (a *agentClient) meshNode(ctx context.Context) (agent.MeshStatus, error) {
+	var s agent.MeshStatus
+	return s, a.call(ctx, http.MethodGet, "/v1/mesh", nil, &s)
+}
+
+// signIn installs the sign-in on the primary, or brings it in line; a bootstrap token, when given, travels inward
+// only. The unit restarts: Authentik takes a while before it answers.
+func (a *agentClient) signIn(ctx context.Context, req agent.SignInRequest) (agent.SignInStatus, error) {
+	var s agent.SignInStatus
+	c := *a.http
+	c.Timeout = 60 * time.Second // systemd restarts the unit
+	return s, (&agentClient{http: &c}).call(ctx, http.MethodPut, "/v1/sign-in", req, &s)
+}
+
+// ldapOutpost hands the agent the LDAP outpost's token, inward only (#204): it seals it for the outpost's own unit,
+// which it starts, or keeps running as it is when the token is the one it has.
+func (a *agentClient) ldapOutpost(ctx context.Context, token idp.Secret) error {
+	c := *a.http
+	c.Timeout = 60 * time.Second // systemd restarts the unit
+	return (&agentClient{http: &c}).call(ctx, http.MethodPut, "/v1/sign-in/ldap", agent.LDAPRequest{Token: token.Reveal()}, nil)
+}
+
+func (a *agentClient) signInStatus(ctx context.Context) (agent.SignInStatus, error) {
+	var s agent.SignInStatus
+	return s, a.call(ctx, http.MethodGet, "/v1/sign-in", nil, &s)
+}
+
+func (a *agentClient) forgetBootstrap(ctx context.Context) error {
+	c := *a.http
+	c.Timeout = 60 * time.Second
+	return (&agentClient{http: &c}).call(ctx, http.MethodDelete, "/v1/sign-in/bootstrap-token", nil, nil)
+}
+
+// agentRefused is the agent's no, with its reason.
+type agentRefused struct {
+	Status       int
+	Code, Detail string
+}
+
+func (e *agentRefused) Error() string {
+	return fmt.Sprintf("the agent answered %d %s: %s", e.Status, e.Code, e.Detail)
+}
+
+// The agent's compose read ending for a reason other than the file's contents, as the manager says each (#293, #295):
+//   - errReadRefused: the agent answered, but couldn't start the read's child (as root, its read user missing, a
+//     permission refused, or the check that the child starts not dumpable failing). The network is fine; the primary
+//     needs mending;
+//   - errReadBusy: another read held the agent's one read slot until this one's deadline. Try again;
+//   - errReadTimeout, errReadTooBig: the read ran out of time or memory, within the bounds the agent sets every read.
+//     The app's definition is too slow or too large to read;
+//   - errReadCrashed: the read's child crashed before it read the file, starting or confining itself (Go unable to
+//     start a thread under the unit's TasksMax, say). Not the definition's: the primary needs mending.
+var (
+	errReadRefused = errors.New("agent-refused-read")
+	errReadBusy    = errors.New("agent-busy")
+	errReadTimeout = errors.New("read-timeout")
+	errReadTooBig  = errors.New("read-too-big")
+	errReadCrashed = errors.New("agent-read-crashed")
+)
+
+// readTroubles is each of the agent's answers to a compose read that the manager says as one of the errors above, from
+// a read or from an install's, with the manager's own status for it: the primary's trouble is 500 or 503, the app
+// definition's 422.
+var readTroubles = []struct {
+	status int
+	code   string
+	err    error
+	answer int
+}{
+	{http.StatusInternalServerError, "no-reader", errReadRefused, http.StatusInternalServerError},
+	{http.StatusServiceUnavailable, "busy", errReadBusy, http.StatusServiceUnavailable},
+	{http.StatusGatewayTimeout, "read-timeout", errReadTimeout, http.StatusUnprocessableEntity},
+	{http.StatusUnprocessableEntity, "read-too-big", errReadTooBig, http.StatusUnprocessableEntity},
+	{http.StatusInternalServerError, "reader-crashed", errReadCrashed, http.StatusInternalServerError},
+}
+
+// readTrouble is the manager's error for the agent's answer, its status and error code, to a compose read: one of the
+// errors above, or nil for any other answer.
+func readTrouble(status int, code string) error {
+	for _, t := range readTroubles {
+		if t.status == status && t.code == code {
+			return t.err
+		}
+	}
+	return nil
+}
+
+// failRead answers a compose read's trouble (readTrouble) with its code alone, and logs it with where it came from,
+// as an error when the primary needs mending; it says whether err was one.
+func (m *Manager) failRead(w http.ResponseWriter, err error, where string, args ...any) bool {
+	for _, t := range readTroubles {
+		if !errors.Is(err, t.err) {
+			continue
+		}
+		args = append(args, "err", err)
+		if t.answer == http.StatusInternalServerError {
+			m.log.Error("the agent couldn't read an app's compose file, "+where+": the primary needs mending; its log says why", args...)
+		} else {
+			m.log.Warn("the agent's read of an app's compose file, "+where+", ended", args...)
+		}
+		fail(w, t.answer, t.err.Error())
+		return true
+	}
+	return false
+}
+
+// readProject asks the agent to read an app's compose file as the project name, through the Compose SDK.
+func (a *agentClient) readProject(ctx context.Context, name string, compose []byte) (engine.Project, error) {
+	var p engine.Project
+	body, err := json.Marshal(map[string]string{"project": name, "compose": string(compose)})
+	if err != nil {
+		return p, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://agent/v1/projects/read", bytes.NewReader(body))
+	if err != nil {
+		return p, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.reads.Do(req)
+	if err != nil {
+		return p, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		e := &agentRefused{Status: resp.StatusCode}
+		var b struct{ Error, Detail string }
+		decoded := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&b) == nil
+		if trouble := readTrouble(resp.StatusCode, b.Error); decoded && trouble != nil {
+			return p, fmt.Errorf("%w: the agent answered %s %s", trouble, resp.Status, b.Error)
+		}
+		if !decoded || resp.StatusCode/100 != 4 {
+			return p, fmt.Errorf("the agent answered %s", resp.Status)
+		}
+		e.Code, e.Detail = b.Error, b.Detail
+		return p, e
+	}
+	return p, json.NewDecoder(resp.Body).Decode(&p)
 }

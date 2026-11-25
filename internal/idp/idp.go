@@ -1,0 +1,285 @@
+// Package idp is the identity provider contract: what Homeward needs from Authentik and Kanidm alike (spec: Adapter
+// contracts → Identity providers; ADR 0004, amended). Each provider is an adapter in its own package, and every
+// adapter passes the same contract suite (idptest) against the real software in containers.
+//
+// The household account is the one sign-in for everyone. Its passkeys are made at the sign-in's own name,
+// auth.<main domain>, which is also their RP ID, never the bare domain (#83). Every passkey requires user
+// verification, at enrolment and at every assertion (#84). Admins sign in only through a passkey-only flow, and the
+// first admin's passkey comes only from a one-time enrolment link the manager mints (#84, #87).
+package idp
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/ArjunRachithcf/homeward/internal/mesh"
+)
+
+// Role is what a person may do; every role is a group in the provider.
+type Role = mesh.Role
+
+// Roles, as the mesh names them.
+const (
+	Admin = mesh.Admin
+	Adult = mesh.Adult
+	Kid   = mesh.Kid
+)
+
+// Roles are every role, in order.
+func Roles() []Role { return []Role{Admin, Adult, Kid} }
+
+// RoleGroup is a role's group in the provider. It carries Homeward's prefix, so a household's own groups are never
+// touched.
+func RoleGroup(r Role) string { return "homerslab-" + string(r) + "s" }
+
+// Secret is a credential: it never prints, never marshals and never logs.
+type Secret = mesh.Secret
+
+// SignInPrefix is the sign-in's name under the main domain.
+const SignInPrefix = "auth."
+
+// Household is the sign-in as the household uses it.
+type Household struct {
+	// Name is the household's name, which the sign-in's pages show.
+	Name string
+	// Domain is the main domain; the sign-in answers at auth.<Domain>, at Port (ADR 0021).
+	Domain string
+	Port   int
+}
+
+// SignIn is the sign-in's name, auth.<main domain>: the passkeys' RP ID.
+func (h Household) SignIn() string { return SignInPrefix + h.Domain }
+
+// Origin is the sign-in's one origin, https://auth.<main domain>[:port], which WebAuthn checks exactly.
+func (h Household) Origin() string {
+	o := "https://" + h.SignIn()
+	if h.Port != 0 && h.Port != 443 {
+		o += ":" + strconv.Itoa(h.Port)
+	}
+	return o
+}
+
+// URL is a path at the sign-in's origin.
+func (h Household) URL(path string) string { return h.Origin() + path }
+
+// Person is someone in the household account.
+type Person struct {
+	Username string `json:"username"`
+	Name     string `json:"name"`
+	Mail     string `json:"mail"`
+	Role     Role   `json:"role"`
+}
+
+// Passkey is one of a person's passkeys, as the provider lists it. None of it is secret.
+type Passkey struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Created time.Time `json:"created"`
+	// RPID is the name the passkey is bound to: always the sign-in's own.
+	RPID string `json:"rpId"`
+}
+
+// Credentials are everything a person holds that can sign them in, as the provider lists it: their passkeys, and the
+// kinds of anything else (a password, TOTP, recovery codes, an app password or API token, a linked account at another
+// sign-in, another kind of device). None of it is secret.
+//
+// Before accepting a step-up, Homeward reads an admin's credentials and refuses it when anything but passkeys is
+// there (ADR 0004, amended; #84): no claim of the ID token says what the admin holds, and a password or second factor
+// a stolen session added could otherwise stand in for the passkey somewhere.
+type Credentials struct {
+	Passkeys int      `json:"passkeys"`
+	Others   []string `json:"others"`
+}
+
+// PasskeysOnly says the person holds at least one passkey and nothing else.
+func (c Credentials) PasskeysOnly() bool { return c.Passkeys > 0 && len(c.Others) == 0 }
+
+// The kinds of credentials that aren't passkeys, as Credentials names them.
+const (
+	CredPassword      = "password"
+	CredTOTP          = "totp"
+	CredRecoveryCodes = "recovery-codes"
+	CredToken         = "token"          // an app password, an API token or a recovery link
+	CredLinkedAccount = "linked-account" // a sign-in through another provider
+)
+
+// EnrolmentLife is how long an enrolment link works, once (#84, #87).
+const EnrolmentLife = 30 * time.Minute
+
+// Link is a one-time enrolment link: its URL is a bearer credential until it is used or expires.
+type Link struct {
+	URL       Secret
+	ExpiresAt time.Time
+}
+
+// Client is an app's OIDC client: who may sign in to it, and where the provider sends them back.
+type Client struct {
+	// Slug names the client in the provider, homerslab-<app>.
+	Slug string
+	// Name is what the sign-in shows.
+	Name         string
+	RedirectURIs []string
+	// Roles may sign in; nobody else.
+	Roles []Role
+	// PasskeyOnly signs everyone in through the passkey-only flow (Admin: admins sign in only that way).
+	PasskeyOnly bool
+}
+
+// Guard is an app's forward-auth guard at the edge: its own, for its one name and its audience (#83: never one for the
+// whole domain). The edge asks it before any request reaches the app.
+type Guard struct {
+	// Slug names the guard in the provider, homerslab-<app>; Name is what the sign-in shows.
+	Slug string
+	Name string
+	// URL is the app's one URL, https://<name>.<domain>[:port] (ADR 0021): the only name the guard answers for.
+	URL string
+	// Roles may open the app; nobody else.
+	Roles []Role
+}
+
+// ClientCredentials are what an app needs of its OIDC client. Secret is a credential.
+type ClientCredentials struct {
+	ID     string
+	Secret Secret
+	// Issuer is the client's issuer, at the sign-in's origin; its discovery document is Issuer +
+	// "/.well-known/openid-configuration" (spec: OIDC Discovery 1.0).
+	Issuer string
+	// Created says this call made the client; false when it was there already (an install that timed out made it, and
+	// its app may be running with it), so only a caller that made it may delete it after a failure.
+	Created bool
+}
+
+// Report is what a provider can do, as its adapter finds it.
+type Report struct {
+	Provider string `json:"provider"` // authentik, kanidm
+	Version  string `json:"version"`
+	// OIDC, ForwardAuth and LDAP are the sign-in methods it provides to apps. ForwardAuth is false while a guard isn't
+	// as Homeward made it, so the role it names may not be Homeward's (#244), or someone may get past it another way
+	// than its sign-in (#273); Prepare puts its mappings and settings back, and EnsureGuard, for its app, a guard
+	// whose application was handed another provider.
+	OIDC        bool `json:"oidc"`
+	ForwardAuth bool `json:"forwardAuth"`
+	LDAP        bool `json:"ldap"`
+	// RPID and Origin are what its passkeys are bound to and checked against: auth.<main domain> and its one URL.
+	RPID   string `json:"rpId"`
+	Origin string `json:"origin"`
+	// UserVerification is what its passkey flows ask of an authenticator, at enrolment and at every assertion.
+	UserVerification string `json:"userVerification"`
+	// FirstAdminOff says the provider's own first-admin flow applies to nobody.
+	FirstAdminOff bool `json:"firstAdminOff"`
+	// PasskeyOnlySignIn says admins sign in through a flow that takes a passkey and nothing else.
+	PasskeyOnlySignIn bool `json:"passkeyOnlySignIn"`
+}
+
+// Provider is one identity provider's API, as Homeward's own account in it.
+type Provider interface {
+	// Report says what the provider can do.
+	Report(ctx context.Context) (Report, error)
+	// Prepare makes the household's sign-in: the groups for roles, Homeward's passkey-only sign-in flow and its
+	// passkey-enrolment flow, the household's name. It corrects what drifted and changes nothing that isn't
+	// Homeward's. It is idempotent.
+	Prepare(ctx context.Context, h Household) error
+	// EnsurePerson makes a person, or brings their name, mail and role's group in line. They have no password and no
+	// passkey: one comes only from an enrolment link. Making someone an admin who holds app passwords is refused with
+	// ErrAdminAppPassword and changes nothing: they're removed first (LDAP.RevokeAppPasswords, or the person in the
+	// provider's own settings), or the person keeps them on a separate account that isn't an admin (#281). One made
+	// at the same moment as the promotion is ended with it. Making someone an admin who holds anything else but
+	// passkeys (Credentials.Others: a password, TOTP, recovery codes, a token, a linked account) is refused the same
+	// way, with ErrAdminCredentials, which an app password's refusal wraps too (#292). A new account, or someone who is
+	// an admin already, is never refused: the first admin is a new account, and recovery changes no role.
+	EnsurePerson(ctx context.Context, p Person) error
+	// People are the people in a role.
+	People(ctx context.Context, r Role) ([]Person, error)
+	// Passkeys are a person's passkeys.
+	Passkeys(ctx context.Context, username string) ([]Passkey, error)
+	// Credentials are everything the person holds that can sign them in. It reads the provider each time, never a copy.
+	Credentials(ctx context.Context, username string) (Credentials, error)
+	// EnrolmentLink mints a one-time link that adds a passkey to a person's account at the sign-in's own address. It
+	// works once, for EnrolmentLife, and runs Homeward's own flow with only a passkey-enrolment stage, never the
+	// provider's recovery flow.
+	EnrolmentLink(ctx context.Context, username string) (Link, error)
+	// EnsureClient makes an app's OIDC client, or brings it in line: its redirect addresses exactly the ones given
+	// (https, no wildcard, or an app's own private-use scheme), its roles the only ones it opens to. Its id is its slug
+	// and its credentials never change once it is made, so a change reaches the app with no new secret.
+	EnsureClient(ctx context.Context, c Client) (ClientCredentials, error)
+	// DeleteClient deletes an app's OIDC client and what opens it; one that isn't there is gone already.
+	DeleteClient(ctx context.Context, slug string) error
+	// EnsureGuard makes an app's guard, or brings it in line: only its roles get past it, at its URL only.
+	EnsureGuard(ctx context.Context, g Guard) error
+}
+
+// Errors an adapter returns, so callers can say what to fix.
+var (
+	ErrTokenRefused = errors.New("the identity provider refused Homeward's token")
+	ErrUnreachable  = errors.New("the identity provider can't be reached")
+	ErrNoPerson     = errors.New("no such person in the household account")
+	ErrNotReady     = errors.New("the identity provider isn't ready yet")
+	// ErrAdminAppPassword refuses an app password for an admin, and making an admin of someone who holds one (#281):
+	// an admin who uses LDAP apps does it with a separate account that isn't an admin.
+	ErrAdminAppPassword = errors.New("an admin holds no app password: LDAP apps take a separate account that isn't an admin")
+	// ErrAdminCredentials refuses making an admin of someone who holds anything but passkeys (#292).
+	ErrAdminCredentials = errors.New("an admin holds passkeys only")
+)
+
+// LDAPApp is an app that signs people in over LDAP (#204): an LDAP provider of its own at the sign-in's LDAP outpost,
+// which only its roles may bind to. Each person binds as themselves, by the DN template, and sees only their own entry
+// and their own groups: there is no account that searches the household's directory (the maintainer, #204), so an
+// app that needs one can't sign in over LDAP.
+type LDAPApp struct {
+	// Slug names the app in the provider, homerslab-<app>; Name is what the provider's console shows.
+	Slug string
+	Name string
+	// Roles may bind; nobody else.
+	Roles []Role
+}
+
+// LDAPCredentials are what an app needs of its LDAP provider. None of it is secret: a person's own app password is
+// what binds.
+type LDAPCredentials struct {
+	// BaseDN is the app's base DN.
+	BaseDN string
+	// UserDN is the DN template of a person, with %s for their username: cn=%s,ou=users,<BaseDN>.
+	UserDN string
+	// Created says this call made the provider; false when it was there already.
+	Created bool
+}
+
+// AdminAppPasswords is an admin found holding app passwords. Err says why they couldn't be ended; nil, they were.
+type AdminAppPasswords struct {
+	Username string
+	Err      error
+}
+
+// LDAP is a provider that serves apps over LDAP through an outpost of its own: the sign-in listener's port 636 leads to
+// it (ADR 0020). People bind with an app password, never their passkey (LDAP can't carry one).
+type LDAP interface {
+	// LDAPOutpost makes the provider's LDAP outpost, or brings it in line, and returns its token: the credential its
+	// container connects to the provider with.
+	LDAPOutpost(ctx context.Context) (Secret, error)
+	// EnsureLDAP makes an app's LDAP provider, or brings it in line: only its roles bind. Its base DN never changes
+	// once it is made.
+	EnsureLDAP(ctx context.Context, app LDAPApp) (LDAPCredentials, error)
+	// EnsureLDAPApps brings each of these apps' providers in line, as EnsureLDAP does, at the cost of one EnsureLDAP's
+	// tidying of the outpost, not one per app. One app's failure keeps the others from nothing; the error names each.
+	EnsureLDAPApps(ctx context.Context, apps []LDAPApp) error
+	// DeleteLDAP deletes an app's LDAP provider: from the moment it returns, nobody binds there. One that isn't there
+	// is gone already.
+	DeleteLDAP(ctx context.Context, slug string) error
+	// AppPassword makes a person a new app password for one LDAP app, by the app's slug: it binds at that app's base
+	// DN and at no other app's, so an app that is handed it can't replay it elsewhere. It is shown only here. The app's
+	// directory must be there; whether the person is in its audience is the bind's to say, as for every other password.
+	// Credentials counts it, so an admin who holds one passes no step-up: it refuses an admin with ErrAdminAppPassword,
+	// one made an admin while it was being made included (#274, #281). Nobody in the admins' group binds over LDAP
+	// anyway, whatever they bind with: the provider's bind refuses them (#292).
+	AppPassword(ctx context.Context, slug, username string) (Secret, error)
+	// RevokeAppPasswords ends every app password the person holds, for every app, whoever made it: from the moment it
+	// returns, none of them binds anywhere.
+	RevokeAppPasswords(ctx context.Context, username string) error
+	// EndAdminAppPasswords finds every admin holding an app password, whoever made it (with Kanidm, a person makes
+	// their own, an admin too), and whoever made the admin (the provider's console included: every member of the
+	// admins' group, inactive ones too), ends those passwords, and says whose they were and where it failed, so the
+	// manager raises a security event for each (#281). Its error says what it couldn't read.
+	EndAdminAppPasswords(ctx context.Context) ([]AdminAppPasswords, error)
+}
